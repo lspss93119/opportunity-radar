@@ -1,0 +1,1 @@
+"""Opportunity Radar core package."""

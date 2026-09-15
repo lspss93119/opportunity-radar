@@ -23,3 +23,7 @@ Read these before implementation:
 - `docs/superpowers/plans/2026-09-15-opportunity-radar-macbook-v1.md`
 
 Current checkpoint: **Task 1 Foundation**.
+
+## Dependency lock note
+
+This starter archive may not contain `uv.lock`. On your MacBook, run `uv sync`; uv will resolve the declared dependencies and create/update the lockfile. Commit that lockfile before continuing Task 2.
