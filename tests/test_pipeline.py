@@ -14,6 +14,7 @@ from radar.pipeline import (
     hourly_sample_time,
 )
 from radar.state import RadarState
+from radar.storage.parquet import ParquetStorage
 
 UTC = timezone.utc
 NOW = datetime(2026, 9, 15, 10, 0, 19, 876000, tzinfo=UTC)
@@ -152,6 +153,23 @@ async def test_failed_venue_does_not_leave_old_market_snapshot_in_state():
 
     assert state.get_market("lighter", "BTC") is None
     assert state.get_market("hyperliquid", "BTC").best_ask == 200
+
+
+@pytest.mark.asyncio
+async def test_pipeline_hands_collected_batch_to_optional_storage(tmp_path):
+    storage = ParquetStorage(tmp_path / "data")
+    pipeline = MarketDataPipeline(
+        [SuccessfulCollector()],
+        RadarState(),
+        sampling_seconds=10,
+        storage=storage,
+    )
+
+    await pipeline.collect_once(now=NOW)
+
+    assert storage.pending_count == 1
+    assert pipeline.flush_storage(now=NOW) == 1
+    assert storage.pending_count == 0
 
 
 @pytest.mark.asyncio
