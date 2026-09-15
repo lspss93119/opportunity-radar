@@ -44,6 +44,13 @@ class RadarConfig(BaseModel):
     markets: list[MarketConfig] = Field(default_factory=list)
     monitors: MonitorConfig = Field(default_factory=MonitorConfig)
 
+    @field_validator("sampling_seconds")
+    @classmethod
+    def sampling_must_be_ten_seconds(cls, value: int) -> int:
+        if value != 10:
+            raise ValueError("sampling_seconds must be a 10-second interval")
+        return value
+
     @field_validator("fees_bps")
     @classmethod
     def fees_must_be_non_negative(cls, value: dict[str, float]) -> dict[str, float]:

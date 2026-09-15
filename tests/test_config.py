@@ -11,6 +11,14 @@ def test_example_config_loads():
     assert cfg.sampling_seconds == 10
     assert cfg.monitors.spread.primary_size_usd == 10_000
     assert {m.venue for m in cfg.markets} == {"lighter", "hyperliquid"}
+    assert {
+        (market.venue, market.venue_symbol)
+        for market in cfg.markets
+    } == {
+        (venue, symbol)
+        for venue in ("lighter", "hyperliquid")
+        for symbol in ("BTC", "ETH", "SOL")
+    }
 
 
 def test_primary_size_is_limited_to_fixed_supported_sizes():
@@ -54,3 +62,8 @@ def test_negative_fee_is_rejected():
                 "monitors": {"spread": {"enabled": False}},
             }
         )
+
+
+def test_sampling_interval_is_fixed_at_ten_seconds():
+    with pytest.raises(ValidationError):
+        RadarConfig.model_validate({"sampling_seconds": 5})

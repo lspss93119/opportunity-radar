@@ -76,6 +76,17 @@ def test_funding_snapshot_requires_utc_times():
             funding_rate=0.0001,
         )
 
+    for invalid_rate in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(ValidationError):
+            FundingSnapshot(
+                effective_time=NOW,
+                observed_at=NOW,
+                venue="lighter",
+                venue_symbol="BTC",
+                canonical_symbol="BTC",
+                funding_rate=invalid_rate,
+            )
+
 
 def test_hourly_context_rejects_negative_oi_or_volume():
     with pytest.raises(ValidationError):

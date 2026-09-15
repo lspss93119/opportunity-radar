@@ -55,7 +55,7 @@ class FundingSnapshot(BaseModel):
     venue: str = Field(min_length=1)
     venue_symbol: str = Field(min_length=1)
     canonical_symbol: str = Field(min_length=1)
-    funding_rate: float
+    funding_rate: float = Field(allow_inf_nan=False)
     next_funding_time: datetime | None = None
 
     _effective_time_utc = field_validator("effective_time")(_require_utc)

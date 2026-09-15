@@ -1,0 +1,7 @@
+{
+  "code": 200,
+  "resolution": "1h",
+  "fundings": [
+    {"timestamp": 1789470000, "value": "0.30", "rate": "-0.0010", "direction": "short"}
+  ]
+}

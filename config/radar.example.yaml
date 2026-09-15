@@ -9,9 +9,25 @@ markets:
     venue_symbol: BTC
     canonical_symbol: BTC
     enabled: true
+  - venue: lighter
+    venue_symbol: ETH
+    canonical_symbol: ETH
+    enabled: true
+  - venue: lighter
+    venue_symbol: SOL
+    canonical_symbol: SOL
+    enabled: true
   - venue: hyperliquid
     venue_symbol: BTC
     canonical_symbol: BTC
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: ETH
+    canonical_symbol: ETH
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: SOL
+    canonical_symbol: SOL
     enabled: true
 
 monitors:

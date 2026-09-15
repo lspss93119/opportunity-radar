@@ -25,3 +25,6 @@ packages = ["src/radar"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "live: use the public venue APIs and network access",
+]
