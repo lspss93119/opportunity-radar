@@ -7,9 +7,13 @@ from radar.collectors.base import Collector, CollectorBatch
 from radar.collectors.hyperliquid import HyperliquidCollector
 from radar.collectors.lighter import LighterCollector
 from radar.config import MarketConfig, RadarConfig
-from radar.pipeline import MarketDataPipeline, aligned_sample_time
+from radar.models import HourlyContext, MarketSnapshot
+from radar.pipeline import (
+    MarketDataPipeline,
+    aligned_sample_time,
+    hourly_sample_time,
+)
 from radar.state import RadarState
-from radar.models import MarketSnapshot
 
 UTC = timezone.utc
 NOW = datetime(2026, 9, 15, 10, 0, 19, 876000, tzinfo=UTC)
@@ -151,19 +155,73 @@ async def test_failed_venue_does_not_leave_old_market_snapshot_in_state():
 
 
 @pytest.mark.asyncio
-async def test_pipeline_requests_hourly_context_only_once_per_utc_hour():
+async def test_pipeline_delays_hourly_context_until_after_grace_and_repeats_per_hour():
     collector = CadenceCollector()
     pipeline = MarketDataPipeline([collector], RadarState(), sampling_seconds=10)
 
-    await pipeline.collect_once(now=NOW)
     await pipeline.collect_once(
-        now=datetime(2026, 9, 15, 10, 0, 29, tzinfo=UTC)
+        now=datetime(2026, 9, 15, 10, 0, 0, tzinfo=UTC)
     )
     await pipeline.collect_once(
-        now=datetime(2026, 9, 15, 11, 0, 0, tzinfo=UTC)
+        now=datetime(2026, 9, 15, 10, 0, 50, tzinfo=UTC)
+    )
+    await pipeline.collect_once(
+        now=datetime(2026, 9, 15, 10, 1, 0, tzinfo=UTC)
+    )
+    await pipeline.collect_once(
+        now=datetime(2026, 9, 15, 10, 1, 10, tzinfo=UTC)
+    )
+    await pipeline.collect_once(
+        now=datetime(2026, 9, 15, 11, 1, 0, tzinfo=UTC)
     )
 
-    assert collector.include_hourly_context_values == [True, False, True]
+    assert collector.include_hourly_context_values == [False, False, True, False, True]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_collects_hourly_context_immediately_after_mid_hour_start():
+    collector = CadenceCollector()
+    pipeline = MarketDataPipeline([collector], RadarState(), sampling_seconds=10)
+
+    await pipeline.collect_once(now=datetime(2026, 9, 15, 10, 37, tzinfo=UTC))
+
+    assert collector.include_hourly_context_values == [True]
+
+
+class HourlyContextCollector(CadenceCollector):
+    async def collect(
+        self, *, sample_time: datetime, include_hourly_context: bool
+    ) -> CollectorBatch:
+        self.include_hourly_context_values.append(include_hourly_context)
+        if not include_hourly_context:
+            return CollectorBatch()
+        return CollectorBatch(
+            hourly_contexts=(
+                HourlyContext(
+                    sample_time=hourly_sample_time(sample_time),
+                    observed_at=sample_time,
+                    venue=self.venue,
+                    venue_symbol="BTC",
+                    canonical_symbol="BTC",
+                    open_interest=1.0,
+                    volume_24h=2.0,
+                ),
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_hourly_context_sample_time_stays_at_hour_boundary_after_grace():
+    collector = HourlyContextCollector()
+    pipeline = MarketDataPipeline([collector], RadarState(), sampling_seconds=10)
+
+    batch = await pipeline.collect_once(
+        now=datetime(2026, 9, 15, 10, 1, 10, tzinfo=UTC)
+    )
+
+    assert batch.hourly_contexts[0].sample_time == datetime(
+        2026, 9, 15, 10, 0, tzinfo=UTC
+    )
 
 
 def test_state_clears_context_when_a_context_collection_round_has_no_data():

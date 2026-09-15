@@ -10,6 +10,7 @@ from radar.state import RadarState
 
 UTC = timezone.utc
 SAMPLE_INTERVAL_SECONDS = 10
+HOURLY_CONTEXT_GRACE_SECONDS = 60
 
 
 def utc_now() -> datetime:
@@ -36,6 +37,26 @@ def hourly_sample_time(sample_time: datetime) -> datetime:
     if sample_time.tzinfo is None or sample_time.utcoffset() is None:
         raise ValueError("sample_time must be timezone-aware")
     return sample_time.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+
+
+def should_collect_hourly_context(
+    now: datetime,
+    hour: datetime,
+    last_hourly_sample: datetime | None,
+    *,
+    grace_seconds: int = HOURLY_CONTEXT_GRACE_SECONDS,
+) -> bool:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    if hour.tzinfo is None or hour.utcoffset() is None:
+        raise ValueError("hour must be timezone-aware")
+    if grace_seconds < 0:
+        raise ValueError("grace_seconds must be non-negative")
+
+    current_hour = hour.astimezone(UTC)
+    if last_hourly_sample == current_hour:
+        return False
+    return now.astimezone(UTC) >= current_hour + timedelta(seconds=grace_seconds)
 
 
 def merge_batches(batches: Iterable[CollectorBatch]) -> CollectorBatch:
@@ -102,7 +123,9 @@ class MarketDataPipeline:
         current_time = self._clock() if now is None else now
         sample_time = aligned_sample_time(current_time, self.sampling_seconds)
         hour = hourly_sample_time(sample_time)
-        include_hourly_context = self._last_hourly_sample != hour
+        include_hourly_context = should_collect_hourly_context(
+            current_time, hour, self._last_hourly_sample
+        )
 
         results = await asyncio.gather(
             *(
