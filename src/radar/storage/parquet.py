@@ -15,6 +15,59 @@ UTC = timezone.utc
 DATASET_NAMES = ("market", "funding", "hourly_context")
 NormalizedRecord = MarketSnapshot | FundingSnapshot | HourlyContext
 PendingKey = tuple[str, date]
+UTC_TIMESTAMP = pa.timestamp("us", tz="UTC")
+
+MARKET_SCHEMA = pa.schema(
+    [
+        pa.field("sample_time", UTC_TIMESTAMP, nullable=False),
+        pa.field("observed_at", UTC_TIMESTAMP, nullable=False),
+        pa.field("venue", pa.string(), nullable=False),
+        pa.field("venue_symbol", pa.string(), nullable=False),
+        pa.field("canonical_symbol", pa.string(), nullable=False),
+        pa.field("best_bid", pa.float64(), nullable=False),
+        pa.field("best_bid_size", pa.float64(), nullable=False),
+        pa.field("best_ask", pa.float64(), nullable=False),
+        pa.field("best_ask_size", pa.float64(), nullable=False),
+        pa.field("mark_price", pa.float64()),
+        pa.field("index_price", pa.float64()),
+        pa.field("buy_1k_vwap", pa.float64()),
+        pa.field("sell_1k_vwap", pa.float64()),
+        pa.field("buy_5k_vwap", pa.float64()),
+        pa.field("sell_5k_vwap", pa.float64()),
+        pa.field("buy_10k_vwap", pa.float64()),
+        pa.field("sell_10k_vwap", pa.float64()),
+    ]
+)
+
+FUNDING_SCHEMA = pa.schema(
+    [
+        pa.field("effective_time", UTC_TIMESTAMP, nullable=False),
+        pa.field("observed_at", UTC_TIMESTAMP, nullable=False),
+        pa.field("venue", pa.string(), nullable=False),
+        pa.field("venue_symbol", pa.string(), nullable=False),
+        pa.field("canonical_symbol", pa.string(), nullable=False),
+        pa.field("funding_rate", pa.float64(), nullable=False),
+        pa.field("next_funding_time", UTC_TIMESTAMP),
+    ]
+)
+
+HOURLY_CONTEXT_SCHEMA = pa.schema(
+    [
+        pa.field("sample_time", UTC_TIMESTAMP, nullable=False),
+        pa.field("observed_at", UTC_TIMESTAMP, nullable=False),
+        pa.field("venue", pa.string(), nullable=False),
+        pa.field("venue_symbol", pa.string(), nullable=False),
+        pa.field("canonical_symbol", pa.string(), nullable=False),
+        pa.field("open_interest", pa.float64()),
+        pa.field("volume_24h", pa.float64()),
+    ]
+)
+
+DATASET_SCHEMAS = {
+    "market": MARKET_SCHEMA,
+    "funding": FUNDING_SCHEMA,
+    "hourly_context": HOURLY_CONTEXT_SCHEMA,
+}
 
 
 def _as_utc(value: datetime, field_name: str) -> datetime:
@@ -94,7 +147,7 @@ class ParquetStorage:
                 final_path = partition / filename
                 temp_path = partition / f".{filename}.tmp"
                 staged.append((temp_path, final_path))
-                table = pa.Table.from_pylist(rows)
+                table = pa.Table.from_pylist(rows, schema=DATASET_SCHEMAS[dataset])
                 pq.write_table(table, temp_path, compression="zstd")
 
             for temp_path, final_path in staged:

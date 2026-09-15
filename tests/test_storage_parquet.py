@@ -1,6 +1,8 @@
 import os
 from datetime import datetime, timedelta, timezone
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import duckdb
 import pytest
 
@@ -11,7 +13,11 @@ from radar.storage.parquet import ParquetStorage
 UTC = timezone.utc
 
 
-def make_market(sample_time: datetime, symbol: str = "BTC") -> MarketSnapshot:
+def make_market(
+    sample_time: datetime,
+    symbol: str = "BTC",
+    with_optional_values: bool = True,
+) -> MarketSnapshot:
     return MarketSnapshot(
         sample_time=sample_time,
         observed_at=sample_time.replace(microsecond=123000),
@@ -22,18 +28,22 @@ def make_market(sample_time: datetime, symbol: str = "BTC") -> MarketSnapshot:
         best_bid_size=2.0,
         best_ask=100.0,
         best_ask_size=3.0,
-        mark_price=99.5,
-        index_price=99.4,
-        buy_1k_vwap=100.1,
-        sell_1k_vwap=98.9,
-        buy_5k_vwap=100.2,
-        sell_5k_vwap=98.8,
-        buy_10k_vwap=100.3,
-        sell_10k_vwap=98.7,
+        mark_price=99.5 if with_optional_values else None,
+        index_price=99.4 if with_optional_values else None,
+        buy_1k_vwap=100.1 if with_optional_values else None,
+        sell_1k_vwap=98.9 if with_optional_values else None,
+        buy_5k_vwap=100.2 if with_optional_values else None,
+        sell_5k_vwap=98.8 if with_optional_values else None,
+        buy_10k_vwap=100.3 if with_optional_values else None,
+        sell_10k_vwap=98.7 if with_optional_values else None,
     )
 
 
-def make_funding(effective_time: datetime, symbol: str = "BTC") -> FundingSnapshot:
+def make_funding(
+    effective_time: datetime,
+    symbol: str = "BTC",
+    next_funding_time: datetime | None = None,
+) -> FundingSnapshot:
     return FundingSnapshot(
         effective_time=effective_time,
         observed_at=effective_time.replace(microsecond=456000),
@@ -41,19 +51,23 @@ def make_funding(effective_time: datetime, symbol: str = "BTC") -> FundingSnapsh
         venue_symbol=symbol,
         canonical_symbol=symbol,
         funding_rate=0.000123,
-        next_funding_time=None,
+        next_funding_time=next_funding_time,
     )
 
 
-def make_hourly(sample_time: datetime, symbol: str = "BTC") -> HourlyContext:
+def make_hourly(
+    sample_time: datetime,
+    symbol: str = "BTC",
+    with_optional_values: bool = True,
+) -> HourlyContext:
     return HourlyContext(
         sample_time=sample_time,
         observed_at=sample_time.replace(microsecond=789000),
         venue="lighter",
         venue_symbol=symbol,
         canonical_symbol=symbol,
-        open_interest=123.4,
-        volume_24h=567890.1,
+        open_interest=123.4 if with_optional_values else None,
+        volume_24h=567890.1 if with_optional_values else None,
     )
 
 
@@ -143,6 +157,75 @@ def test_individual_normalized_models_are_accepted_and_existing_parquet_reopens(
     assert len(query_dataset(root, "market", "*")) == 1
     assert len(query_dataset(root, "funding", "*")) == 1
     assert len(query_dataset(root, "hourly_context", "*")) == 1
+
+
+def test_nullable_market_values_are_normalized_within_one_flush(tmp_path):
+    root = tmp_path / "data"
+    timestamp = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    store = ParquetStorage(root)
+    store.append(make_market(timestamp, "NULL", with_optional_values=False))
+    store.append(make_market(timestamp + timedelta(seconds=10), "VALID"))
+
+    assert store.flush(now=timestamp) == 1
+
+    rows = query_dataset(root, "market", "venue_symbol, buy_10k_vwap")
+    assert rows == [("NULL", None), ("VALID", 100.3)]
+
+
+def test_nullable_market_schema_is_stable_across_separate_flushes(tmp_path):
+    root = tmp_path / "data"
+    timestamp = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    store = ParquetStorage(root)
+    store.append(make_market(timestamp, "NULL", with_optional_values=False))
+    assert store.flush(now=timestamp) == 1
+    store.append(make_market(timestamp + timedelta(seconds=10), "VALID"))
+    assert store.flush(now=timestamp + timedelta(seconds=10)) == 1
+
+    files = sorted((root / "market").glob("date=*/*.parquet"))
+    assert len(files) == 2
+    assert pq.ParquetFile(files[0]).schema_arrow == pq.ParquetFile(files[1]).schema_arrow
+    assert query_dataset(root, "market", "venue_symbol, buy_10k_vwap") == [
+        ("NULL", None),
+        ("VALID", 100.3),
+    ]
+
+
+def test_funding_next_funding_time_has_stable_nullable_timestamp_schema(tmp_path):
+    root = tmp_path / "data"
+    timestamp = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    next_funding = timestamp + timedelta(hours=1)
+    store = ParquetStorage(root)
+    store.append(make_funding(timestamp, next_funding_time=None))
+    assert store.flush(now=timestamp) == 1
+
+    funding_file = next((root / "funding").glob("date=*/*.parquet"))
+    schema = pq.ParquetFile(funding_file).schema_arrow
+    assert schema.field("next_funding_time").type == pa.timestamp("us", tz="UTC")
+    rows = query_dataset(root, "funding", "next_funding_time")
+    assert rows == [(None,)]
+
+    store.append(make_funding(timestamp + timedelta(seconds=10), next_funding_time=next_funding))
+    assert store.flush(now=timestamp + timedelta(seconds=10)) == 1
+    assert {row[0] for row in query_dataset(root, "funding", "next_funding_time")} == {
+        None,
+        next_funding,
+    }
+
+
+def test_hourly_nullable_values_have_stable_float_schema(tmp_path):
+    root = tmp_path / "data"
+    timestamp = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    store = ParquetStorage(root)
+    store.append(make_hourly(timestamp, with_optional_values=False))
+    assert store.flush(now=timestamp) == 1
+
+    hourly_file = next((root / "hourly_context").glob("date=*/*.parquet"))
+    schema = pq.ParquetFile(hourly_file).schema_arrow
+    assert schema.field("open_interest").type == pa.float64()
+    assert schema.field("volume_24h").type == pa.float64()
+    assert query_dataset(root, "hourly_context", "open_interest, volume_24h") == [
+        (None, None)
+    ]
 
 
 def test_failed_write_leaves_existing_parquet_untouched(tmp_path, monkeypatch):
