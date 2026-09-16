@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -54,8 +55,8 @@ class RadarConfig(BaseModel):
     @field_validator("fees_bps")
     @classmethod
     def fees_must_be_non_negative(cls, value: dict[str, float]) -> dict[str, float]:
-        if any(fee < 0 for fee in value.values()):
-            raise ValueError("fees_bps cannot contain negative values")
+        if any(not math.isfinite(fee) or fee < 0 for fee in value.values()):
+            raise ValueError("fees_bps must contain finite non-negative values")
         return value
 
 

@@ -64,6 +64,19 @@ def test_negative_fee_is_rejected():
         )
 
 
+@pytest.mark.parametrize("invalid_fee", [float("nan"), float("inf"), -float("inf")])
+def test_non_finite_fee_is_rejected(invalid_fee):
+    with pytest.raises(ValidationError):
+        RadarConfig.model_validate(
+            {
+                "sampling_seconds": 10,
+                "fees_bps": {"lighter": invalid_fee},
+                "markets": [],
+                "monitors": {"spread": {"enabled": False}},
+            }
+        )
+
+
 def test_sampling_interval_is_fixed_at_ten_seconds():
     with pytest.raises(ValidationError):
         RadarConfig.model_validate({"sampling_seconds": 5})

@@ -3,18 +3,24 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TypeAlias
 
-from radar.config import RadarConfig, SpreadMonitorConfig
+from radar.config import RadarConfig
 from radar.monitors.base import Monitor
+from radar.monitors.spread.factory import create_spread_monitor
+from radar.storage.sqlite import SQLiteRuntimeStore
 
-MonitorFactory: TypeAlias = Callable[[SpreadMonitorConfig], Monitor]
+MonitorFactory: TypeAlias = Callable[
+    [RadarConfig, SQLiteRuntimeStore | None], Monitor
+]
 
-# Task 5 will add the real spread monitor factory. Task 4 keeps the mapping
-# explicit without dynamic discovery or a plugin loader.
-MONITOR_FACTORIES: dict[str, MonitorFactory] = {}
+MONITOR_FACTORIES: dict[str, MonitorFactory] = {
+    "spread": create_spread_monitor,
+}
 
 
 def build_enabled_monitors(
     config: RadarConfig,
+    *,
+    runtime_store: SQLiteRuntimeStore | None = None,
 ) -> tuple[Monitor, ...]:
     spread_config = config.monitors.spread
     if not spread_config.enabled:
@@ -22,4 +28,4 @@ def build_enabled_monitors(
     factory = MONITOR_FACTORIES.get("spread")
     if factory is None:
         return ()
-    return (factory(spread_config),)
+    return (factory(config, runtime_store),)

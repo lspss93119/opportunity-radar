@@ -9,7 +9,9 @@ from radar.models import MarketSnapshot
 from radar.monitors.base import AlertRequest, Monitor
 from radar.monitors.registry import MONITOR_FACTORIES, build_enabled_monitors
 from radar.monitors.runner import MonitorRunner
+from radar.monitors.spread.monitor import SpreadMonitor
 from radar.state import RadarState
+from radar.storage.sqlite import SQLiteRuntimeStore
 
 UTC = timezone.utc
 NOW = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
@@ -74,25 +76,42 @@ def test_fake_monitor_structurally_satisfies_protocol_and_returns_alert():
 def test_registry_uses_explicit_factory_and_respects_enabled_flag(monkeypatch):
     created_with = []
 
-    def factory(settings):
-        created_with.append(settings)
-        return FakeMonitor("spread", settings.interval_seconds)
+    def factory(config, runtime_store):
+        created_with.append((config, runtime_store))
+        return FakeMonitor("spread", config.monitors.spread.interval_seconds)
 
     monkeypatch.setitem(MONITOR_FACTORIES, "spread", factory)
     config = RadarConfig.model_validate(
         {"monitors": {"spread": {"enabled": True, "interval_seconds": 60}}}
     )
-    monitors = build_enabled_monitors(config)
+    runtime_store = object()
+    monitors = build_enabled_monitors(config, runtime_store=runtime_store)
 
     assert len(monitors) == 1
     assert monitors[0].name == "spread"
     assert monitors[0].interval_seconds == 60
-    assert created_with[0] is config.monitors.spread
+    assert created_with[0] == (config, runtime_store)
 
     disabled_config = RadarConfig.model_validate(
         {"monitors": {"spread": {"enabled": False}}}
     )
-    assert build_enabled_monitors(disabled_config) == ()
+    assert build_enabled_monitors(disabled_config, runtime_store=runtime_store) == ()
+
+
+def test_registry_builds_real_spread_monitor_with_or_without_runtime_store(tmp_path):
+    config = RadarConfig(
+        fees_bps={"lighter": 4.5, "hyperliquid": 3.5},
+        markets=[],
+    )
+
+    without_store = build_enabled_monitors(config)
+    assert len(without_store) == 1
+    assert isinstance(without_store[0], SpreadMonitor)
+
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite3") as store:
+        with_store = build_enabled_monitors(config, runtime_store=store)
+        assert len(with_store) == 1
+        assert isinstance(with_store[0], SpreadMonitor)
 
 
 @pytest.mark.asyncio
