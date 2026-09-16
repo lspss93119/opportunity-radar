@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
@@ -104,6 +105,9 @@ class SpreadMonitor:
             for candidate in candidates
             if candidate.net_spread_bps >= self.config.candidate_net_bps
         }
+        previous_episodes = (
+            deepcopy(self._episodes) if self._runtime_store is not None else None
+        )
 
         events: list[OpportunityEvent] = []
         for key in tuple(self._episodes):
@@ -167,7 +171,12 @@ class SpreadMonitor:
                 )
                 alerts.append(alert)
 
-        self._persist_episodes(current_time, events)
+        try:
+            self._persist_episodes(current_time, events)
+        except Exception:
+            if previous_episodes is not None:
+                self._episodes = previous_episodes
+            raise
         return alerts
 
     def _start_episode(

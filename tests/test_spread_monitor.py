@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -84,6 +85,23 @@ def make_monitor(
         {"long": 0.0, "short": 0.0} if fees_bps is None else fees_bps,
         runtime_store=runtime_store,
     )
+
+
+def fail_next_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+    store: SQLiteRuntimeStore,
+) -> None:
+    original = store.set_monitor_state_and_append_opportunities
+    failed = False
+
+    def persist(*args: object, **kwargs: object) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("injected persistence failure")
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "set_monitor_state_and_append_opportunities", persist)
 
 
 def test_directional_spread_uses_executable_prices_and_both_taker_fees():
@@ -460,6 +478,150 @@ async def test_already_alerted_episode_restores_without_duplicate_alert(tmp_path
         )
         assert await reopened.evaluate(NOW + timedelta(seconds=10), state) == []
         assert reopened.active_episodes[0].alerted is True
+
+
+@pytest.mark.asyncio
+async def test_alert_persistence_failure_restores_unalerted_episode_for_retry(
+    tmp_path,
+    monkeypatch,
+):
+    database = tmp_path / "runtime.sqlite3"
+    state = make_state(
+        make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
+        make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
+    )
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(
+            runtime_store=store,
+            candidate_duration_seconds=0,
+            alert_duration_seconds=10,
+            stale_after_seconds=60,
+        )
+        assert await monitor.evaluate(NOW, state) == []
+        episode_id = monitor.active_episodes[0].episode_id
+        episodes_before_failure = deepcopy(monitor.active_episodes)
+        persisted_before_failure = store.get_monitor_state("spread", "episodes")
+        fail_next_persistence(monkeypatch, store)
+
+        with pytest.raises(RuntimeError, match="injected persistence failure"):
+            await monitor.evaluate(NOW + timedelta(seconds=10), state)
+
+        episode = monitor.active_episodes[0]
+        assert monitor.active_episodes == episodes_before_failure
+        assert episode.episode_id == episode_id
+        assert episode.alerted is False
+        assert episode.last_seen_at == NOW
+        assert store.get_monitor_state("spread", "episodes") == persisted_before_failure
+        assert [event["event_type"] for event in store.list_opportunities(monitor_name="spread")] == [
+            "candidate_confirmed"
+        ]
+
+        alerts = await monitor.evaluate(NOW + timedelta(seconds=10), state)
+
+        assert len(alerts) == 1
+        assert monitor.active_episodes[0].alerted is True
+        events = store.list_opportunities(monitor_name="spread")
+        assert [event["event_type"] for event in events].count("alert") == 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_confirmation_persistence_failure_restores_unconfirmed_episode(
+    tmp_path,
+    monkeypatch,
+):
+    database = tmp_path / "runtime.sqlite3"
+    state = make_state(
+        make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
+        make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
+    )
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(
+            runtime_store=store,
+            candidate_duration_seconds=10,
+            alert_duration_seconds=120,
+            stale_after_seconds=60,
+        )
+        await monitor.evaluate(NOW, state)
+        episode_id = monitor.active_episodes[0].episode_id
+        episodes_before_failure = deepcopy(monitor.active_episodes)
+        persisted_before_failure = store.get_monitor_state("spread", "episodes")
+        fail_next_persistence(monkeypatch, store)
+
+        with pytest.raises(RuntimeError, match="injected persistence failure"):
+            await monitor.evaluate(NOW + timedelta(seconds=10), state)
+
+        episode = monitor.active_episodes[0]
+        assert monitor.active_episodes == episodes_before_failure
+        assert episode.episode_id == episode_id
+        assert episode.candidate_confirmed is False
+        assert episode.candidate_confirmed_at is None
+        assert episode.last_seen_at == NOW
+        assert store.get_monitor_state("spread", "episodes") == persisted_before_failure
+        assert store.list_opportunities(monitor_name="spread") == []
+
+        assert await monitor.evaluate(NOW + timedelta(seconds=10), state) == []
+
+        episode = monitor.active_episodes[0]
+        assert episode.candidate_confirmed is True
+        assert episode.candidate_confirmed_at == NOW + timedelta(seconds=10)
+        events = store.list_opportunities(monitor_name="spread")
+        assert [event["event_type"] for event in events] == ["candidate_confirmed"]
+
+
+@pytest.mark.asyncio
+async def test_resolution_persistence_failure_restores_active_episode_for_retry(
+    tmp_path,
+    monkeypatch,
+):
+    database = tmp_path / "runtime.sqlite3"
+    state = make_state(
+        make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
+        make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
+    )
+    missing_short_state = make_state(
+        make_market(
+            "long",
+            buy_10k_vwap=100.0,
+            sell_10k_vwap=99.0,
+            observed_at=NOW + timedelta(seconds=10),
+        ),
+    )
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(
+            runtime_store=store,
+            candidate_duration_seconds=0,
+            alert_duration_seconds=120,
+            stale_after_seconds=60,
+        )
+        await monitor.evaluate(NOW, state)
+        episode_id = monitor.active_episodes[0].episode_id
+        episodes_before_failure = deepcopy(monitor.active_episodes)
+        persisted_before_failure = store.get_monitor_state("spread", "episodes")
+        fail_next_persistence(monkeypatch, store)
+
+        with pytest.raises(RuntimeError, match="injected persistence failure"):
+            await monitor.evaluate(NOW + timedelta(seconds=10), missing_short_state)
+
+        episode = monitor.active_episodes[0]
+        assert monitor.active_episodes == episodes_before_failure
+        assert episode.episode_id == episode_id
+        assert episode.candidate_confirmed is True
+        assert episode.last_seen_at == NOW
+        assert store.get_monitor_state("spread", "episodes") == persisted_before_failure
+        assert [event["event_type"] for event in store.list_opportunities(monitor_name="spread")] == [
+            "candidate_confirmed"
+        ]
+
+        assert await monitor.evaluate(NOW + timedelta(seconds=10), missing_short_state) == []
+
+        assert monitor.active_episodes == ()
+        assert store.get_monitor_state("spread", "episodes") == {}
+        events = store.list_opportunities(monitor_name="spread")
+        assert [event["event_type"] for event in events] == [
+            "candidate_confirmed",
+            "resolved",
+        ]
+        assert [event["event_type"] for event in events].count("resolved") == 1
 
 
 @pytest.mark.asyncio
