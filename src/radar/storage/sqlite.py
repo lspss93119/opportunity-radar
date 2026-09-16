@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -87,6 +88,50 @@ class SQLiteRuntimeStore:
             (monitor_name, state_key, _json_text(state), _utc_iso(updated_at, "updated_at")),
         )
         self._connection.commit()
+
+    def set_monitor_state_and_append_opportunities(
+        self,
+        monitor_name: str,
+        state_key: str,
+        state: object,
+        *,
+        updated_at: datetime | None = None,
+        opportunities: Sequence[tuple[str, str, object, datetime | None]] = (),
+    ) -> None:
+        """Commit one runtime-state update and its events as one transaction."""
+        monitor_name = _require_text(monitor_name, "monitor_name")
+        state_key = _require_text(state_key, "state_key")
+        state_json = _json_text(state)
+        updated_iso = _utc_iso(updated_at, "updated_at")
+        event_rows = [
+            (
+                monitor_name,
+                _require_text(event_id, "event_id"),
+                _require_text(event_type, "event_type"),
+                _json_text(event),
+                _utc_iso(occurred_at, "occurred_at"),
+            )
+            for event_id, event_type, event, occurred_at in opportunities
+        ]
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO monitor_state (monitor_name, state_key, state_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (monitor_name, state_key) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                """,
+                (monitor_name, state_key, state_json, updated_iso),
+            )
+            self._connection.executemany(
+                """
+                INSERT INTO opportunity_log
+                    (monitor_name, event_id, event_type, event_json, occurred_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                event_rows,
+            )
 
     def get_monitor_state(self, monitor_name: str, state_key: str) -> object | None:
         row = self._connection.execute(

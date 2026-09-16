@@ -40,6 +40,8 @@ class SpreadCandidate:
 
 
 def _finite_number(value: float, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be numeric")
     result = float(value)
     if not math.isfinite(result):
         raise ValueError(f"{field_name} must be finite")
@@ -54,6 +56,8 @@ def _positive_number(value: float, field_name: str) -> float:
 
 
 def _as_utc(value: datetime, field_name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise ValueError(f"{field_name} must be timezone-aware")
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
     return value.astimezone(UTC)
@@ -173,12 +177,15 @@ def build_spread_candidates(
                 short_fee = _fee_for(short_snapshot.venue, fees_bps)
                 if short_fee is None:
                     continue
-                raw_spread = calculate_raw_spread_bps(long_price, short_price)
-                net_spread = calculate_net_spread_bps(
-                    raw_spread,
-                    long_fee,
-                    short_fee,
-                )
+                try:
+                    raw_spread = calculate_raw_spread_bps(long_price, short_price)
+                    net_spread = calculate_net_spread_bps(
+                        raw_spread,
+                        long_fee,
+                        short_fee,
+                    )
+                except (OverflowError, ValueError):
+                    continue
                 candidates.append(
                     SpreadCandidate(
                         key=SpreadPairKey(

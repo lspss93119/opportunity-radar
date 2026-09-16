@@ -249,6 +249,30 @@ def test_invalid_sample_timestamp_is_fail_closed():
     assert candidates == ()
 
 
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("observed_at", None),
+        ("observed_at", "not-a-timestamp"),
+        ("sample_time", None),
+        ("sample_time", "not-a-timestamp"),
+    ],
+)
+def test_invalid_timestamp_type_is_fail_closed(field_name, invalid_value):
+    invalid = make_market("long").model_copy(update={field_name: invalid_value})
+
+    candidates = build_spread_candidates(
+        [invalid, make_market("short")],
+        NOW,
+        primary_size_usd=10_000,
+        top_n=3,
+        stale_after_seconds=30,
+        fees_bps={"long": 0.0, "short": 0.0},
+    )
+
+    assert candidates == ()
+
+
 def test_missing_fee_never_creates_a_candidate():
     candidates = build_spread_candidates(
         [make_market("long"), make_market("short")],
@@ -265,6 +289,71 @@ def test_missing_fee_never_creates_a_candidate():
 @pytest.mark.parametrize("invalid_price", [float("nan"), float("inf"), 0.0])
 def test_non_positive_or_non_finite_executable_price_is_fail_closed(invalid_price):
     invalid = make_market("long").model_copy(update={"buy_10k_vwap": invalid_price})
+    candidates = build_spread_candidates(
+        [invalid, make_market("short")],
+        NOW,
+        primary_size_usd=10_000,
+        top_n=3,
+        stale_after_seconds=30,
+        fees_bps={"long": 0.0, "short": 0.0},
+    )
+
+    assert all(candidate.key.long_venue != "long" for candidate in candidates)
+
+
+def test_extreme_finite_prices_skip_only_the_invalid_pair():
+    candidates = build_spread_candidates(
+        [
+            make_market(
+                "tiny",
+                canonical_symbol="BTC",
+                buy_10k_vwap=1e-320,
+                sell_10k_vwap=1e-320,
+            ),
+            make_market(
+                "huge",
+                canonical_symbol="BTC",
+                buy_10k_vwap=1e308,
+                sell_10k_vwap=1e308,
+            ),
+            make_market(
+                "good-long",
+                canonical_symbol="ETH",
+                buy_10k_vwap=100.0,
+                sell_10k_vwap=99.0,
+            ),
+            make_market(
+                "good-short",
+                canonical_symbol="ETH",
+                buy_10k_vwap=102.0,
+                sell_10k_vwap=101.0,
+            ),
+        ],
+        NOW,
+        primary_size_usd=10_000,
+        top_n=3,
+        stale_after_seconds=30,
+        fees_bps={venue: 0.0 for venue in ("tiny", "huge", "good-long", "good-short")},
+    )
+
+    assert any(
+        candidate.key.long_venue == "good-long"
+        and candidate.key.short_venue == "good-short"
+        for candidate in candidates
+    )
+    assert all(
+        not (
+            candidate.key.long_venue == "tiny"
+            and candidate.key.short_venue == "huge"
+        )
+        for candidate in candidates
+    )
+
+
+@pytest.mark.parametrize("invalid_price", [True, False])
+def test_boolean_executable_price_is_fail_closed(invalid_price):
+    invalid = make_market("long").model_copy(update={"buy_10k_vwap": invalid_price})
+
     candidates = build_spread_candidates(
         [invalid, make_market("short")],
         NOW,

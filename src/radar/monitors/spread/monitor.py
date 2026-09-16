@@ -18,6 +18,7 @@ from radar.monitors.spread.models import (
 )
 
 UTC = timezone.utc
+OpportunityEvent = tuple[str, str, object, datetime]
 
 
 def _pair_sort_key(key: SpreadPairKey) -> tuple[str, str, str, str, str]:
@@ -104,9 +105,15 @@ class SpreadMonitor:
             if candidate.net_spread_bps >= self.config.candidate_net_bps
         }
 
+        events: list[OpportunityEvent] = []
         for key in tuple(self._episodes):
             if key not in qualifying:
-                self._resolve_episode(key, current_time, reason="not_qualifying")
+                self._resolve_episode(
+                    key,
+                    current_time,
+                    reason="not_qualifying",
+                    events=events,
+                )
 
         alerts: list[AlertRequest] = []
         for key in sorted(qualifying, key=_pair_sort_key):
@@ -116,7 +123,12 @@ class SpreadMonitor:
                 episode = self._start_episode(candidate, current_time)
                 self._episodes[key] = episode
             elif not self._is_continuous(episode, current_time):
-                self._resolve_episode(key, current_time, reason="continuity_gap")
+                self._resolve_episode(
+                    key,
+                    current_time,
+                    reason="continuity_gap",
+                    events=events,
+                )
                 episode = self._start_episode(candidate, current_time)
                 self._episodes[key] = episode
             else:
@@ -130,7 +142,12 @@ class SpreadMonitor:
             ):
                 episode.candidate_confirmed = True
                 episode.candidate_confirmed_at = current_time
-                self._log_event(episode, "candidate_confirmed", current_time)
+                self._log_event(
+                    episode,
+                    "candidate_confirmed",
+                    current_time,
+                    events=events,
+                )
 
             if candidate.net_spread_bps >= self.config.alert_net_bps:
                 if episode.alert_condition_since is None:
@@ -141,10 +158,16 @@ class SpreadMonitor:
             if self._is_alert_eligible(episode, current_time):
                 episode.alerted = True
                 alert = self._build_alert_request(episode, current_time, state)
-                self._log_event(episode, "alert", current_time, event=alert.payload)
+                self._log_event(
+                    episode,
+                    "alert",
+                    current_time,
+                    event=alert.payload,
+                    events=events,
+                )
                 alerts.append(alert)
 
-        self._persist_episodes(current_time)
+        self._persist_episodes(current_time, events)
         return alerts
 
     def _start_episode(
@@ -247,7 +270,14 @@ class SpreadMonitor:
             payload=payload,
         )
 
-    def _resolve_episode(self, key: SpreadPairKey, now: datetime, *, reason: str) -> None:
+    def _resolve_episode(
+        self,
+        key: SpreadPairKey,
+        now: datetime,
+        *,
+        reason: str,
+        events: list[OpportunityEvent],
+    ) -> None:
         episode = self._episodes.pop(key)
         if episode.candidate_confirmed:
             self._log_event(
@@ -259,6 +289,7 @@ class SpreadMonitor:
                     "reason": reason,
                     "net_spread_bps": episode.last_net_spread_bps,
                 },
+                events=events,
             )
 
     def _log_event(
@@ -268,6 +299,7 @@ class SpreadMonitor:
         occurred_at: datetime,
         *,
         event: Mapping[str, JSONValue] | None = None,
+        events: list[OpportunityEvent],
     ) -> None:
         if self._runtime_store is None:
             return
@@ -284,18 +316,23 @@ class SpreadMonitor:
                 "raw_spread_bps": candidate.raw_spread_bps,
                 "net_spread_bps": candidate.net_spread_bps,
             }
-        self._runtime_store.append_opportunity(
-            self.name,
-            f"{episode.episode_id}:{event_type}",
-            event_type,
-            dict(event),
-            occurred_at=occurred_at,
+        events.append(
+            (
+                f"{episode.episode_id}:{event_type}",
+                event_type,
+                dict(event),
+                occurred_at,
+            )
         )
 
-    def _persist_episodes(self, now: datetime) -> None:
+    def _persist_episodes(
+        self,
+        now: datetime,
+        events: list[OpportunityEvent],
+    ) -> None:
         if self._runtime_store is None:
             return
-        self._runtime_store.set_monitor_state(
+        self._runtime_store.set_monitor_state_and_append_opportunities(
             self.name,
             "episodes",
             {
@@ -303,6 +340,7 @@ class SpreadMonitor:
                 for episode in self._episodes.values()
             },
             updated_at=now,
+            opportunities=events,
         )
 
     @staticmethod

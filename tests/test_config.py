@@ -77,6 +77,32 @@ def test_non_finite_fee_is_rejected(invalid_fee):
         )
 
 
+def test_boolean_fee_is_rejected():
+    with pytest.raises(ValidationError):
+        RadarConfig.model_validate(
+            {
+                "sampling_seconds": 10,
+                "fees_bps": {"lighter": True},
+                "markets": [],
+                "monitors": {"spread": {"enabled": False}},
+            }
+        )
+
+
+@pytest.mark.parametrize("field_name", ["candidate_net_bps", "alert_net_bps"])
+@pytest.mark.parametrize("invalid_threshold", [float("nan"), float("inf"), -float("inf"), -1.0])
+def test_invalid_spread_threshold_is_rejected(field_name, invalid_threshold):
+    with pytest.raises(ValidationError):
+        RadarConfig.model_validate(
+            {
+                "sampling_seconds": 10,
+                "fees_bps": {},
+                "markets": [],
+                "monitors": {"spread": {field_name: invalid_threshold}},
+            }
+        )
+
+
 def test_sampling_interval_is_fixed_at_ten_seconds():
     with pytest.raises(ValidationError):
         RadarConfig.model_validate({"sampling_seconds": 5})

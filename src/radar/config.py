@@ -24,9 +24,9 @@ class SpreadMonitorConfig(BaseModel):
     interval_seconds: int = Field(default=10, gt=0)
     primary_size_usd: Literal[1000, 5000, 10000] = 10000
     top_n: int = Field(default=3, gt=0)
-    candidate_net_bps: float = 10.0
+    candidate_net_bps: float = Field(default=10.0, ge=0, allow_inf_nan=False)
     candidate_duration_seconds: int = Field(default=30, ge=0)
-    alert_net_bps: float = 20.0
+    alert_net_bps: float = Field(default=20.0, ge=0, allow_inf_nan=False)
     alert_duration_seconds: int = Field(default=120, ge=0)
     stale_after_seconds: int = Field(default=30, gt=0)
 
@@ -57,6 +57,13 @@ class RadarConfig(BaseModel):
     def fees_must_be_non_negative(cls, value: dict[str, float]) -> dict[str, float]:
         if any(not math.isfinite(fee) or fee < 0 for fee in value.values()):
             raise ValueError("fees_bps must contain finite non-negative values")
+        return value
+
+    @field_validator("fees_bps", mode="before")
+    @classmethod
+    def fees_must_not_be_boolean(cls, value: object) -> object:
+        if isinstance(value, dict) and any(isinstance(fee, bool) for fee in value.values()):
+            raise ValueError("fees_bps values must be numeric, not boolean")
         return value
 
 
