@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import matplotlib.pyplot as plt
 
+from radar.alerts.models import SpreadAlertDetails
 from radar.history.spread import (
     HistoricalSpreadContext,
     HistoricalSpreadPoint,
@@ -14,10 +15,25 @@ SAMPLE_TIME = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 
 
 def make_details():
-    from radar.alerts.spread import parse_spread_alert
-    from tests.test_alert_formatting import make_alert
-
-    return parse_spread_alert(make_alert())
+    return SpreadAlertDetails(
+        canonical_symbol="BTC",
+        long_venue="lighter",
+        long_venue_symbol="BTC",
+        short_venue="hyperliquid",
+        short_venue_symbol="BTC",
+        primary_size_usd=10_000,
+        long_buy_vwap=100.0,
+        short_sell_vwap=101.0,
+        raw_spread_bps=100.0,
+        long_fee_bps=4.5,
+        short_fee_bps=3.5,
+        net_spread_bps=92.0,
+        sample_time=SAMPLE_TIME,
+        candidate_duration_seconds=30,
+        alert_duration_seconds=120,
+        long_funding=None,
+        short_funding=None,
+    )
 
 
 def make_context(point_count: int) -> HistoricalSpreadContext:

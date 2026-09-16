@@ -24,7 +24,12 @@ def render_spread_chart(
     try:
         timestamps = [point.sample_time for point in context.points_7d]
         spreads = [point.raw_spread_bps for point in context.points_7d]
-        axis.plot(timestamps, spreads, marker="o", label="7d raw spread")
+        axis.plot(
+            mdates.date2num(timestamps),
+            spreads,
+            marker="o",
+            label="7d raw spread",
+        )
         axis.axhline(
             details.raw_spread_bps,
             color="black",

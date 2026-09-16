@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import median
 
 import duckdb  # type: ignore[import-untyped]
 
-UTC = timezone.utc
 VWAP_COLUMNS = {
     1_000: ("buy_1k_vwap", "sell_1k_vwap"),
     5_000: ("buy_5k_vwap", "sell_5k_vwap"),
@@ -36,7 +35,7 @@ class HistoricalSpreadContext:
     stats_90d: WindowStats
 
     @classmethod
-    def empty(cls) -> "HistoricalSpreadContext":
+    def empty(cls) -> HistoricalSpreadContext:
         empty_stats = WindowStats(0, None)
         return cls((), empty_stats, empty_stats, empty_stats)
 

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
+from radar.history.spread import HistoricalSpreadContext, SpreadHistory
 from radar.models import MarketSnapshot
 from radar.storage.parquet import ParquetStorage
-from radar.history.spread import HistoricalSpreadContext, SpreadHistory
 
-UTC = timezone.utc
 AS_OF = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 
 
