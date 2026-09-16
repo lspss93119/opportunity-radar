@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 
+from radar.alerts.chart import render_spread_chart
 from radar.alerts.models import FundingContext, SpreadAlertDetails
-from radar.history.spread import HistoricalSpreadContext, WindowStats
+from radar.alerts.telegram import TelegramTransport
+from radar.history.spread import HistoricalSpreadContext, SpreadHistory, WindowStats
 from radar.monitors.base import AlertRequest, JSONValue
 
 SUPPORTED_SIZES = frozenset({1_000, 5_000, 10_000})
+LOGGER = logging.getLogger(__name__)
 
 
 def _require_text(payload: Mapping[str, JSONValue], field_name: str) -> str:
@@ -220,3 +225,51 @@ def format_spread_alert(
             _format_stats("90日", context.stats_90d),
         )
     )
+
+
+class SpreadAlertProcessor:
+    def __init__(
+        self,
+        history: SpreadHistory,
+        telegram: TelegramTransport,
+        *,
+        chart_renderer: Callable[
+            [SpreadAlertDetails, HistoricalSpreadContext], bytes | None
+        ] = render_spread_chart,
+    ) -> None:
+        self._history = history
+        self._telegram = telegram
+        self._chart_renderer = chart_renderer
+
+    async def process(self, alert: AlertRequest) -> None:
+        details = parse_spread_alert(alert)
+        try:
+            context = await asyncio.to_thread(
+                self._history.query,
+                canonical_symbol=details.canonical_symbol,
+                long_venue=details.long_venue,
+                long_venue_symbol=details.long_venue_symbol,
+                short_venue=details.short_venue,
+                short_venue_symbol=details.short_venue_symbol,
+                primary_size_usd=details.primary_size_usd,
+                as_of=details.sample_time,
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.error("history query failed for alert_id=%s", alert.event_id)
+            context = HistoricalSpreadContext.empty()
+
+        message = format_spread_alert(details, context)
+        chart_png: bytes | None = None
+        try:
+            chart_png = await asyncio.to_thread(
+                self._chart_renderer,
+                details,
+                context,
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.error("chart rendering failed for alert_id=%s", alert.event_id)
+
+        if chart_png is None or len(message) > 1_024:
+            await self._telegram.send_text(message)
+        else:
+            await self._telegram.send_chart(chart_png, message)
