@@ -36,6 +36,49 @@ work is added to the fast path. The slow path does not access `RadarState`,
 SQLite episode state, current fees for historical calculations, or any
 unflushed Parquet buffer.
 
+## Blocking-work isolation
+
+The queue is the responsibility boundary, but it is not by itself an event
+loop isolation boundary. DuckDB queries and Matplotlib rendering are
+synchronous operations, so the async processor must offload both to a worker
+thread with `asyncio.to_thread()`:
+
+```python
+history = await asyncio.to_thread(
+    history_reader.query,
+    ...,
+)
+
+chart_png = await asyncio.to_thread(
+    chart_renderer,
+    ...,
+)
+```
+
+Payload parsing and message formatting may remain inline because they are
+small. Telegram continues to use async `httpx.AsyncClient` directly and does
+not need `to_thread()`. No custom executor, process pool, worker pool,
+background framework, retry queue, broker, or durable queue is introduced.
+
+The intended runtime boundary is:
+
+```text
+FAST asyncio loop
+    |
+    +--> collectors / MonitorRunner
+    |
+    +--> AlertWorker
+             |
+             +--> DuckDB query ------ asyncio.to_thread()
+             +--> Matplotlib render - asyncio.to_thread()
+             +--> Telegram HTTP ----- async httpx
+```
+
+Processor and worker tests must verify that the history and chart callables
+are invoked through the offloaded path without changing queue ordering,
+failure continuation, or `queue.task_done()` behavior. Tests do not rely on
+timing-sensitive performance assertions.
+
 ## Historical spread reconstruction
 
 `src/radar/history/spread.py` provides a focused history reader. It accepts a
@@ -128,9 +171,10 @@ optional chart-rendering function for deterministic tests. It processes only
 `AlertRequest.monitor == "spread"`:
 
 1. parse the current alert payload;
-2. query history using the payload's `sample_time` as `as_of`;
+2. query history using the payload's `sample_time` as `as_of` via
+   `asyncio.to_thread()`;
 3. if history fails, log the failure and use an empty context;
-4. try to render a chart;
+4. try to render a chart via `asyncio.to_thread()`;
 5. if rendering fails or returns no chart, send the current alert as text;
 6. otherwise send the chart with the formatted caption.
 
@@ -158,4 +202,3 @@ cleanup, deterministic message content, Telegram request paths and sanitized
 failures, processor degradation, worker continuation, and queue accounting.
 All tests are non-live; no Telegram live test or Task 6 application test is
 added.
-
