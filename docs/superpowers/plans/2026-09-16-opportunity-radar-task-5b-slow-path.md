@@ -23,6 +23,7 @@
 - Historical long/short rows require exact `sample_time` equality, complete identity filtering, latest-`observed_at` deduplication, and `sample_time <= as_of`.
 - Use only fixed executable sizes `$1,000`, `$5,000`, and `$10,000`; never interpolate or substitute another price field.
 - Missing history/chart errors degrade the current alert; Telegram errors remain observable and must not kill later worker items.
+- Telegram photo captions are limited to 1,024 characters: never truncate an alert; an oversized formatted message must use text-only delivery.
 - Do not add pandas, a custom executor, process pool, worker pool, retry framework, broker, database server, or durable queue.
 - Do not read `ParquetStorage._pending`, persist full L2, or add Task 6 scheduling/secret/application wiring.
 
@@ -441,7 +442,22 @@ assert chart_thread_ids[0] != loop_thread
 Cover successful chart delivery, empty history text delivery, history
 exception text fallback, chart exception text fallback, current payload values
 remaining in the message, and non-spread request rejection. Assert the
-Telegram fake receives exactly one text or chart call.
+Telegram fake receives exactly one text or chart call. Also cover Telegram
+caption safety with these delivery cases:
+
+```python
+if chart_png is None:
+    await telegram.send_text(message)
+elif len(message) <= 1_024:
+    await telegram.send_chart(chart_png, message)
+else:
+    await telegram.send_text(message)
+```
+
+Use one message at exactly or below 1,024 characters and one message above
+1,024 characters. Assert that the first uses chart delivery, the second uses
+text-only delivery, the oversized text is passed through unchanged, and
+`send_chart()` is not called for the oversized message.
 
 - [ ] **Step 2: Run processor tests to verify they fail before implementation**
 
@@ -492,7 +508,18 @@ context = await asyncio.to_thread(
 Catch and log history exceptions using only the alert event ID, then use
 `HistoricalSpreadContext.empty()`. Call the injected chart renderer through
 `await asyncio.to_thread(self._chart_renderer, details, context)`, catch and
-log rendering exceptions, and select text-only or chart delivery. Do not catch
+log rendering exceptions, and select delivery exactly as follows:
+
+```python
+if chart_png is None:
+    await self._telegram.send_text(message)
+elif len(message) <= 1_024:
+    await self._telegram.send_chart(chart_png, message)
+else:
+    await self._telegram.send_text(message)
+```
+
+Do not truncate the formatted message to fit the caption limit. Do not catch
 Telegram exceptions; let the worker observe them.
 
 - [ ] **Step 4: Run processor tests and commit**
@@ -642,15 +669,19 @@ Confirm no Task 5B slow-path import or call was added to
 call is behind `asyncio.to_thread()`, Telegram remains async HTTP, no secret or
 live Telegram test exists, and no Task 6 application file was changed.
 
-- [ ] **Step 4: Commit the completed Task 5B checkpoint**
+- [ ] **Step 4: Commit any remaining Task 5B checkpoint changes**
 
-After the full verification is green and the scope audit is clean, commit any
-remaining Task 5B-only changes with:
+After the full verification is green and the scope audit is clean, inspect
+`git status`. Only if Task 5B changes remain uncommitted, stage those
+Task-5B-only files and create the checkpoint commit:
 
 ```bash
 git add src tests pyproject.toml uv.lock
 git commit -m "Implement Task 5B spread alert slow path"
 ```
+
+If the working tree is already clean, do not create an empty checkpoint
+commit.
 
 Report the starting SHA, all Task 5B commit SHAs, final SHA, files changed,
 historical query semantics, offload behavior, Telegram endpoints, tests and
