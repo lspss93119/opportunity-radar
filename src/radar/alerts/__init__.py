@@ -5,8 +5,10 @@ from radar.alerts.spread import (
     parse_spread_alert,
 )
 from radar.alerts.telegram import TelegramTransport, TelegramTransportError
+from radar.alerts.worker import AlertWorker
 
 __all__ = [
+    "AlertWorker",
     "FundingContext",
     "SpreadAlertDetails",
     "SpreadAlertProcessor",
