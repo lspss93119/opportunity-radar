@@ -5,6 +5,7 @@ description = "Read-only personal market opportunity radar"
 requires-python = ">=3.13"
 dependencies = [
   "duckdb>=1.1,<2",
+  "matplotlib>=3.9,<4",
   "pydantic>=2.9,<3",
   "pyarrow>=17,<22",
   "pytz>=2024.1,<2027",
