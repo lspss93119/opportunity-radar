@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from radar.collectors.base import CollectorBatch
+from radar.config import MarketConfig, RadarConfig
+from radar.models import MarketSnapshot
+from radar.monitors.base import AlertRequest
+from radar.pipeline import MarketDataPipeline
+from radar.state import RadarState
+from radar.storage.parquet import ParquetStorage
+
+NOW = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+
+
+def make_market(sample_time: datetime = NOW) -> MarketSnapshot:
+    return MarketSnapshot(
+        sample_time=sample_time,
+        observed_at=sample_time + timedelta(milliseconds=100),
+        venue="lighter",
+        venue_symbol="BTC",
+        canonical_symbol="BTC",
+        best_bid=99.0,
+        best_bid_size=10.0,
+        best_ask=100.0,
+        best_ask_size=10.0,
+        buy_10k_vwap=100.0,
+        sell_10k_vwap=99.0,
+    )
+
+
+class FakeCollector:
+    venue = "lighter"
+
+    async def collect(
+        self, *, sample_time: datetime, include_hourly_context: bool
+    ) -> CollectorBatch:
+        return CollectorBatch(market_snapshots=(make_market(sample_time),))
+
+
+class RecordingRunner:
+    def __init__(self, queue: asyncio.Queue[AlertRequest]) -> None:
+        self.queue = queue
+        self.calls: list[tuple[datetime, RadarState]] = []
+
+    async def run_cycle(self, now: datetime) -> None:
+        self.calls.append((now, self.state))
+
+    state: RadarState
+
+
+class FakeWorker:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.running = asyncio.Event()
+
+    async def run_forever(self) -> None:
+        self.started.set()
+        self.running.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class FakeRuntimeStore:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.closed = False
+
+    def close(self) -> None:
+        self.events.append("runtime.close")
+        self.closed = True
+
+
+class FakeStorage:
+    pending_count = 1
+
+
+class RecordingPipeline:
+    sampling_seconds = 10
+
+    def __init__(self, events: list[str]) -> None:
+        self.state = RadarState()
+        self.events = events
+        self.flush_calls: list[datetime] = []
+
+    async def collect_once(self, *, now: datetime) -> CollectorBatch:
+        self.events.append("collect")
+        return CollectorBatch()
+
+    def flush_storage(self, *, now: datetime | None = None) -> int:
+        assert now is not None
+        self.events.append("flush")
+        self.flush_calls.append(now)
+        return 1
+
+
+def make_application_config() -> RadarConfig:
+    return RadarConfig(
+        markets=[
+            MarketConfig(
+                venue="lighter",
+                venue_symbol="BTC",
+                canonical_symbol="BTC",
+            )
+        ],
+    )
+
+
+def test_missing_telegram_credentials_are_reported_without_values():
+    from radar.app import load_telegram_credentials
+
+    with pytest.raises(RuntimeError, match="RADAR_TELEGRAM_BOT_TOKEN") as error:
+        load_telegram_credentials({"RADAR_TELEGRAM_CHAT_ID": "chat-secret"})
+
+    assert "chat-secret" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_application_cycle_updates_state_appends_storage_and_runs_monitor(tmp_path):
+    from radar.app import RadarApplication
+
+    state = RadarState()
+    storage = ParquetStorage(tmp_path / "data")
+    pipeline = MarketDataPipeline(
+        [FakeCollector()],
+        state,
+        storage=storage,
+    )
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = state
+    runtime = FakeRuntimeStore([])
+    app = RadarApplication(
+        pipeline=pipeline,
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=storage,
+        runtime_store=runtime,  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+
+    batch = await app.collect_and_evaluate_once(NOW)
+
+    assert batch.market_snapshots[0].venue == "lighter"
+    assert state.get_market("lighter", "BTC") is not None
+    assert storage.pending_count == 1
+    assert runner.calls == [(NOW, state)]
+
+
+@pytest.mark.asyncio
+async def test_application_flushes_at_interval_not_after_each_sample():
+    from radar.app import RadarApplication
+
+    events: list[str] = []
+    pipeline = RecordingPipeline(events)
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    app = RadarApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=FakeRuntimeStore(events),  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+
+    assert await app.maybe_flush(NOW) == 0
+    assert await app.maybe_flush(NOW + timedelta(seconds=59)) == 0
+    assert await app.maybe_flush(NOW + timedelta(seconds=60)) == 1
+    assert await app.maybe_flush(NOW + timedelta(seconds=61)) == 0
+
+    assert pipeline.flush_calls == [NOW + timedelta(seconds=60)]
+
+
+@pytest.mark.asyncio
+async def test_application_shutdown_flushes_then_cancels_worker_then_closes_runtime():
+    from radar.app import RadarApplication
+
+    events: list[str] = []
+    pipeline = RecordingPipeline(events)
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    worker = FakeWorker()
+    runtime = FakeRuntimeStore(events)
+    app = RadarApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=worker,  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=runtime,  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    await app.run(stop_event=stop_event)
+
+    assert worker.cancelled.is_set()
+    assert events == ["flush", "runtime.close"]
+    assert runtime.closed
+
+
+def test_build_application_wires_monitor_runner_and_worker_to_one_queue(tmp_path):
+    from radar.app import build_application
+
+    app = build_application(
+        make_application_config(),
+        data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime" / "radar.sqlite3",
+        telegram_credentials=("token-not-logged", "chat-id"),
+        clock=lambda: NOW,
+    )
+
+    try:
+        assert app.monitor_runner.queue is app.alert_worker._queue
+    finally:
+        app.runtime_store.close()

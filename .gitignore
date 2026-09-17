@@ -4,5 +4,6 @@ __pycache__/
 *.py[cod]
 .env
 data/
+runtime/
 artifacts/
 .DS_Store
