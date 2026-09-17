@@ -15,7 +15,8 @@ from radar.alerts.worker import AlertWorker
 from radar.collectors.base import CollectorBatch
 from radar.config import RadarConfig, load_config
 from radar.history.spread import SpreadHistory
-from radar.monitors.base import AlertRequest
+from radar.models import FundingSnapshot, MarketSnapshot
+from radar.monitors.base import AlertRequest, JSONValue
 from radar.monitors.registry import build_enabled_monitors
 from radar.monitors.runner import MonitorRunner
 from radar.pipeline import MarketDataPipeline, aligned_sample_time, utc_now
@@ -78,6 +79,7 @@ class RadarApplication:
         storage: ParquetStorage,
         runtime_store: SQLiteRuntimeStore,
         processor: SpreadAlertProcessor,
+        config: RadarConfig | None = None,
         clock: Callable[[], datetime] = utc_now,
         flush_interval_seconds: int = DEFAULT_PARQUET_FLUSH_SECONDS,
         stats: PilotStats | None = None,
@@ -90,6 +92,7 @@ class RadarApplication:
         self.storage = storage
         self.runtime_store = runtime_store
         self.processor = processor
+        self.config = RadarConfig() if config is None else config
         self.clock = clock
         self.flush_interval_seconds = flush_interval_seconds
         self.stats = PilotStats() if stats is None else stats
@@ -164,8 +167,18 @@ class RadarApplication:
                     break
                 cycle_time = _as_utc(self.clock(), "now")
                 try:
-                    await self.collect_and_evaluate_once(cycle_time)
+                    batch = await self.collect_and_evaluate_once(cycle_time)
                     await self.maybe_flush(cycle_time)
+                    LOGGER.info(
+                        "collection cycle=%d sample_time=%s markets=%d funding=%d "
+                        "hourly_context=%d queue_size=%d",
+                        self.stats.collection_cycles,
+                        self.stats.latest_sample_time,
+                        len(batch.market_snapshots),
+                        len(batch.funding_snapshots),
+                        len(batch.hourly_contexts),
+                        self.monitor_runner.queue.qsize(),
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # noqa: BLE001
@@ -188,6 +201,156 @@ class RadarApplication:
                 self.stats.parquet_flushes,
                 self.monitor_runner.queue.qsize(),
             )
+
+
+def _configured_fee_bps(config: RadarConfig, venue: str) -> float:
+    for configured_venue, fee in config.fees_bps.items():
+        if configured_venue.lower() == venue.lower():
+            return fee
+    return 0.0
+
+
+def _find_smoke_pair(
+    state: RadarState,
+    symbol: str,
+) -> tuple[MarketSnapshot, MarketSnapshot]:
+    canonical_symbol = symbol.strip().upper()
+    if not canonical_symbol:
+        raise ValueError("symbol must be non-empty")
+    snapshots = tuple(
+        snapshot
+        for snapshot in state.markets
+        if snapshot.canonical_symbol.upper() == canonical_symbol
+    )
+    for long_snapshot in snapshots:
+        if long_snapshot.buy_10k_vwap is None:
+            continue
+        for short_snapshot in snapshots:
+            if (
+                short_snapshot is long_snapshot
+                or short_snapshot.venue.lower() == long_snapshot.venue.lower()
+                or short_snapshot.sell_10k_vwap is None
+                or short_snapshot.sample_time != long_snapshot.sample_time
+            ):
+                continue
+            return long_snapshot, short_snapshot
+    raise RuntimeError(
+        f"Telegram smoke requires two venues with current $10k VWAP data for {canonical_symbol}"
+    )
+
+
+def _funding_payload(
+    funding: FundingSnapshot | None,
+) -> dict[str, JSONValue] | None:
+    if funding is None:
+        return None
+    return {
+        "venue": funding.venue,
+        "venue_symbol": funding.venue_symbol,
+        "canonical_symbol": funding.canonical_symbol,
+        "effective_time": funding.effective_time.isoformat(),
+        "observed_at": funding.observed_at.isoformat(),
+        "funding_rate": funding.funding_rate,
+        "next_funding_time": (
+            funding.next_funding_time.isoformat()
+            if funding.next_funding_time is not None
+            else None
+        ),
+    }
+
+
+def _find_funding(
+    state: RadarState,
+    snapshot: MarketSnapshot,
+) -> FundingSnapshot | None:
+    for funding in state.funding:
+        if (
+            funding.venue == snapshot.venue
+            and funding.venue_symbol == snapshot.venue_symbol
+            and funding.canonical_symbol == snapshot.canonical_symbol
+        ):
+            return funding
+    return None
+
+
+def build_telegram_smoke_alert(
+    config: RadarConfig,
+    state: RadarState,
+    *,
+    symbol: str,
+    now: datetime,
+) -> AlertRequest:
+    current_time = _as_utc(now, "now")
+    long_snapshot, short_snapshot = _find_smoke_pair(state, symbol)
+    long_buy_vwap = long_snapshot.buy_10k_vwap
+    short_sell_vwap = short_snapshot.sell_10k_vwap
+    if long_buy_vwap is None or short_sell_vwap is None:
+        raise RuntimeError("Telegram smoke requires current $10k VWAP data")
+
+    sample_time = long_snapshot.sample_time
+    payload: dict[str, JSONValue] = {
+        "canonical_symbol": long_snapshot.canonical_symbol,
+        "long_venue": long_snapshot.venue,
+        "long_venue_symbol": long_snapshot.venue_symbol,
+        "short_venue": short_snapshot.venue,
+        "short_venue_symbol": short_snapshot.venue_symbol,
+        "primary_size_usd": 10_000,
+        "long_buy_vwap": long_buy_vwap,
+        "short_sell_vwap": short_sell_vwap,
+        # These are deliberately fixed smoke values. The app must not calculate
+        # or assert an opportunity; spread logic remains in SpreadMonitor.
+        "raw_spread_bps": 0.0,
+        "long_fee_bps": _configured_fee_bps(config, long_snapshot.venue),
+        "short_fee_bps": _configured_fee_bps(config, short_snapshot.venue),
+        "net_spread_bps": 0.0,
+        "sample_time": sample_time.isoformat(),
+        "candidate_duration_seconds": 0,
+        "alert_duration_seconds": 0,
+        "funding_context": {
+            "long": _funding_payload(_find_funding(state, long_snapshot)),
+            "short": _funding_payload(_find_funding(state, short_snapshot)),
+        },
+    }
+    return AlertRequest(
+        monitor="spread",
+        event_id=f"telegram-smoke:{long_snapshot.canonical_symbol}:{sample_time.isoformat()}",
+        created_at=current_time,
+        payload=payload,
+    )
+
+
+async def run_telegram_smoke(
+    application: RadarApplication,
+    *,
+    symbol: str = "BTC",
+    now: datetime | None = None,
+) -> None:
+    current_time = _as_utc(
+        application.clock() if now is None else now,
+        "now",
+    )
+    try:
+        batch = await application.pipeline.collect_once(now=current_time)
+        application.stats.collection_cycles += 1
+        if batch.market_snapshots:
+            application.stats.latest_sample_time = max(
+                snapshot.sample_time for snapshot in batch.market_snapshots
+            )
+        await application.flush_now(current_time)
+        alert = build_telegram_smoke_alert(
+            application.config,
+            application.pipeline.state,
+            symbol=symbol,
+            now=current_time,
+        )
+        LOGGER.info(
+            "telegram smoke sending synthetic alert symbol=%s sample_time=%s",
+            alert.payload["canonical_symbol"],
+            alert.payload["sample_time"],
+        )
+        await application.processor.process(alert)
+    finally:
+        application.runtime_store.close()
 
 
 def build_application(
@@ -260,6 +423,7 @@ def build_application(
         storage=storage,
         runtime_store=runtime_store,
         processor=processor,
+        config=config,
         clock=clock,
         stats=stats,
     )
@@ -288,9 +452,19 @@ def main(argv: list[str] | None = None) -> int:
             application = build_application(config)
             asyncio.run(application.run())
         else:
-            raise RuntimeError("telegram-smoke is not implemented yet")
+            application = build_application(config)
+            asyncio.run(
+                run_telegram_smoke(
+                    application,
+                    symbol=args.symbol,
+                )
+            )
     except KeyboardInterrupt:
         return 130
     except (OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

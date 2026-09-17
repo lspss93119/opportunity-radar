@@ -101,6 +101,48 @@ class RecordingPipeline:
         return 1
 
 
+class SmokePipeline:
+    sampling_seconds = 10
+
+    def __init__(self, state: RadarState, batch: CollectorBatch) -> None:
+        self.state = state
+        self.batch = batch
+        self.collect_calls: list[datetime] = []
+        self.flush_calls: list[datetime] = []
+
+    async def collect_once(self, *, now: datetime) -> CollectorBatch:
+        self.collect_calls.append(now)
+        self.state.apply(self.batch, replace_context=True)
+        return self.batch
+
+    def flush_storage(self, *, now: datetime | None = None) -> int:
+        assert now is not None
+        self.flush_calls.append(now)
+        return 1
+
+
+def make_smoke_market(
+    venue: str,
+    *,
+    sample_time: datetime = NOW,
+    buy_10k_vwap: float = 100.0,
+    sell_10k_vwap: float = 101.0,
+) -> MarketSnapshot:
+    return MarketSnapshot(
+        sample_time=sample_time,
+        observed_at=sample_time + timedelta(milliseconds=100),
+        venue=venue,
+        venue_symbol="BTC",
+        canonical_symbol="BTC",
+        best_bid=99.0,
+        best_bid_size=10.0,
+        best_ask=100.0,
+        best_ask_size=10.0,
+        buy_10k_vwap=buy_10k_vwap,
+        sell_10k_vwap=sell_10k_vwap,
+    )
+
+
 def make_application_config() -> RadarConfig:
     return RadarConfig(
         markets=[
@@ -227,3 +269,118 @@ def test_build_application_wires_monitor_runner_and_worker_to_one_queue(tmp_path
         assert app.monitor_runner.queue is app.alert_worker._queue
     finally:
         app.runtime_store.close()
+
+
+def test_parser_accepts_run_and_telegram_smoke_commands():
+    from radar.app import build_parser
+
+    parser = build_parser()
+
+    run_args = parser.parse_args(["run", "--config", "config/radar.yaml"])
+    smoke_args = parser.parse_args(
+        ["telegram-smoke", "--config", "config/radar.yaml", "--symbol", "ETH"]
+    )
+
+    assert run_args.command == "run"
+    assert smoke_args.command == "telegram-smoke"
+    assert smoke_args.symbol == "ETH"
+
+
+@pytest.mark.asyncio
+async def test_telegram_smoke_collects_flushes_and_uses_real_processor():
+    from radar.alerts.spread import SpreadAlertProcessor
+    from radar.app import RadarApplication, run_telegram_smoke
+    from radar.history.spread import HistoricalSpreadContext
+
+    state = RadarState()
+    batch = CollectorBatch(
+        market_snapshots=(
+            make_smoke_market("lighter", buy_10k_vwap=100.0, sell_10k_vwap=101.0),
+            make_smoke_market("hyperliquid", buy_10k_vwap=100.5, sell_10k_vwap=101.5),
+        )
+    )
+    pipeline = SmokePipeline(state, batch)
+
+    class SmokeHistory:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def query(self, **kwargs: object) -> HistoricalSpreadContext:
+            self.calls.append(kwargs)
+            return HistoricalSpreadContext.empty()
+
+    history = SmokeHistory()
+
+    class SmokeTelegram:
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+            self.chart_calls: list[tuple[bytes, str]] = []
+
+        async def send_text(self, text: str) -> None:
+            self.text_calls.append(text)
+
+        async def send_chart(self, png: bytes, caption: str) -> None:
+            self.chart_calls.append((png, caption))
+
+    telegram = SmokeTelegram()
+    rendered: list[str] = []
+
+    def render(details, context):
+        rendered.append(details.canonical_symbol)
+        return b"png"
+
+    processor = SpreadAlertProcessor(
+        history,
+        telegram,
+        chart_renderer=render,
+    )  # type: ignore[arg-type]
+    runtime = FakeRuntimeStore([])
+    app = RadarApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=RecordingRunner(asyncio.Queue()),  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=runtime,  # type: ignore[arg-type]
+        processor=processor,
+        clock=lambda: NOW,
+    )
+
+    await run_telegram_smoke(app, symbol="BTC", now=NOW)
+
+    assert pipeline.collect_calls == [NOW]
+    assert pipeline.flush_calls == [NOW]
+    assert rendered == ["BTC"]
+    assert history.calls[0]["canonical_symbol"] == "BTC"
+    assert len(telegram.chart_calls) == 1
+    assert telegram.text_calls == []
+    assert runtime.closed
+
+
+def test_main_dispatches_telegram_smoke(monkeypatch, tmp_path):
+    import radar.app as app_module
+
+    config = make_application_config()
+    fake_application = object()
+    calls: list[tuple[object, str]] = []
+
+    async def fake_smoke(application, *, symbol):
+        calls.append((application, symbol))
+
+    monkeypatch.setattr(app_module, "load_config", lambda path: config)
+    monkeypatch.setattr(
+        app_module,
+        "build_application",
+        lambda loaded_config: fake_application,
+    )
+    monkeypatch.setattr(app_module, "run_telegram_smoke", fake_smoke)
+
+    assert app_module.main(
+        [
+            "telegram-smoke",
+            "--config",
+            str(tmp_path / "radar.yaml"),
+            "--symbol",
+            "ETH",
+        ]
+    ) == 0
+    assert calls == [(fake_application, "ETH")]
