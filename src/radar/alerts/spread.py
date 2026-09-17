@@ -183,10 +183,10 @@ def _format_funding(
 
 def _format_stats(label: str, stats: WindowStats) -> str:
     if stats.median_raw_spread_bps is None:
-        return f"{label}: 不可用（样本数 {stats.sample_count}）"
+        return f"{label}: 不可用（樣本數 {stats.sample_count}）"
     return (
-        f"{label}: 中位数 {stats.median_raw_spread_bps:.2f} bps"
-        f"（样本数 {stats.sample_count}）"
+        f"{label}: 中位數 {stats.median_raw_spread_bps:.2f} bps"
+        f"（樣本數 {stats.sample_count}）"
     )
 
 
@@ -196,30 +196,30 @@ def format_spread_alert(
 ) -> str:
     return "\n".join(
         (
-            f"价差警报 {details.canonical_symbol} ${details.primary_size_usd:,}",
+            f"價差警報 {details.canonical_symbol} ${details.primary_size_usd:,}",
             (
                 f"做多 {details.long_venue.title()} ({details.long_venue_symbol}) "
-                f"买入 VWAP {details.long_buy_vwap:.2f}"
+                f"買入 VWAP {details.long_buy_vwap:.2f}"
             ),
             (
                 f"做空 {details.short_venue.title()} ({details.short_venue_symbol}) "
-                f"卖出 VWAP {details.short_sell_vwap:.2f}"
+                f"賣出 VWAP {details.short_sell_vwap:.2f}"
             ),
-            f"样本时间 {details.sample_time.isoformat()}",
-            f"原始价差 {details.raw_spread_bps:.2f} bps",
+            f"樣本時間 {details.sample_time.isoformat()}",
+            f"原始價差 {details.raw_spread_bps:.2f} bps",
             (
-                f"手续费 {details.long_venue.title()} {details.long_fee_bps:.2f} bps"
+                f"手續費 {details.long_venue.title()} {details.long_fee_bps:.2f} bps"
                 f" + {details.short_venue.title()} {details.short_fee_bps:.2f} bps"
             ),
-            f"净价差 {details.net_spread_bps:.2f} bps",
+            f"淨價差 {details.net_spread_bps:.2f} bps",
             (
-                f"候选持续 {details.candidate_duration_seconds}s，"
-                f"警报持续 {details.alert_duration_seconds}s"
+                f"候選持續 {details.candidate_duration_seconds}s，"
+                f"警報持續 {details.alert_duration_seconds}s"
             ),
-            "资金费率",
+            "資金費率",
             _format_funding(details.long_venue, details.long_funding),
             _format_funding(details.short_venue, details.short_funding),
-            "历史原始价差",
+            "歷史原始價差",
             _format_stats("7日", context.stats_7d),
             _format_stats("30日", context.stats_30d),
             _format_stats("90日", context.stats_90d),

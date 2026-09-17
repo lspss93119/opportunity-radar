@@ -110,6 +110,47 @@ def test_parse_and_format_spread_alert_preserves_current_and_history_values():
     assert "80.00" not in message
 
 
+def test_format_spread_alert_uses_traditional_chinese_wording():
+    from radar.alerts.spread import format_spread_alert, parse_spread_alert
+
+    details = parse_spread_alert(make_alert())
+    message = format_spread_alert(details, make_context())
+
+    for wording in (
+        "價差警報",
+        "買入",
+        "賣出",
+        "樣本時間",
+        "原始價差",
+        "手續費",
+        "淨價差",
+        "候選持續",
+        "警報持續",
+        "資金費率",
+        "歷史原始價差",
+        "樣本數",
+        "中位數",
+    ):
+        assert wording in message
+
+    for wording in (
+        "价差警报",
+        "买入",
+        "卖出",
+        "样本时间",
+        "原始价差",
+        "手续费",
+        "净价差",
+        "候选持续",
+        "警报持续",
+        "资金费率",
+        "历史原始价差",
+        "样本数",
+        "中位数",
+    ):
+        assert wording not in message
+
+
 def test_format_missing_history_and_funding_is_deterministically_unavailable():
     from radar.alerts.spread import format_spread_alert, parse_spread_alert
 
