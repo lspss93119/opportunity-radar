@@ -124,6 +124,7 @@ async def test_hyperliquid_collector_normalizes_market_funding_and_hourly_contex
 @pytest.mark.asyncio
 async def test_hyperliquid_collector_omits_symbol_when_its_book_request_fails():
     transport = FixtureTransport()
+    failures: list[tuple[str, Exception]] = []
 
     async def failing_transport(url: str, *, method: str, json_body=None, params=None):
         if json_body.get("type") == "l2Book" and json_body.get("coin") == "ETH":
@@ -131,7 +132,10 @@ async def test_hyperliquid_collector_omits_symbol_when_its_book_request_fails():
         return await transport(url, method=method, json_body=json_body, params=params)
 
     collector = HyperliquidCollector(
-        configured_markets(), request_json=failing_transport, clock=lambda: OBSERVED_AT
+        configured_markets(),
+        request_json=failing_transport,
+        clock=lambda: OBSERVED_AT,
+        error_handler=lambda venue, error: failures.append((venue, error)),
     )
     batch = await collector.collect(
         sample_time=SAMPLE_TIME, include_hourly_context=False
@@ -141,3 +145,29 @@ async def test_hyperliquid_collector_omits_symbol_when_its_book_request_fails():
         "BTC",
         "SOL",
     }
+    assert [(venue, str(error)) for venue, error in failures] == [
+        ("hyperliquid", "temporary outage")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_collector_reports_metadata_failure():
+    failures: list[tuple[str, Exception]] = []
+
+    async def failing_transport(url: str, *, method: str, json_body=None, params=None):
+        raise OSError("metadata unavailable")
+
+    collector = HyperliquidCollector(
+        configured_markets(),
+        request_json=failing_transport,
+        error_handler=lambda venue, error: failures.append((venue, error)),
+    )
+
+    batch = await collector.collect(
+        sample_time=SAMPLE_TIME, include_hourly_context=False
+    )
+
+    assert batch.market_snapshots == ()
+    assert [(venue, str(error)) for venue, error in failures] == [
+        ("hyperliquid", "metadata unavailable")
+    ]

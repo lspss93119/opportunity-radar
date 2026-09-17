@@ -7,10 +7,12 @@ from typing import Any
 
 from radar.collectors.base import (
     CollectorBatch,
+    CollectorErrorHandler,
     finite_float,
     markets_for_venue,
     non_negative_float,
     positive_float,
+    report_collector_error,
 )
 from radar.collectors.http import request_json as default_request_json
 from radar.config import MarketConfig
@@ -146,10 +148,12 @@ class LighterCollector:
         *,
         request_json=default_request_json,
         clock=lambda: datetime.now(UTC),
+        error_handler: CollectorErrorHandler | None = None,
     ) -> None:
         self._markets = markets_for_venue(markets, self.venue)
         self._request_json = request_json
         self._clock = clock
+        self._error_handler = error_handler
 
     async def collect(
         self, *, sample_time: datetime, include_hourly_context: bool
@@ -162,7 +166,8 @@ class LighterCollector:
             )
             details = parse_lighter_order_book_details(details_payload)
             details_observed_at = self._clock()
-        except Exception:
+        except Exception as error:  # noqa: BLE001
+            report_collector_error(self._error_handler, self.venue, error)
             return CollectorBatch()
 
         market_snapshots = await asyncio.gather(
@@ -251,7 +256,8 @@ class LighterCollector:
                 buy_10k_vwap=buy_vwap(asks, 10_000),
                 sell_10k_vwap=sell_vwap(bids, 10_000),
             )
-        except Exception:
+        except Exception as error:  # noqa: BLE001
+            report_collector_error(self._error_handler, self.venue, error)
             return None
 
     async def _collect_funding(
@@ -284,5 +290,6 @@ class LighterCollector:
                 funding_rate=point.funding_rate,
                 next_funding_time=None,
             )
-        except Exception:
+        except Exception as error:  # noqa: BLE001
+            report_collector_error(self._error_handler, self.venue, error)
             return None

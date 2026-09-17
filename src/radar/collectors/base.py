@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 import math
-from typing import Protocol, Sequence, runtime_checkable
+from typing import Callable, Protocol, Sequence, TypeAlias, runtime_checkable
 
 from radar.config import MarketConfig
 from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel
+
+LOGGER = logging.getLogger(__name__)
+CollectorErrorHandler: TypeAlias = Callable[[str, Exception], None]
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,29 @@ class Collector(Protocol):
         self, *, sample_time: datetime, include_hourly_context: bool
     ) -> CollectorBatch:
         """Collect one normalized sample without placing or signing orders."""
+
+
+def report_collector_error(
+    error_handler: CollectorErrorHandler | None,
+    venue: str,
+    error: Exception,
+) -> None:
+    if error_handler is None:
+        LOGGER.error(
+            "collector %s failed: %s: %s",
+            venue,
+            type(error).__name__,
+            error,
+        )
+        return
+    try:
+        error_handler(venue, error)
+    except Exception as handler_error:  # noqa: BLE001
+        LOGGER.error(
+            "collector error handler failed for %s",
+            venue,
+            exc_info=handler_error,
+        )
 
 
 def markets_for_venue(

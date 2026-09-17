@@ -156,6 +156,45 @@ async def test_failed_venue_does_not_leave_old_market_snapshot_in_state():
 
 
 @pytest.mark.asyncio
+async def test_failed_collector_is_reported_while_other_batch_remains_usable():
+    failures: list[tuple[str, Exception]] = []
+    state = RadarState()
+    pipeline = MarketDataPipeline(
+        [FailingCollector(), SuccessfulCollector()],
+        state,
+        sampling_seconds=10,
+        collector_error_handler=lambda venue, error: failures.append((venue, error)),
+    )
+
+    batch = await pipeline.collect_once(now=NOW)
+
+    assert failures[0][0] == "lighter"
+    assert str(failures[0][1]) == "venue unavailable"
+    assert [snapshot.venue for snapshot in batch.market_snapshots] == ["hyperliquid"]
+    assert state.get_market("hyperliquid", "BTC") is not None
+
+
+@pytest.mark.asyncio
+async def test_collector_error_handler_failure_does_not_stop_successful_batch():
+    state = RadarState()
+
+    def broken_handler(venue: str, error: Exception) -> None:
+        raise RuntimeError("logging failed")
+
+    pipeline = MarketDataPipeline(
+        [FailingCollector(), SuccessfulCollector()],
+        state,
+        sampling_seconds=10,
+        collector_error_handler=broken_handler,
+    )
+
+    batch = await pipeline.collect_once(now=NOW)
+
+    assert [snapshot.venue for snapshot in batch.market_snapshots] == ["hyperliquid"]
+    assert state.get_market("hyperliquid", "BTC") is not None
+
+
+@pytest.mark.asyncio
 async def test_pipeline_hands_collected_batch_to_optional_storage(tmp_path):
     storage = ParquetStorage(tmp_path / "data")
     pipeline = MarketDataPipeline(

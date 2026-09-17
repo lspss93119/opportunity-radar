@@ -4,7 +4,12 @@ import asyncio
 from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 
-from radar.collectors.base import Collector, CollectorBatch
+from radar.collectors.base import (
+    Collector,
+    CollectorBatch,
+    CollectorErrorHandler,
+    report_collector_error,
+)
 from radar.config import RadarConfig
 from radar.state import RadarState
 from radar.storage.parquet import ParquetStorage
@@ -84,6 +89,7 @@ class MarketDataPipeline:
         sampling_seconds: int = SAMPLE_INTERVAL_SECONDS,
         clock: Callable[[], datetime] = utc_now,
         storage: ParquetStorage | None = None,
+        collector_error_handler: CollectorErrorHandler | None = None,
     ) -> None:
         if sampling_seconds != SAMPLE_INTERVAL_SECONDS:
             raise ValueError("sampling_seconds must be a 10-second interval")
@@ -92,6 +98,7 @@ class MarketDataPipeline:
         self.sampling_seconds = sampling_seconds
         self._clock = clock
         self.storage = storage
+        self._collector_error_handler = collector_error_handler
         self._last_hourly_sample: datetime | None = None
 
     @classmethod
@@ -103,14 +110,25 @@ class MarketDataPipeline:
         request_json=None,
         clock: Callable[[], datetime] = utc_now,
         storage: ParquetStorage | None = None,
+        collector_error_handler: CollectorErrorHandler | None = None,
     ) -> "MarketDataPipeline":
         from radar.collectors.hyperliquid import HyperliquidCollector
         from radar.collectors.lighter import LighterCollector
 
         collector_kwargs = {} if request_json is None else {"request_json": request_json}
         collectors = (
-            LighterCollector(config.markets, clock=clock, **collector_kwargs),
-            HyperliquidCollector(config.markets, clock=clock, **collector_kwargs),
+            LighterCollector(
+                config.markets,
+                clock=clock,
+                error_handler=collector_error_handler,
+                **collector_kwargs,
+            ),
+            HyperliquidCollector(
+                config.markets,
+                clock=clock,
+                error_handler=collector_error_handler,
+                **collector_kwargs,
+            ),
         )
         return cls(
             collectors,
@@ -118,6 +136,7 @@ class MarketDataPipeline:
             sampling_seconds=config.sampling_seconds,
             clock=clock,
             storage=storage,
+            collector_error_handler=collector_error_handler,
         )
 
     @property
@@ -146,7 +165,24 @@ class MarketDataPipeline:
             ),
             return_exceptions=True,
         )
-        batches = tuple(result for result in results if isinstance(result, CollectorBatch))
+        batches: list[CollectorBatch] = []
+        for collector, result in zip(self._collectors, results, strict=True):
+            if isinstance(result, CollectorBatch):
+                batches.append(result)
+            elif isinstance(result, asyncio.CancelledError):
+                raise result
+            elif isinstance(result, Exception):
+                report_collector_error(
+                    self._collector_error_handler,
+                    collector.venue,
+                    result,
+                )
+            else:
+                report_collector_error(
+                    self._collector_error_handler,
+                    collector.venue,
+                    TypeError("collector returned a non-CollectorBatch value"),
+                )
         batch = merge_batches(batches)
         self.state.apply(batch, replace_context=include_hourly_context)
         if self.storage is not None:
