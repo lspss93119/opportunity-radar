@@ -440,6 +440,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     smoke_parser.add_argument("--config", type=Path, required=True)
     smoke_parser.add_argument("--symbol", default="BTC")
+    opportunities_parser = subparsers.add_parser(
+        "opportunities",
+        help="report historical opportunities from Parquet",
+    )
+    opportunities_parser.add_argument("--config", type=Path, required=True)
+    opportunities_parser.add_argument("--hours", type=float, default=6.0)
+    opportunities_parser.add_argument("--top", type=int, default=20)
+    opportunities_parser.add_argument(
+        "--size",
+        dest="size_usd",
+        type=int,
+        choices=(1_000, 5_000, 10_000),
+    )
+    opportunities_parser.add_argument("--symbol")
+    opportunities_parser.add_argument("--min-net-bps", type=float)
     return parser
 
 
@@ -449,7 +464,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
-        if args.command == "run":
+        if args.command == "opportunities":
+            from radar.history.opportunities import (
+                build_opportunity_report,
+                format_opportunity_report,
+            )
+
+            report = build_opportunity_report(
+                DEFAULT_DATA_ROOT,
+                config,
+                hours=args.hours,
+                top=args.top,
+                size_usd=args.size_usd,
+                symbol=args.symbol,
+                min_net_bps=args.min_net_bps,
+            )
+            print(format_opportunity_report(report, top=args.top))
+        elif args.command == "run":
             application = build_application(config)
             asyncio.run(application.run())
         else:
