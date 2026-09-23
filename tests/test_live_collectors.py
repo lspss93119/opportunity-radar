@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from radar.collectors.arcus import ArcusCollector
+from radar.collectors.backpack import BackpackCollector
 from radar.collectors.hyperliquid import HyperliquidCollector
 from radar.collectors.lighter import LighterCollector
 from radar.config import MarketConfig
@@ -43,6 +44,17 @@ def configured_arcus_markets() -> list[MarketConfig]:
         MarketConfig(
             venue="arcus",
             venue_symbol=f"{symbol}-USD",
+            canonical_symbol=symbol,
+        )
+        for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
+    ]
+
+
+def configured_backpack_markets() -> list[MarketConfig]:
+    return [
+        MarketConfig(
+            venue="backpack",
+            venue_symbol=f"{symbol}.US_USDC_PERP",
             canonical_symbol=symbol,
         )
         for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
@@ -198,5 +210,37 @@ async def test_arcus_exact_equity_universe_public_read_only_live_smoke():
         for size in ("1k", "5k", "10k")
     }
     assert all(count == len(expected_symbols) for count in vwap_availability.values())
+    assert {item.canonical_symbol for item in batch.funding_snapshots} == expected_symbols
+    assert {item.canonical_symbol for item in batch.hourly_contexts} == expected_symbols
+
+
+@pytest.mark.live
+@pytest.mark.asyncio
+async def test_backpack_exact_equity_universe_public_read_only_live_smoke():
+    now = datetime.now(UTC)
+    sample_time = aligned_sample_time(now, 10)
+    expected_symbols = {"SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU"}
+    batch = await BackpackCollector(configured_backpack_markets()).collect(
+        sample_time=sample_time,
+        include_hourly_context=True,
+    )
+
+    assert {snapshot.canonical_symbol for snapshot in batch.market_snapshots} == expected_symbols
+    assert all(snapshot.venue == "backpack" for snapshot in batch.market_snapshots)
+    assert all(snapshot.sample_time == sample_time for snapshot in batch.market_snapshots)
+    assert all(snapshot.observed_at >= sample_time for snapshot in batch.market_snapshots)
+    assert all(snapshot.best_bid < snapshot.best_ask for snapshot in batch.market_snapshots)
+    vwap_availability = {
+        size: sum(
+            getattr(snapshot, f"buy_{size}_vwap") is not None
+            and getattr(snapshot, f"sell_{size}_vwap") is not None
+            for snapshot in batch.market_snapshots
+        )
+        for size in ("1k", "5k", "10k")
+    }
+    assert all(count == len(expected_symbols) for count in vwap_availability.values())
+    assert {snapshot.venue_symbol for snapshot in batch.market_snapshots} == {
+        f"{symbol}.US_USDC_PERP" for symbol in expected_symbols
+    }
     assert {item.canonical_symbol for item in batch.funding_snapshots} == expected_symbols
     assert {item.canonical_symbol for item in batch.hourly_contexts} == expected_symbols

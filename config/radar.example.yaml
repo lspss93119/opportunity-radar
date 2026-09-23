@@ -6,6 +6,7 @@ fees_bps:
   trade_xyz: 9.0
   entropy: 9.0
   arcus: 2.25
+  backpack: 5.0
 
 markets:
   - venue: lighter
@@ -130,6 +131,38 @@ markets:
     enabled: true
   - venue: arcus
     venue_symbol: MU-USD
+    canonical_symbol: MU
+    enabled: true
+  - venue: backpack
+    venue_symbol: SNDK.US_USDC_PERP
+    canonical_symbol: SNDK
+    enabled: true
+  - venue: backpack
+    venue_symbol: NVDA.US_USDC_PERP
+    canonical_symbol: NVDA
+    enabled: true
+  - venue: backpack
+    venue_symbol: TSLA.US_USDC_PERP
+    canonical_symbol: TSLA
+    enabled: true
+  - venue: backpack
+    venue_symbol: HOOD.US_USDC_PERP
+    canonical_symbol: HOOD
+    enabled: true
+  - venue: backpack
+    venue_symbol: GOOGL.US_USDC_PERP
+    canonical_symbol: GOOGL
+    enabled: true
+  - venue: backpack
+    venue_symbol: AAPL.US_USDC_PERP
+    canonical_symbol: AAPL
+    enabled: true
+  - venue: backpack
+    venue_symbol: META.US_USDC_PERP
+    canonical_symbol: META
+    enabled: true
+  - venue: backpack
+    venue_symbol: MU.US_USDC_PERP
     canonical_symbol: MU
     enabled: true
 

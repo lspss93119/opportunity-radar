@@ -7,7 +7,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-EXPLICIT_FEE_VENUES = frozenset({"trade_xyz", "entropy", "arcus"})
+EXPLICIT_FEE_VENUES = frozenset({"trade_xyz", "entropy", "arcus", "backpack"})
 
 
 class MarketConfig(BaseModel):

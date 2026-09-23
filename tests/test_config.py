@@ -13,12 +13,14 @@ def test_example_config_loads():
     assert cfg.fees_bps["trade_xyz"] == 9.0
     assert cfg.fees_bps["entropy"] == 9.0
     assert cfg.fees_bps["arcus"] == 2.25
+    assert cfg.fees_bps["backpack"] == 5.0
     assert {m.venue for m in cfg.markets} == {
         "lighter",
         "hyperliquid",
         "trade_xyz",
         "entropy",
         "arcus",
+        "backpack",
     }
     assert {
         (market.venue, market.venue_symbol)
@@ -37,6 +39,9 @@ def test_example_config_loads():
         ("entropy", "io:SNDK")
     } | {
         ("arcus", f"{symbol}-USD")
+        for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
+    } | {
+        ("backpack", f"{symbol}.US_USDC_PERP")
         for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
     }
 
@@ -157,7 +162,14 @@ def test_enabled_trade_xyz_accepts_explicit_fee_case_insensitively():
     assert config.fees_bps == {"TRADE_XYZ": 9.0}
 
 
-@pytest.mark.parametrize("venue, venue_symbol", [("entropy", "io:SNDK"), ("arcus", "SNDK-USD")])
+@pytest.mark.parametrize(
+    "venue, venue_symbol",
+    [
+        ("entropy", "io:SNDK"),
+        ("arcus", "SNDK-USD"),
+        ("backpack", "SNDK.US_USDC_PERP"),
+    ],
+)
 def test_enabled_new_venue_requires_an_explicit_fee(venue, venue_symbol):
     with pytest.raises(ValidationError, match=venue):
         RadarConfig(
