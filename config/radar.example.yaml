@@ -212,7 +212,6 @@ monitors:
     enabled: true
     interval_seconds: 10
     primary_size_usd: 10000
-    top_n: 3
     candidate_net_bps: 10
     candidate_duration_seconds: 30
     alert_net_bps: 20

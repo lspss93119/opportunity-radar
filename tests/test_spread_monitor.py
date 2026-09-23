@@ -150,7 +150,7 @@ def test_selected_vwap_maps_only_the_fixed_supported_sizes():
     assert selected_vwap(snapshot, "buy", 10_000) == 10.0
 
 
-def test_candidates_use_top_n_buy_and_sell_rankings_with_directional_keys():
+def test_candidates_evaluate_all_directional_pairs_with_deterministic_keys():
     snapshots = [
         make_market("alpha", buy_10k_vwap=100.0, sell_10k_vwap=110.0),
         make_market("bravo", buy_10k_vwap=101.0, sell_10k_vwap=109.0),
@@ -172,12 +172,24 @@ def test_candidates_use_top_n_buy_and_sell_rankings_with_directional_keys():
         },
     )
 
-    assert [candidate.key for candidate in candidates] == [
-        SpreadPairKey("BTC", "alpha", "BTC", "bravo", "BTC"),
-        SpreadPairKey("BTC", "bravo", "BTC", "alpha", "BTC"),
-    ]
-    assert candidates[0].long_buy_vwap == 100.0
-    assert candidates[0].short_sell_vwap == 109.0
+    assert len(candidates) == 12
+    assert {
+        (candidate.key.long_venue, candidate.key.short_venue)
+        for candidate in candidates
+    } == {
+        (long_venue, short_venue)
+        for long_venue in ("alpha", "bravo", "charlie", "delta")
+        for short_venue in ("alpha", "bravo", "charlie", "delta")
+        if long_venue != short_venue
+    }
+    alpha_to_bravo = next(
+        candidate
+        for candidate in candidates
+        if candidate.key
+        == SpreadPairKey("BTC", "alpha", "BTC", "bravo", "BTC")
+    )
+    assert alpha_to_bravo.long_buy_vwap == 100.0
+    assert alpha_to_bravo.short_sell_vwap == 109.0
 
 
 def test_equal_prices_have_deterministic_venue_tie_breaking():
@@ -196,8 +208,110 @@ def test_equal_prices_have_deterministic_venue_tie_breaking():
         fees_bps={venue: 0.0 for venue in ("zulu", "alpha", "bravo")},
     )
 
-    assert [candidate.key.long_venue for candidate in candidates] == ["bravo", "alpha"]
-    assert all(candidate.key.short_venue != "zulu" for candidate in candidates)
+    assert len(candidates) == 6
+    assert {
+        (candidate.key.long_venue, candidate.key.short_venue)
+        for candidate in candidates
+    } == {
+        (long_venue, short_venue)
+        for long_venue in ("zulu", "alpha", "bravo")
+        for short_venue in ("zulu", "alpha", "bravo")
+        if long_venue != short_venue
+    }
+
+
+@pytest.mark.parametrize("venue_count", [3, 5, 6])
+def test_all_valid_directional_pairs_are_evaluated(venue_count: int):
+    venues = [f"venue-{index}" for index in range(venue_count)]
+    snapshots = [make_market(venue) for venue in venues]
+
+    candidates = build_spread_candidates(
+        snapshots,
+        NOW,
+        primary_size_usd=10_000,
+        top_n=1,
+        stale_after_seconds=30,
+        fees_bps={venue: 0.0 for venue in venues},
+    )
+
+    assert len(candidates) == venue_count * (venue_count - 1)
+    assert all(
+        candidate.key.long_venue != candidate.key.short_venue
+        for candidate in candidates
+    )
+
+
+def test_same_venue_long_short_pairs_are_never_evaluated():
+    candidates = build_spread_candidates(
+        [
+            make_market("same", venue_symbol="BTC-A"),
+            make_market("same", venue_symbol="BTC-B"),
+            make_market("other"),
+        ],
+        NOW,
+        primary_size_usd=10_000,
+        top_n=1,
+        stale_after_seconds=30,
+        fees_bps={"same": 0.0, "other": 0.0},
+    )
+
+    assert len(candidates) == 4
+    assert all(
+        candidate.key.long_venue != candidate.key.short_venue
+        for candidate in candidates
+    )
+
+
+@pytest.mark.asyncio
+async def test_low_fee_venue_is_not_pruned_by_raw_price_top_n():
+    state = make_state(
+        make_market("raw-cheap-1", buy_10k_vwap=100.0, sell_10k_vwap=90.0),
+        make_market("raw-cheap-2", buy_10k_vwap=100.5, sell_10k_vwap=91.0),
+        make_market("low-fee", buy_10k_vwap=101.0, sell_10k_vwap=92.0),
+        make_market("short", buy_10k_vwap=110.0, sell_10k_vwap=102.0),
+    )
+    monitor = make_monitor(
+        top_n=2,
+        candidate_duration_seconds=0,
+        alert_duration_seconds=0,
+        fees_bps={
+            "raw-cheap-1": 250.0,
+            "raw-cheap-2": 250.0,
+            "low-fee": 0.0,
+            "short": 0.0,
+        },
+    )
+
+    alerts = await monitor.evaluate(NOW, state)
+
+    assert {
+        (alert.payload["long_venue"], alert.payload["short_venue"])
+        for alert in alerts
+    } == {("low-fee", "short")}
+    assert alerts[0].payload["net_spread_bps"] == pytest.approx(
+        (102.0 / 101.0 - 1.0) * 10_000
+    )
+
+
+@pytest.mark.asyncio
+async def test_multiple_directional_pair_episodes_coexist():
+    state = make_state(
+        make_market("alpha", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
+        make_market("bravo", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
+        make_market("charlie", buy_10k_vwap=103.0, sell_10k_vwap=102.0),
+    )
+    monitor = make_monitor(
+        candidate_duration_seconds=0,
+        alert_net_bps=1_000.0,
+        fees_bps={"alpha": 0.0, "bravo": 0.0, "charlie": 0.0},
+    )
+
+    assert await monitor.evaluate(NOW, state) == []
+
+    assert {
+        (episode.key.long_venue, episode.key.short_venue)
+        for episode in monitor.active_episodes
+    } == {("alpha", "bravo"), ("alpha", "charlie")}
 
 
 @pytest.mark.parametrize(

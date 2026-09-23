@@ -122,13 +122,16 @@ def build_spread_candidates(
     now: datetime,
     *,
     primary_size_usd: int,
-    top_n: int,
     stale_after_seconds: int,
     fees_bps: Mapping[str, float],
+    top_n: int | None = None,
 ) -> tuple[SpreadCandidate, ...]:
+    """Build every valid directional cross-venue pair.
+
+    ``top_n`` remains an accepted compatibility argument for callers that
+    still pass the legacy monitor setting, but it no longer prunes pairs.
+    """
     current_time = _as_utc(now, "now")
-    if top_n <= 0:
-        raise ValueError("top_n must be positive")
     if stale_after_seconds <= 0:
         raise ValueError("stale_after_seconds must be positive")
 
@@ -158,11 +161,11 @@ def build_spread_candidates(
         buys.sort(key=lambda item: (item[1], item[0].venue, item[0].venue_symbol))
         sells.sort(key=lambda item: (-item[1], item[0].venue, item[0].venue_symbol))
 
-        for long_snapshot, long_price in buys[:top_n]:
+        for long_snapshot, long_price in buys:
             long_fee = _fee_for(long_snapshot.venue, fees_bps)
             if long_fee is None:
                 continue
-            for short_snapshot, short_price in sells[:top_n]:
+            for short_snapshot, short_price in sells:
                 if long_snapshot.venue.lower() == short_snapshot.venue.lower():
                     continue
                 try:

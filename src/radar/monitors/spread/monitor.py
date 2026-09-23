@@ -96,7 +96,6 @@ class SpreadMonitor:
             state.markets,
             current_time,
             primary_size_usd=self.config.primary_size_usd,
-            top_n=self.config.top_n,
             stale_after_seconds=self.config.stale_after_seconds,
             fees_bps=self._fees_bps,
         )
