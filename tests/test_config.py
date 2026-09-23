@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from radar.config import RadarConfig, load_config
+from radar.config import MarketConfig, RadarConfig, load_config
 
 
 def test_example_config_loads():
@@ -106,3 +106,32 @@ def test_invalid_spread_threshold_is_rejected(field_name, invalid_threshold):
 def test_sampling_interval_is_fixed_at_ten_seconds():
     with pytest.raises(ValidationError):
         RadarConfig.model_validate({"sampling_seconds": 5})
+
+
+def test_enabled_trade_xyz_requires_an_explicit_fee():
+    with pytest.raises(ValidationError, match="trade_xyz"):
+        RadarConfig(
+            fees_bps={"hyperliquid": 3.5},
+            markets=[
+                MarketConfig(
+                    venue="trade_xyz",
+                    venue_symbol="xyz:TSLA",
+                    canonical_symbol="TSLA",
+                )
+            ],
+        )
+
+
+def test_enabled_trade_xyz_accepts_explicit_fee_case_insensitively():
+    config = RadarConfig(
+        fees_bps={"TRADE_XYZ": 9.0},
+        markets=[
+            MarketConfig(
+                venue="trade_xyz",
+                venue_symbol="xyz:TSLA",
+                canonical_symbol="TSLA",
+            )
+        ],
+    )
+
+    assert config.fees_bps == {"TRADE_XYZ": 9.0}

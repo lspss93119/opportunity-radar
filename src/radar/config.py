@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class MarketConfig(BaseModel):
@@ -65,6 +65,21 @@ class RadarConfig(BaseModel):
         if isinstance(value, dict) and any(isinstance(fee, bool) for fee in value.values()):
             raise ValueError("fees_bps values must be numeric, not boolean")
         return value
+
+    @model_validator(mode="after")
+    def trade_xyz_markets_require_explicit_fee(self) -> "RadarConfig":
+        has_trade_xyz_market = any(
+            market.enabled and market.venue.lower() == "trade_xyz"
+            for market in self.markets
+        )
+        has_trade_xyz_fee = any(
+            venue.lower() == "trade_xyz" for venue in self.fees_bps
+        )
+        if has_trade_xyz_market and not has_trade_xyz_fee:
+            raise ValueError(
+                "enabled trade_xyz markets require an explicit trade_xyz fee"
+            )
+        return self
 
 
 def load_config(path: Path) -> RadarConfig:

@@ -140,6 +140,34 @@ def test_pipeline_from_config_builds_the_two_configured_public_collectors():
     ]
 
 
+def test_pipeline_from_config_builds_trade_xyz_hyperliquid_collector_when_enabled():
+    config = RadarConfig(
+        sampling_seconds=10,
+        fees_bps={"trade_xyz": 9.0},
+        markets=[
+            MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),
+            MarketConfig(
+                venue="hyperliquid", venue_symbol="BTC", canonical_symbol="BTC"
+            ),
+            MarketConfig(
+                venue="trade_xyz",
+                venue_symbol="xyz:TSLA",
+                canonical_symbol="TSLA",
+            ),
+        ],
+    )
+
+    pipeline = MarketDataPipeline.from_config(config)
+
+    assert [collector.venue for collector in pipeline.collectors] == [
+        "lighter",
+        "hyperliquid",
+        "trade_xyz",
+    ]
+    assert isinstance(pipeline.collectors[2], HyperliquidCollector)
+    assert pipeline.collectors[2].dex == "xyz"
+
+
 @pytest.mark.asyncio
 async def test_failed_venue_does_not_leave_old_market_snapshot_in_state():
     state = RadarState()

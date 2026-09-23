@@ -8,6 +8,7 @@ from radar.collectors.base import (
     Collector,
     CollectorBatch,
     CollectorErrorHandler,
+    markets_for_venue,
     report_collector_error,
 )
 from radar.config import RadarConfig
@@ -116,7 +117,7 @@ class MarketDataPipeline:
         from radar.collectors.lighter import LighterCollector
 
         collector_kwargs = {} if request_json is None else {"request_json": request_json}
-        collectors = (
+        collectors = [
             LighterCollector(
                 config.markets,
                 clock=clock,
@@ -129,7 +130,18 @@ class MarketDataPipeline:
                 error_handler=collector_error_handler,
                 **collector_kwargs,
             ),
-        )
+        ]
+        if markets_for_venue(config.markets, "trade_xyz"):
+            collectors.append(
+                HyperliquidCollector(
+                    config.markets,
+                    venue="trade_xyz",
+                    dex="xyz",
+                    clock=clock,
+                    error_handler=collector_error_handler,
+                    **collector_kwargs,
+                )
+            )
         return cls(
             collectors,
             RadarState() if state is None else state,
