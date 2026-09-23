@@ -117,7 +117,7 @@ class MarketDataPipeline:
         from radar.collectors.lighter import LighterCollector
 
         collector_kwargs = {} if request_json is None else {"request_json": request_json}
-        collectors = [
+        collectors: list[Collector] = [
             LighterCollector(
                 config.markets,
                 clock=clock,
