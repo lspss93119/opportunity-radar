@@ -209,6 +209,30 @@ class Hip3FixtureTransport:
         raise AssertionError(f"unexpected HIP-3 request: {json_body}")
 
 
+class EntropyFixtureTransport:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def __call__(self, url: str, *, method: str, json_body=None, params=None):
+        assert json_body is not None
+        self.calls.append(json_body)
+        request_type = json_body["type"]
+        if request_type == "metaAndAssetCtxs":
+            return load_fixture_from_entropy("meta_and_asset_ctxs.json")
+        if request_type == "l2Book" and json_body["coin"] == "io:SNDK":
+            return load_fixture_from_entropy("l2_io_sndk.json")
+        if request_type == "fundingHistory" and json_body["coin"] == "io:SNDK":
+            return load_fixture_from_entropy("funding_io_sndk.json")
+        raise AssertionError(f"unexpected Entropy request: {json_body}")
+
+
+def load_fixture_from_entropy(name: str):
+    with (Path(__file__).parent / "fixtures" / "entropy" / name).open(
+        encoding="utf-8"
+    ) as handle:
+        return json.load(handle)
+
+
 @pytest.mark.asyncio
 async def test_trade_xyz_collector_adds_dex_only_to_metadata_and_normalizes_hip3_data():
     transport = Hip3FixtureTransport()
@@ -255,6 +279,49 @@ async def test_trade_xyz_collector_adds_dex_only_to_metadata_and_normalizes_hip3
         body for body in transport.calls if body["type"] == "metaAndAssetCtxs"
     ]
     assert metadata_requests == [{"type": "metaAndAssetCtxs", "dex": "xyz"}]
+    assert all(
+        "dex" not in body
+        for body in transport.calls
+        if body["type"] in {"l2Book", "fundingHistory"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_entropy_collector_uses_io_namespace_and_maps_sndk():
+    transport = EntropyFixtureTransport()
+    collector = HyperliquidCollector(
+        [
+            MarketConfig(
+                venue="entropy",
+                venue_symbol="io:SNDK",
+                canonical_symbol="SNDK",
+            )
+        ],
+        venue="entropy",
+        dex="io",
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+    )
+
+    batch = await collector.collect(
+        sample_time=SAMPLE_TIME, include_hourly_context=True
+    )
+
+    assert len(batch.market_snapshots) == 1
+    snapshot = batch.market_snapshots[0]
+    assert snapshot.venue == "entropy"
+    assert snapshot.venue_symbol == "io:SNDK"
+    assert snapshot.canonical_symbol == "SNDK"
+    assert snapshot.buy_10k_vwap is not None
+    assert snapshot.sell_10k_vwap is not None
+    assert batch.funding_snapshots[0].effective_time == datetime.fromtimestamp(
+        1790128800, tz=UTC
+    )
+    assert batch.hourly_contexts[0].canonical_symbol == "SNDK"
+
+    assert [
+        body for body in transport.calls if body["type"] == "metaAndAssetCtxs"
+    ] == [{"type": "metaAndAssetCtxs", "dex": "io"}]
     assert all(
         "dex" not in body
         for body in transport.calls

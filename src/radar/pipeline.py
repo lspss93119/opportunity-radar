@@ -113,6 +113,7 @@ class MarketDataPipeline:
         storage: ParquetStorage | None = None,
         collector_error_handler: CollectorErrorHandler | None = None,
     ) -> "MarketDataPipeline":
+        from radar.collectors.arcus import ArcusCollector
         from radar.collectors.hyperliquid import HyperliquidCollector
         from radar.collectors.lighter import LighterCollector
 
@@ -137,6 +138,26 @@ class MarketDataPipeline:
                     config.markets,
                     venue="trade_xyz",
                     dex="xyz",
+                    clock=clock,
+                    error_handler=collector_error_handler,
+                    **collector_kwargs,
+                )
+            )
+        if markets_for_venue(config.markets, "entropy"):
+            collectors.append(
+                HyperliquidCollector(
+                    config.markets,
+                    venue="entropy",
+                    dex="io",
+                    clock=clock,
+                    error_handler=collector_error_handler,
+                    **collector_kwargs,
+                )
+            )
+        if markets_for_venue(config.markets, "arcus"):
+            collectors.append(
+                ArcusCollector(
+                    config.markets,
                     clock=clock,
                     error_handler=collector_error_handler,
                     **collector_kwargs,

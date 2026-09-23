@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from radar.collectors.base import Collector, CollectorBatch
+from radar.collectors.arcus import ArcusCollector
 from radar.collectors.hyperliquid import HyperliquidCollector
 from radar.collectors.lighter import LighterCollector
 from radar.config import MarketConfig, RadarConfig
@@ -166,6 +167,47 @@ def test_pipeline_from_config_builds_trade_xyz_hyperliquid_collector_when_enable
     ]
     assert isinstance(pipeline.collectors[2], HyperliquidCollector)
     assert pipeline.collectors[2].dex == "xyz"
+
+
+def test_pipeline_from_config_builds_entropy_and_arcus_collectors_when_enabled():
+    config = RadarConfig(
+        sampling_seconds=10,
+        fees_bps={"trade_xyz": 9.0, "entropy": 9.0, "arcus": 2.25},
+        markets=[
+            MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),
+            MarketConfig(
+                venue="hyperliquid", venue_symbol="BTC", canonical_symbol="BTC"
+            ),
+            MarketConfig(
+                venue="trade_xyz",
+                venue_symbol="xyz:TSLA",
+                canonical_symbol="TSLA",
+            ),
+            MarketConfig(
+                venue="entropy",
+                venue_symbol="io:SNDK",
+                canonical_symbol="SNDK",
+            ),
+            MarketConfig(
+                venue="arcus",
+                venue_symbol="SNDK-USD",
+                canonical_symbol="SNDK",
+            ),
+        ],
+    )
+
+    pipeline = MarketDataPipeline.from_config(config)
+
+    assert [collector.venue for collector in pipeline.collectors] == [
+        "lighter",
+        "hyperliquid",
+        "trade_xyz",
+        "entropy",
+        "arcus",
+    ]
+    assert isinstance(pipeline.collectors[3], HyperliquidCollector)
+    assert pipeline.collectors[3].dex == "io"
+    assert isinstance(pipeline.collectors[4], ArcusCollector)
 
 
 @pytest.mark.asyncio

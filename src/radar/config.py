@@ -7,6 +7,8 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+EXPLICIT_FEE_VENUES = frozenset({"trade_xyz", "entropy", "arcus"})
+
 
 class MarketConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -67,17 +69,18 @@ class RadarConfig(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def trade_xyz_markets_require_explicit_fee(self) -> "RadarConfig":
-        has_trade_xyz_market = any(
-            market.enabled and market.venue.lower() == "trade_xyz"
+    def enabled_markets_require_explicit_fee(self) -> "RadarConfig":
+        required_venues = {
+            market.venue.lower()
             for market in self.markets
-        )
-        has_trade_xyz_fee = any(
-            venue.lower() == "trade_xyz" for venue in self.fees_bps
-        )
-        if has_trade_xyz_market and not has_trade_xyz_fee:
+            if market.enabled and market.venue.lower() in EXPLICIT_FEE_VENUES
+        }
+        configured_venues = {venue.lower() for venue in self.fees_bps}
+        missing_venues = sorted(required_venues - configured_venues)
+        if missing_venues:
             raise ValueError(
-                "enabled trade_xyz markets require an explicit trade_xyz fee"
+                "enabled markets require explicit fees for: "
+                + ", ".join(missing_venues)
             )
         return self
 

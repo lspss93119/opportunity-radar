@@ -4,6 +4,8 @@ fees_bps:
   lighter: 4.5
   hyperliquid: 3.5
   trade_xyz: 9.0
+  entropy: 9.0
+  arcus: 2.25
 
 markets:
   - venue: lighter
@@ -92,6 +94,42 @@ markets:
     enabled: true
   - venue: trade_xyz
     venue_symbol: xyz:MU
+    canonical_symbol: MU
+    enabled: true
+  - venue: entropy
+    venue_symbol: io:SNDK
+    canonical_symbol: SNDK
+    enabled: true
+  - venue: arcus
+    venue_symbol: SNDK-USD
+    canonical_symbol: SNDK
+    enabled: true
+  - venue: arcus
+    venue_symbol: NVDA-USD
+    canonical_symbol: NVDA
+    enabled: true
+  - venue: arcus
+    venue_symbol: TSLA-USD
+    canonical_symbol: TSLA
+    enabled: true
+  - venue: arcus
+    venue_symbol: HOOD-USD
+    canonical_symbol: HOOD
+    enabled: true
+  - venue: arcus
+    venue_symbol: GOOGL-USD
+    canonical_symbol: GOOGL
+    enabled: true
+  - venue: arcus
+    venue_symbol: AAPL-USD
+    canonical_symbol: AAPL
+    enabled: true
+  - venue: arcus
+    venue_symbol: META-USD
+    canonical_symbol: META
+    enabled: true
+  - venue: arcus
+    venue_symbol: MU-USD
     canonical_symbol: MU
     enabled: true
 

@@ -1,0 +1,36 @@
+[
+  {
+    "universe": [
+      {"name": "io:SNDK", "szDecimals": 4, "maxLeverage": 10},
+      {"name": "io:ANTH", "szDecimals": 3, "maxLeverage": 6}
+    ],
+    "marginTables": [],
+    "collateralToken": 0
+  },
+  [
+    {
+      "funding": "0.00000625",
+      "openInterest": "1698.0976",
+      "prevDayPx": "1789.4",
+      "dayNtlVlm": "20561482.4154000506",
+      "premium": "-0.0005350868",
+      "oraclePx": "1878.2",
+      "markPx": "1877.5",
+      "midPx": "1877.15",
+      "impactPxs": ["1877.1", "1877.29"],
+      "dayBaseVlm": "11245.9827"
+    },
+    {
+      "funding": "0.00000100",
+      "openInterest": "12.5",
+      "prevDayPx": "11.0",
+      "dayNtlVlm": "3456.0",
+      "premium": "0.0001",
+      "oraclePx": "12.0",
+      "markPx": "12.1",
+      "midPx": "12.05",
+      "impactPxs": ["12.0", "12.1"],
+      "dayBaseVlm": "288.0"
+    }
+  ]
+]
