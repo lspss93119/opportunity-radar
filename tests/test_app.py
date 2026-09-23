@@ -384,3 +384,33 @@ def test_main_dispatches_telegram_smoke(monkeypatch, tmp_path):
         ]
     ) == 0
     assert calls == [(fake_application, "ETH")]
+
+
+def test_main_configures_info_logging(monkeypatch, tmp_path):
+    import logging
+    import radar.app as app_module
+
+    config = make_application_config()
+    logging_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        app_module.logging,
+        "basicConfig",
+        lambda **kwargs: logging_calls.append(kwargs),
+    )
+    monkeypatch.setattr(app_module, "load_config", lambda path: config)
+    monkeypatch.setattr(app_module, "build_application", lambda loaded_config: object())
+
+    async def fake_smoke(application, *, symbol):
+        return None
+
+    monkeypatch.setattr(app_module, "run_telegram_smoke", fake_smoke)
+
+    assert app_module.main(
+        [
+            "telegram-smoke",
+            "--config",
+            str(tmp_path / "radar.yaml"),
+        ]
+    ) == 0
+    assert logging_calls == [{"level": logging.INFO}]

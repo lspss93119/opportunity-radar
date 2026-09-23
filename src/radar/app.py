@@ -444,6 +444,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO)
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
