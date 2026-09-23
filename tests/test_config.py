@@ -14,8 +14,10 @@ def test_example_config_loads():
     assert cfg.fees_bps["entropy"] == 9.0
     assert cfg.fees_bps["arcus"] == 2.25
     assert cfg.fees_bps["backpack"] == 5.0
+    assert cfg.fees_bps["lighter_robinhood"] == 0.0
     assert {m.venue for m in cfg.markets} == {
         "lighter",
+        "lighter_robinhood",
         "hyperliquid",
         "trade_xyz",
         "entropy",
@@ -32,6 +34,9 @@ def test_example_config_loads():
     } | {
         ("lighter", symbol)
         for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
+    } | {
+        ("lighter_robinhood", symbol)
+        for symbol in ("BTC", "ETH", "SOL", "SNDK", "NVDA", "TSLA", "GOOGL", "AAPL", "META", "MU")
     } | {
         ("trade_xyz", f"xyz:{symbol}")
         for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
@@ -168,6 +173,7 @@ def test_enabled_trade_xyz_accepts_explicit_fee_case_insensitively():
         ("entropy", "io:SNDK"),
         ("arcus", "SNDK-USD"),
         ("backpack", "SNDK.US_USDC_PERP"),
+        ("lighter_robinhood", "SNDK"),
     ],
 )
 def test_enabled_new_venue_requires_an_explicit_fee(venue, venue_symbol):
@@ -181,3 +187,18 @@ def test_enabled_new_venue_requires_an_explicit_fee(venue, venue_symbol):
                 )
             ]
         )
+
+
+def test_enabled_lighter_robinhood_accepts_explicit_zero_fee():
+    config = RadarConfig(
+        fees_bps={"lighter_robinhood": 0.0},
+        markets=[
+            MarketConfig(
+                venue="lighter_robinhood",
+                venue_symbol="SNDK",
+                canonical_symbol="SNDK",
+            )
+        ],
+    )
+
+    assert config.fees_bps == {"lighter_robinhood": 0.0}

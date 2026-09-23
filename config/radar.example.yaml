@@ -2,6 +2,7 @@ sampling_seconds: 10
 
 fees_bps:
   lighter: 4.5
+  lighter_robinhood: 0.0
   hyperliquid: 3.5
   trade_xyz: 9.0
   entropy: 9.0
@@ -50,6 +51,46 @@ markets:
     canonical_symbol: META
     enabled: true
   - venue: lighter
+    venue_symbol: MU
+    canonical_symbol: MU
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: BTC
+    canonical_symbol: BTC
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: ETH
+    canonical_symbol: ETH
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: SOL
+    canonical_symbol: SOL
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: SNDK
+    canonical_symbol: SNDK
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: NVDA
+    canonical_symbol: NVDA
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: TSLA
+    canonical_symbol: TSLA
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: GOOGL
+    canonical_symbol: GOOGL
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: AAPL
+    canonical_symbol: AAPL
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: META
+    canonical_symbol: META
+    enabled: true
+  - venue: lighter_robinhood
     venue_symbol: MU
     canonical_symbol: MU
     enabled: true

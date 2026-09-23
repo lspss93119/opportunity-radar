@@ -20,6 +20,7 @@ from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
+LIGHTER_ROBINHOOD_BASE_URL = "https://api.rh.lighter.xyz"
 
 
 @dataclass(frozen=True)
@@ -146,10 +147,17 @@ class LighterCollector:
         self,
         markets: list[MarketConfig] | tuple[MarketConfig, ...],
         *,
+        venue: str = "lighter",
+        base_url: str | None = None,
         request_json=default_request_json,
         clock=lambda: datetime.now(UTC),
         error_handler: CollectorErrorHandler | None = None,
     ) -> None:
+        self.venue = venue
+        self.base_url = (self.BASE_URL if base_url is None else base_url).rstrip("/")
+        self.order_book_details_url = f"{self.base_url}/api/v1/orderBookDetails"
+        self.order_book_orders_url = f"{self.base_url}/api/v1/orderBookOrders"
+        self.fundings_url = f"{self.base_url}/api/v1/fundings"
         self._markets = markets_for_venue(markets, self.venue)
         self._request_json = request_json
         self._clock = clock
@@ -160,7 +168,7 @@ class LighterCollector:
     ) -> CollectorBatch:
         try:
             details_payload = await self._request_json(
-                self.ORDER_BOOK_DETAILS_URL,
+                self.order_book_details_url,
                 method="GET",
                 params={"filter": "perp"},
             )
@@ -228,7 +236,7 @@ class LighterCollector:
             return None
         try:
             payload = await self._request_json(
-                self.ORDER_BOOK_ORDERS_URL,
+                self.order_book_orders_url,
                 method="GET",
                 params={
                     "market_id": detail.market_id,
@@ -268,7 +276,7 @@ class LighterCollector:
         end_timestamp = int(self._clock().timestamp())
         try:
             payload = await self._request_json(
-                self.FUNDINGS_URL,
+                self.fundings_url,
                 method="GET",
                 params={
                     "market_id": detail.market_id,

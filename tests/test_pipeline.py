@@ -142,6 +142,34 @@ def test_pipeline_from_config_builds_the_two_configured_public_collectors():
     ]
 
 
+def test_pipeline_from_config_builds_independent_lighter_robinhood_collector():
+    config = RadarConfig(
+        sampling_seconds=10,
+        fees_bps={"lighter_robinhood": 0.0},
+        markets=[
+            MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),
+            MarketConfig(
+                venue="lighter_robinhood",
+                venue_symbol="BTC",
+                canonical_symbol="BTC",
+            ),
+            MarketConfig(
+                venue="hyperliquid", venue_symbol="BTC", canonical_symbol="BTC"
+            ),
+        ],
+    )
+
+    pipeline = MarketDataPipeline.from_config(config)
+
+    assert [collector.venue for collector in pipeline.collectors] == [
+        "lighter",
+        "lighter_robinhood",
+        "hyperliquid",
+    ]
+    assert isinstance(pipeline.collectors[1], LighterCollector)
+    assert pipeline.collectors[1].base_url == "https://api.rh.lighter.xyz"
+
+
 def test_pipeline_from_config_builds_trade_xyz_hyperliquid_collector_when_enabled():
     config = RadarConfig(
         sampling_seconds=10,

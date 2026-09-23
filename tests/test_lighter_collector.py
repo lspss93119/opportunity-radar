@@ -16,6 +16,7 @@ UTC = timezone.utc
 FIXTURES = Path(__file__).parent / "fixtures" / "lighter"
 SAMPLE_TIME = datetime(2026, 9, 15, 10, 0, 10, tzinfo=UTC)
 OBSERVED_AT = datetime(2026, 9, 15, 10, 0, 10, 654000, tzinfo=UTC)
+ROBINHOOD_BASE_URL = "https://api.rh.lighter.xyz"
 
 
 def load_fixture(name: str):
@@ -23,9 +24,9 @@ def load_fixture(name: str):
         return json.load(handle)
 
 
-def configured_markets() -> list[MarketConfig]:
+def configured_markets(venue: str = "lighter") -> list[MarketConfig]:
     return [
-        MarketConfig(venue="lighter", venue_symbol=symbol, canonical_symbol=symbol)
+        MarketConfig(venue=venue, venue_symbol=symbol, canonical_symbol=symbol)
         for symbol in ("BTC", "ETH", "SOL")
     ]
 
@@ -68,29 +69,44 @@ def test_lighter_funding_parser_uses_latest_settlement_rate_and_timestamp():
 
 
 class FixtureTransport:
-    def __init__(self):
+    def __init__(self, base_url: str = LighterCollector.BASE_URL):
         self.calls: list[tuple[str, str, dict | None]] = []
+        normalized_base_url = base_url.rstrip("/")
+        self.order_book_details_url = f"{normalized_base_url}/api/v1/orderBookDetails"
+        self.order_book_orders_url = f"{normalized_base_url}/api/v1/orderBookOrders"
+        self.fundings_url = f"{normalized_base_url}/api/v1/fundings"
 
     async def __call__(self, url: str, *, method: str, json_body=None, params=None):
         self.calls.append((url, method, params))
-        if url == LighterCollector.ORDER_BOOK_DETAILS_URL:
+        if url == self.order_book_details_url:
             return load_fixture("order_book_details.json")
-        if url == LighterCollector.ORDER_BOOK_ORDERS_URL:
+        if url == self.order_book_orders_url:
             market_id = params["market_id"]
             symbol = {1: "btc", 0: "eth", 2: "sol"}[market_id]
             return load_fixture(f"order_book_{symbol}.json")
-        if url == LighterCollector.FUNDINGS_URL:
+        if url == self.fundings_url:
             market_id = params["market_id"]
             symbol = {1: "btc", 0: "eth", 2: "sol"}[market_id]
             return load_fixture(f"fundings_{symbol}.json")
         raise AssertionError(f"unexpected request: {url} {params}")
 
 
+@pytest.mark.parametrize(
+    ("venue", "base_url"),
+    [
+        ("lighter", LighterCollector.BASE_URL),
+        ("lighter_robinhood", ROBINHOOD_BASE_URL),
+    ],
+)
 @pytest.mark.asyncio
-async def test_lighter_collector_normalizes_market_funding_and_hourly_context():
-    transport = FixtureTransport()
+async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
+    venue: str, base_url: str
+):
+    transport = FixtureTransport(base_url)
     collector = LighterCollector(
-        configured_markets(),
+        configured_markets(venue),
+        venue=venue,
+        base_url=base_url,
         request_json=transport,
         clock=lambda: OBSERVED_AT,
     )
@@ -111,8 +127,14 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context():
     assert btc.best_ask_size == 60.0
     assert btc.mark_price == 100.0
     assert btc.index_price == 99.9
+    assert btc.buy_1k_vwap == pytest.approx(100.0)
+    assert btc.sell_1k_vwap == pytest.approx(99.0)
+    assert btc.buy_5k_vwap == pytest.approx(100.0)
+    assert btc.sell_5k_vwap == pytest.approx(99.0)
     assert btc.buy_10k_vwap == pytest.approx(10000 / (60 + 4000 / 101))
     assert btc.sell_10k_vwap == pytest.approx(10000 / (60 + 4060 / 98))
+    assert all(snapshot.venue == venue for snapshot in batch.market_snapshots)
+    assert collector.base_url == base_url
     assert btc.sample_time == SAMPLE_TIME
     assert btc.observed_at == OBSERVED_AT
     assert btc.observed_at != btc.sample_time
@@ -131,23 +153,34 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context():
     assert btc_context.observed_at == OBSERVED_AT
 
     assert all(method == "GET" for _, method, _ in transport.calls)
-    assert sum(url == LighterCollector.ORDER_BOOK_DETAILS_URL for url, _, _ in transport.calls) == 1
-    assert sum(url == LighterCollector.ORDER_BOOK_ORDERS_URL for url, _, _ in transport.calls) == 3
-    assert sum(url == LighterCollector.FUNDINGS_URL for url, _, _ in transport.calls) == 3
+    assert sum(url == transport.order_book_details_url for url, _, _ in transport.calls) == 1
+    assert sum(url == transport.order_book_orders_url for url, _, _ in transport.calls) == 3
+    assert sum(url == transport.fundings_url for url, _, _ in transport.calls) == 3
 
 
+@pytest.mark.parametrize(
+    ("venue", "base_url"),
+    [
+        ("lighter", LighterCollector.BASE_URL),
+        ("lighter_robinhood", ROBINHOOD_BASE_URL),
+    ],
+)
 @pytest.mark.asyncio
-async def test_lighter_collector_omits_symbol_when_its_book_request_fails():
-    transport = FixtureTransport()
+async def test_lighter_collector_omits_symbol_when_its_book_request_fails(
+    venue: str, base_url: str
+):
+    transport = FixtureTransport(base_url)
     failures: list[tuple[str, Exception]] = []
 
     async def failing_transport(url: str, *, method: str, json_body=None, params=None):
-        if url == LighterCollector.ORDER_BOOK_ORDERS_URL and params["market_id"] == 0:
+        if url == transport.order_book_orders_url and params["market_id"] == 0:
             raise OSError("temporary outage")
         return await transport(url, method=method, json_body=json_body, params=params)
 
     collector = LighterCollector(
-        configured_markets(),
+        configured_markets(venue),
+        venue=venue,
+        base_url=base_url,
         request_json=failing_transport,
         clock=lambda: OBSERVED_AT,
         error_handler=lambda venue, error: failures.append((venue, error)),
@@ -161,19 +194,30 @@ async def test_lighter_collector_omits_symbol_when_its_book_request_fails():
         "SOL",
     }
     assert [(venue, str(error)) for venue, error in failures] == [
-        ("lighter", "temporary outage")
+        (venue, "temporary outage")
     ]
 
 
+@pytest.mark.parametrize(
+    ("venue", "base_url"),
+    [
+        ("lighter", LighterCollector.BASE_URL),
+        ("lighter_robinhood", ROBINHOOD_BASE_URL),
+    ],
+)
 @pytest.mark.asyncio
-async def test_lighter_collector_reports_market_details_failure():
+async def test_lighter_collector_reports_market_details_failure(
+    venue: str, base_url: str
+):
     failures: list[tuple[str, Exception]] = []
 
     async def failing_transport(url: str, *, method: str, json_body=None, params=None):
         raise OSError("market details unavailable")
 
     collector = LighterCollector(
-        configured_markets(),
+        configured_markets(venue),
+        venue=venue,
+        base_url=base_url,
         request_json=failing_transport,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
@@ -184,5 +228,5 @@ async def test_lighter_collector_reports_market_details_failure():
 
     assert batch.market_snapshots == ()
     assert [(venue, str(error)) for venue, error in failures] == [
-        ("lighter", "market details unavailable")
+        (venue, "market details unavailable")
     ]

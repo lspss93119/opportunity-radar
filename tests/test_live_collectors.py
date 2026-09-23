@@ -19,6 +19,28 @@ def configured_markets(venue: str) -> list[MarketConfig]:
     ]
 
 
+def configured_lighter_robinhood_markets() -> list[MarketConfig]:
+    return [
+        MarketConfig(
+            venue="lighter_robinhood",
+            venue_symbol=symbol,
+            canonical_symbol=symbol,
+        )
+        for symbol in (
+            "BTC",
+            "ETH",
+            "SOL",
+            "SNDK",
+            "NVDA",
+            "TSLA",
+            "GOOGL",
+            "AAPL",
+            "META",
+            "MU",
+        )
+    ]
+
+
 def configured_tsla_markets(venue: str, venue_symbol: str) -> list[MarketConfig]:
     return [
         MarketConfig(
@@ -111,6 +133,51 @@ async def test_lighter_public_read_only_live_smoke():
     )
 
     assert_live_market_batch(batch, "lighter", sample_time)
+
+
+@pytest.mark.live
+@pytest.mark.asyncio
+async def test_lighter_robinhood_public_read_only_live_smoke():
+    now = datetime.now(UTC)
+    sample_time = aligned_sample_time(now, 10)
+    expected_symbols = {
+        "BTC",
+        "ETH",
+        "SOL",
+        "SNDK",
+        "NVDA",
+        "TSLA",
+        "GOOGL",
+        "AAPL",
+        "META",
+        "MU",
+    }
+    batch = await LighterCollector(
+        configured_lighter_robinhood_markets(),
+        venue="lighter_robinhood",
+        base_url="https://api.rh.lighter.xyz",
+    ).collect(sample_time=sample_time, include_hourly_context=True)
+
+    assert {snapshot.canonical_symbol for snapshot in batch.market_snapshots} == expected_symbols
+    assert {snapshot.venue_symbol for snapshot in batch.market_snapshots} == expected_symbols
+    assert all(snapshot.venue == "lighter_robinhood" for snapshot in batch.market_snapshots)
+    assert all(snapshot.sample_time == sample_time for snapshot in batch.market_snapshots)
+    assert all(snapshot.observed_at >= sample_time for snapshot in batch.market_snapshots)
+    assert all(snapshot.best_bid < snapshot.best_ask for snapshot in batch.market_snapshots)
+    assert all(
+        value is not None
+        for snapshot in batch.market_snapshots
+        for value in (
+            snapshot.buy_1k_vwap,
+            snapshot.sell_1k_vwap,
+            snapshot.buy_5k_vwap,
+            snapshot.sell_5k_vwap,
+            snapshot.buy_10k_vwap,
+            snapshot.sell_10k_vwap,
+        )
+    )
+    assert {item.canonical_symbol for item in batch.funding_snapshots} == expected_symbols
+    assert {context.canonical_symbol for context in batch.hourly_contexts} == expected_symbols
 
 
 @pytest.mark.live

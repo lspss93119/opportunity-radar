@@ -116,7 +116,10 @@ class MarketDataPipeline:
         from radar.collectors.arcus import ArcusCollector
         from radar.collectors.backpack import BackpackCollector
         from radar.collectors.hyperliquid import HyperliquidCollector
-        from radar.collectors.lighter import LighterCollector
+        from radar.collectors.lighter import (
+            LIGHTER_ROBINHOOD_BASE_URL,
+            LighterCollector,
+        )
 
         collector_kwargs = {} if request_json is None else {"request_json": request_json}
         collectors: list[Collector] = [
@@ -126,13 +129,26 @@ class MarketDataPipeline:
                 error_handler=collector_error_handler,
                 **collector_kwargs,
             ),
+        ]
+        if markets_for_venue(config.markets, "lighter_robinhood"):
+            collectors.append(
+                LighterCollector(
+                    config.markets,
+                    venue="lighter_robinhood",
+                    base_url=LIGHTER_ROBINHOOD_BASE_URL,
+                    clock=clock,
+                    error_handler=collector_error_handler,
+                    **collector_kwargs,
+                )
+            )
+        collectors.append(
             HyperliquidCollector(
                 config.markets,
                 clock=clock,
                 error_handler=collector_error_handler,
                 **collector_kwargs,
-            ),
-        ]
+            )
+        )
         if markets_for_venue(config.markets, "trade_xyz"):
             collectors.append(
                 HyperliquidCollector(
