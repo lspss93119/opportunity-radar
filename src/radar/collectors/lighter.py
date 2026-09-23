@@ -126,10 +126,19 @@ def parse_lighter_fundings(payload: object) -> LighterFundingPoint | None:
         if not isinstance(raw_funding, dict):
             raise ValueError("fundings entries must be objects")
         timestamp = finite_float(raw_funding.get("timestamp"), "funding timestamp")
+        direction = raw_funding.get("direction")
+        if direction not in ("long", "short"):
+            raise ValueError("funding direction must be long or short")
+        raw_rate = finite_float(raw_funding.get("rate"), "funding rate")
+        if raw_rate < 0:
+            raise ValueError("funding rate must be non-negative")
+        funding_rate = raw_rate / 100.0
+        if direction == "short":
+            funding_rate = -funding_rate
         points.append(
             LighterFundingPoint(
                 effective_time=datetime.fromtimestamp(timestamp, tz=UTC),
-                funding_rate=finite_float(raw_funding.get("rate"), "funding rate"),
+                funding_rate=funding_rate,
             )
         )
     return max(points, key=lambda point: point.effective_time) if points else None

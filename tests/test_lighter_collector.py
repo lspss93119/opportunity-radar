@@ -64,8 +64,72 @@ def test_lighter_funding_parser_uses_latest_settlement_rate_and_timestamp():
     point = parse_lighter_fundings(load_fixture("fundings_btc.json"))
 
     assert point is not None
-    assert point.funding_rate == pytest.approx(0.0011)
+    assert point.funding_rate == pytest.approx(0.000011)
     assert point.effective_time == datetime.fromtimestamp(1789470000, tz=UTC)
+
+
+@pytest.mark.parametrize(
+    ("direction", "expected_rate"),
+    [("long", 0.000045), ("short", -0.000045)],
+)
+def test_lighter_funding_parser_normalizes_percentage_rate_and_direction(
+    direction: str, expected_rate: float
+):
+    point = parse_lighter_fundings(
+        {
+            "code": 200,
+            "fundings": [
+                {
+                    "timestamp": 1789470000,
+                    "rate": "0.0045",
+                    "direction": direction,
+                }
+            ],
+        }
+    )
+
+    assert point is not None
+    assert point.funding_rate == pytest.approx(expected_rate)
+
+
+@pytest.mark.parametrize("direction", ["long", "short"])
+def test_lighter_funding_parser_preserves_zero_rate(
+    direction: str,
+):
+    point = parse_lighter_fundings(
+        {
+            "code": 200,
+            "fundings": [
+                {
+                    "timestamp": 1789470000,
+                    "rate": "0",
+                    "direction": direction,
+                }
+            ],
+        }
+    )
+
+    assert point is not None
+    assert point.funding_rate == 0.0
+
+
+@pytest.mark.parametrize("direction", [None, "sideways", 1])
+def test_lighter_funding_parser_rejects_unknown_or_malformed_direction(
+    direction: object,
+):
+    with pytest.raises(ValueError, match="direction"):
+        parse_lighter_fundings(
+            {
+                "code": 200,
+                "fundings": [
+                    {
+                        "timestamp": 1789470000,
+                        "rate": "0.0045",
+                        "direction": direction,
+                    }
+                ],
+            }
+        )
 
 
 class FixtureTransport:
@@ -140,7 +204,7 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
     assert btc.observed_at != btc.sample_time
 
     assert len(batch.funding_snapshots) == 3
-    assert batch.funding_snapshots[0].funding_rate == pytest.approx(0.0011)
+    assert batch.funding_snapshots[0].funding_rate == pytest.approx(0.000011)
     assert batch.funding_snapshots[0].effective_time == datetime.fromtimestamp(
         1789470000, tz=UTC
     )
