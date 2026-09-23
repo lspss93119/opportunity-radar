@@ -10,7 +10,12 @@ def test_example_config_loads():
     cfg = load_config(Path("config/radar.example.yaml"))
     assert cfg.sampling_seconds == 10
     assert cfg.monitors.spread.primary_size_usd == 10_000
-    assert {m.venue for m in cfg.markets} == {"lighter", "hyperliquid"}
+    assert cfg.fees_bps["trade_xyz"] == 9.0
+    assert {m.venue for m in cfg.markets} == {
+        "lighter",
+        "hyperliquid",
+        "trade_xyz",
+    }
     assert {
         (market.venue, market.venue_symbol)
         for market in cfg.markets
@@ -18,6 +23,12 @@ def test_example_config_loads():
         (venue, symbol)
         for venue in ("lighter", "hyperliquid")
         for symbol in ("BTC", "ETH", "SOL")
+    } | {
+        ("lighter", symbol)
+        for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
+    } | {
+        ("trade_xyz", f"xyz:{symbol}")
+        for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
     }
 
 

@@ -3,6 +3,7 @@ sampling_seconds: 10
 fees_bps:
   lighter: 4.5
   hyperliquid: 3.5
+  trade_xyz: 9.0
 
 markets:
   - venue: lighter
@@ -17,6 +18,38 @@ markets:
     venue_symbol: SOL
     canonical_symbol: SOL
     enabled: true
+  - venue: lighter
+    venue_symbol: SNDK
+    canonical_symbol: SNDK
+    enabled: true
+  - venue: lighter
+    venue_symbol: NVDA
+    canonical_symbol: NVDA
+    enabled: true
+  - venue: lighter
+    venue_symbol: TSLA
+    canonical_symbol: TSLA
+    enabled: true
+  - venue: lighter
+    venue_symbol: HOOD
+    canonical_symbol: HOOD
+    enabled: true
+  - venue: lighter
+    venue_symbol: GOOGL
+    canonical_symbol: GOOGL
+    enabled: true
+  - venue: lighter
+    venue_symbol: AAPL
+    canonical_symbol: AAPL
+    enabled: true
+  - venue: lighter
+    venue_symbol: META
+    canonical_symbol: META
+    enabled: true
+  - venue: lighter
+    venue_symbol: MU
+    canonical_symbol: MU
+    enabled: true
   - venue: hyperliquid
     venue_symbol: BTC
     canonical_symbol: BTC
@@ -28,6 +61,38 @@ markets:
   - venue: hyperliquid
     venue_symbol: SOL
     canonical_symbol: SOL
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:SNDK
+    canonical_symbol: SNDK
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:NVDA
+    canonical_symbol: NVDA
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:TSLA
+    canonical_symbol: TSLA
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:HOOD
+    canonical_symbol: HOOD
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:GOOGL
+    canonical_symbol: GOOGL
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:AAPL
+    canonical_symbol: AAPL
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:META
+    canonical_symbol: META
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:MU
+    canonical_symbol: MU
     enabled: true
 
 monitors:
