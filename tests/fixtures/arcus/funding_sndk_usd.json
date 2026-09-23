@@ -1,0 +1,16 @@
+{
+  "fundingRates": [
+    {
+      "marketId": 33,
+      "marketDisplayName": "SNDK-USD",
+      "fundingRate": "-0.000024476814430583",
+      "time": 1790125200000000
+    },
+    {
+      "marketId": 33,
+      "marketDisplayName": "SNDK-USD",
+      "fundingRate": "0.000005034722222222",
+      "time": 1790128800000000
+    }
+  ]
+}
