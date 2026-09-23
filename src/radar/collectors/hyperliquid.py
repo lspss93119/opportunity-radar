@@ -122,10 +122,14 @@ class HyperliquidCollector:
         self,
         markets: list[MarketConfig] | tuple[MarketConfig, ...],
         *,
+        venue: str = "hyperliquid",
+        dex: str | None = None,
         request_json=default_request_json,
         clock=lambda: datetime.now(UTC),
         error_handler: CollectorErrorHandler | None = None,
     ) -> None:
+        self.venue = venue
+        self.dex = dex
         self._markets = markets_for_venue(markets, self.venue)
         self._request_json = request_json
         self._clock = clock
@@ -135,10 +139,13 @@ class HyperliquidCollector:
         self, *, sample_time: datetime, include_hourly_context: bool
     ) -> CollectorBatch:
         try:
+            metadata_request: dict[str, object] = {"type": "metaAndAssetCtxs"}
+            if self.dex is not None:
+                metadata_request["dex"] = self.dex
             context_payload = await self._request_json(
                 self.INFO_URL,
                 method="POST",
-                json_body={"type": "metaAndAssetCtxs"},
+                json_body=metadata_request,
             )
             contexts = parse_hyperliquid_meta_and_asset_ctxs(context_payload)
             metadata_observed_at = self._clock()

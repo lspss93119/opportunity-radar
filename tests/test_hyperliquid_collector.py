@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from radar.collectors.base import CollectorBatch
 from radar.collectors.hyperliquid import (
     HyperliquidCollector,
     parse_hyperliquid_l2_book,
@@ -26,6 +27,21 @@ def configured_markets() -> list[MarketConfig]:
     return [
         MarketConfig(venue="hyperliquid", venue_symbol=symbol, canonical_symbol=symbol)
         for symbol in ("BTC", "ETH", "SOL")
+    ]
+
+
+def configured_hip3_markets() -> list[MarketConfig]:
+    return [
+        MarketConfig(
+            venue="trade_xyz",
+            venue_symbol="xyz:TSLA",
+            canonical_symbol="TSLA",
+        ),
+        MarketConfig(
+            venue="trade_xyz",
+            venue_symbol="xyz:NVDA",
+            canonical_symbol="NVDA",
+        ),
     ]
 
 
@@ -119,6 +135,9 @@ async def test_hyperliquid_collector_normalizes_market_funding_and_hourly_contex
     assert sum(body["type"] == "metaAndAssetCtxs" for _, _, body in transport.calls) == 1
     assert sum(body["type"] == "l2Book" for _, _, body in transport.calls) == 3
     assert sum(body["type"] == "fundingHistory" for _, _, body in transport.calls) == 3
+    assert [
+        body for _, _, body in transport.calls if body["type"] == "metaAndAssetCtxs"
+    ] == [{"type": "metaAndAssetCtxs"}]
 
 
 @pytest.mark.asyncio
@@ -170,4 +189,131 @@ async def test_hyperliquid_collector_reports_metadata_failure():
     assert batch.market_snapshots == ()
     assert [(venue, str(error)) for venue, error in failures] == [
         ("hyperliquid", "metadata unavailable")
+    ]
+
+
+class Hip3FixtureTransport:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def __call__(self, url: str, *, method: str, json_body=None, params=None):
+        assert json_body is not None
+        self.calls.append(json_body)
+        request_type = json_body["type"]
+        if request_type == "metaAndAssetCtxs":
+            return load_fixture("hip3_meta_and_asset_ctxs.json")
+        if request_type == "l2Book" and json_body["coin"] == "xyz:TSLA":
+            return load_fixture("hip3_l2_xyz_tsla.json")
+        if request_type == "fundingHistory" and json_body["coin"] == "xyz:TSLA":
+            return load_fixture("hip3_funding_xyz_tsla.json")
+        raise AssertionError(f"unexpected HIP-3 request: {json_body}")
+
+
+@pytest.mark.asyncio
+async def test_trade_xyz_collector_adds_dex_only_to_metadata_and_normalizes_hip3_data():
+    transport = Hip3FixtureTransport()
+    collector = HyperliquidCollector(
+        configured_hip3_markets()[:1],
+        venue="trade_xyz",
+        dex="xyz",
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+    )
+
+    batch = await collector.collect(
+        sample_time=SAMPLE_TIME, include_hourly_context=True
+    )
+
+    snapshot = batch.market_snapshots[0]
+    assert snapshot.venue == "trade_xyz"
+    assert snapshot.venue_symbol == "xyz:TSLA"
+    assert snapshot.canonical_symbol == "TSLA"
+    assert snapshot.best_bid == 100.0
+    assert snapshot.best_ask == 101.0
+    assert snapshot.buy_1k_vwap is not None
+    assert snapshot.sell_1k_vwap is not None
+    assert snapshot.buy_5k_vwap is not None
+    assert snapshot.sell_5k_vwap is not None
+    assert snapshot.buy_10k_vwap is not None
+    assert snapshot.sell_10k_vwap is not None
+
+    funding = batch.funding_snapshots[0]
+    assert funding.venue == "trade_xyz"
+    assert funding.venue_symbol == "xyz:TSLA"
+    assert funding.canonical_symbol == "TSLA"
+    assert funding.funding_rate == pytest.approx(0.0002)
+    assert funding.effective_time == datetime.fromtimestamp(1789470000, tz=UTC)
+
+    context = batch.hourly_contexts[0]
+    assert context.venue == "trade_xyz"
+    assert context.venue_symbol == "xyz:TSLA"
+    assert context.canonical_symbol == "TSLA"
+    assert context.open_interest == 123.4
+    assert context.volume_24h == 456789.0
+
+    metadata_requests = [
+        body for body in transport.calls if body["type"] == "metaAndAssetCtxs"
+    ]
+    assert metadata_requests == [{"type": "metaAndAssetCtxs", "dex": "xyz"}]
+    assert all(
+        "dex" not in body
+        for body in transport.calls
+        if body["type"] in {"l2Book", "fundingHistory"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_trade_xyz_book_failure_omits_only_failed_symbol_and_reports_trade_venue():
+    transport = Hip3FixtureTransport()
+    failures: list[tuple[str, Exception]] = []
+
+    async def failing_transport(url: str, *, method: str, json_body=None, params=None):
+        assert json_body is not None
+        if json_body.get("type") == "l2Book" and json_body.get("coin") == "xyz:NVDA":
+            raise OSError("HIP-3 book unavailable")
+        return await transport(url, method=method, json_body=json_body, params=params)
+
+    collector = HyperliquidCollector(
+        configured_hip3_markets(),
+        venue="trade_xyz",
+        dex="xyz",
+        request_json=failing_transport,
+        clock=lambda: OBSERVED_AT,
+        error_handler=lambda venue, error: failures.append((venue, error)),
+    )
+
+    batch = await collector.collect(
+        sample_time=SAMPLE_TIME, include_hourly_context=False
+    )
+
+    assert [(snapshot.venue_symbol, snapshot.canonical_symbol) for snapshot in batch.market_snapshots] == [
+        ("xyz:TSLA", "TSLA")
+    ]
+    assert [(venue, str(error)) for venue, error in failures] == [
+        ("trade_xyz", "HIP-3 book unavailable")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trade_xyz_metadata_failure_reports_logical_venue_and_returns_empty_batch():
+    failures: list[tuple[str, Exception]] = []
+
+    async def failing_transport(url: str, *, method: str, json_body=None, params=None):
+        raise OSError("HIP-3 metadata unavailable")
+
+    collector = HyperliquidCollector(
+        configured_hip3_markets(),
+        venue="trade_xyz",
+        dex="xyz",
+        request_json=failing_transport,
+        error_handler=lambda venue, error: failures.append((venue, error)),
+    )
+
+    batch = await collector.collect(
+        sample_time=SAMPLE_TIME, include_hourly_context=False
+    )
+
+    assert batch == CollectorBatch()
+    assert [(venue, str(error)) for venue, error in failures] == [
+        ("trade_xyz", "HIP-3 metadata unavailable")
     ]

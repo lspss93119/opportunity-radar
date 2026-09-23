@@ -1,0 +1,36 @@
+[
+  {
+    "universe": [
+      {"name": "xyz:TSLA", "szDecimals": 3, "maxLeverage": 5},
+      {"name": "xyz:NVDA", "szDecimals": 3, "maxLeverage": 5}
+    ],
+    "marginTables": [],
+    "collateralToken": 0
+  },
+  [
+    {
+      "funding": "0.0000125",
+      "openInterest": "123.4",
+      "prevDayPx": "375.0",
+      "dayNtlVlm": "456789.0",
+      "premium": "0.0002",
+      "oraclePx": "376.2",
+      "markPx": "376.5",
+      "midPx": "376.4",
+      "impactPxs": ["376.0", "377.0"],
+      "dayBaseVlm": "1200.0"
+    },
+    {
+      "funding": "-0.0000100",
+      "openInterest": "234.5",
+      "prevDayPx": "185.0",
+      "dayNtlVlm": "567890.0",
+      "premium": "-0.0001",
+      "oraclePx": "186.0",
+      "markPx": "186.2",
+      "midPx": "186.1",
+      "impactPxs": ["185.8", "186.4"],
+      "dayBaseVlm": "3000.0"
+    }
+  ]
+]
