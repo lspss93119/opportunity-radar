@@ -202,4 +202,3 @@
 - [ ] **Step 4: Leave the worktree clean and stop without merge, PR, or push.**
 
   Run: `git status --short --branch` and record the starting SHA, ending SHA, commit SHAs, API details, feed count, live results, skipped symbols/reasons, and known limitations.
-
