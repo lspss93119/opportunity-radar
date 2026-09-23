@@ -1,0 +1,56 @@
+[
+  {
+    "baseSymbol": "SNDK.US",
+    "marketType": "PERP",
+    "orderBookState": "Open",
+    "quoteSymbol": "USDC",
+    "rwaMarketType": "STOCK",
+    "symbol": "SNDK.US_USDC_PERP",
+    "visible": true
+  },
+  {
+    "baseSymbol": "NVDA.US",
+    "marketType": "PERP",
+    "orderBookState": "Open",
+    "quoteSymbol": "USDC",
+    "rwaMarketType": "STOCK",
+    "symbol": "NVDA.US_USDC_PERP",
+    "visible": true
+  },
+  {
+    "baseSymbol": "BTC",
+    "marketType": "PERP",
+    "orderBookState": "Open",
+    "quoteSymbol": "USDC",
+    "rwaMarketType": null,
+    "symbol": "BTC_USDC_PERP",
+    "visible": true
+  },
+  {
+    "baseSymbol": "AAPL.US",
+    "marketType": "SPOT",
+    "orderBookState": "Open",
+    "quoteSymbol": "USDC",
+    "rwaMarketType": "STOCK",
+    "symbol": "AAPL.US_USDC",
+    "visible": true
+  },
+  {
+    "baseSymbol": "META.US",
+    "marketType": "PERP",
+    "orderBookState": "Closed",
+    "quoteSymbol": "USDC",
+    "rwaMarketType": "STOCK",
+    "symbol": "META.US_USDC_PERP",
+    "visible": true
+  },
+  {
+    "baseSymbol": "MU.US",
+    "marketType": "PERP",
+    "orderBookState": "Open",
+    "quoteSymbol": "USDC",
+    "rwaMarketType": "STOCK",
+    "symbol": "MU.US_USDC_PERP",
+    "visible": false
+  }
+]

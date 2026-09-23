@@ -1,0 +1,26 @@
+[
+  {
+    "firstPrice": "99",
+    "high": "102",
+    "lastPrice": "100.5",
+    "low": "98",
+    "priceChange": "1.5",
+    "priceChangePercent": "0.015",
+    "quoteVolume": "123456.7",
+    "symbol": "SNDK.US_USDC_PERP",
+    "trades": "42",
+    "volume": "1234.5"
+  },
+  {
+    "firstPrice": "199",
+    "high": "202",
+    "lastPrice": "200.5",
+    "low": "198",
+    "priceChange": "1.5",
+    "priceChangePercent": "0.0075",
+    "quoteVolume": "765432.1",
+    "symbol": "NVDA.US_USDC_PERP",
+    "trades": "24",
+    "volume": "2345.6"
+  }
+]

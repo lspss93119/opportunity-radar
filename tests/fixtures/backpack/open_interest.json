@@ -1,0 +1,12 @@
+[
+  {
+    "openInterest": "12.5",
+    "symbol": "SNDK.US_USDC_PERP",
+    "timestamp": 1790139336384
+  },
+  {
+    "openInterest": "25.0",
+    "symbol": "NVDA.US_USDC_PERP",
+    "timestamp": 1790139336384
+  }
+]

@@ -1,0 +1,12 @@
+[
+  {
+    "fundingRate": "0.000011",
+    "intervalEndTimestamp": "2026-09-23T05:00:00",
+    "symbol": "SNDK.US_USDC_PERP"
+  },
+  {
+    "fundingRate": "0.0000125",
+    "intervalEndTimestamp": "2026-09-23T06:00:00",
+    "symbol": "SNDK.US_USDC_PERP"
+  }
+]

@@ -1,0 +1,16 @@
+[
+  {
+    "fundingRate": "0.0000125",
+    "indexPrice": "100.25",
+    "markPrice": "100.5",
+    "nextFundingTimestamp": 1790139600000,
+    "symbol": "SNDK.US_USDC_PERP"
+  },
+  {
+    "fundingRate": "-0.00002",
+    "indexPrice": "200.25",
+    "markPrice": "200.5",
+    "nextFundingTimestamp": 1790139600000,
+    "symbol": "NVDA.US_USDC_PERP"
+  }
+]
