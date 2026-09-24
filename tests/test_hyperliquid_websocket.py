@@ -9,6 +9,8 @@ import pytest
 from radar.collectors.hyperliquid import (
     HyperliquidOrderBookFeed,
 )
+from radar.config import MarketConfig
+from radar.market_data import LatestMarketData
 from radar.vwap import BookLevel
 
 OBSERVED_AT = datetime(2026, 9, 15, 10, 0, 8, tzinfo=UTC)
@@ -180,27 +182,80 @@ async def test_hyperliquid_complete_snapshot_replaces_book_without_delta_logic()
 
 
 @pytest.mark.asyncio
-async def test_hyperliquid_feed_rejects_unrelated_coin_message():
-    websocket = FixtureWebSocket([])
+async def test_hyperliquid_feed_ignores_unconfigured_coin_without_reconnect_or_invalidation():
+    websocket = FixtureWebSocket(
+        [
+            subscription_ack("BTC"),
+            l2_book_message(
+                "BTC",
+                bids=((99.0, 1.0),),
+                asks=((101.0, 1.0),),
+            ),
+        ]
+    )
+    failures: list[tuple[str, Exception]] = []
+    invalidated: list[str] = []
+    latest = LatestMarketData()
+
+    def on_book(coin: str, snapshot) -> None:
+        latest.update_book(
+            venue="hyperliquid",
+            venue_symbol=coin,
+            bids=snapshot.bids,
+            asks=snapshot.asks,
+            observed_at=snapshot.observed_at,
+        )
+
+    def on_invalidate(coin: str) -> None:
+        invalidated.append(coin)
+        latest.invalidate(venue="hyperliquid", venue_symbol=coin)
+
     feed = HyperliquidOrderBookFeed(
         "wss://test.invalid/ws",
         ["BTC"],
         connect=lambda _url: websocket,
         clock=lambda: OBSERVED_AT,
         venue="hyperliquid",
+        on_book=on_book,
+        on_invalidate=on_invalidate,
+        error_handler=lambda venue, error: failures.append((venue, error)),
+        reconnect_delay_seconds=1.0,
     )
 
-    with pytest.raises(ValueError, match="not configured"):
-        await feed._handle_message(
-            websocket,
-            json.dumps(
-                l2_book_message(
-                    "xyz:TSLA",
-                    bids=((99.0, 1.0),),
-                    asks=((101.0, 1.0),),
-                )
-            ),
+    market = MarketConfig(
+        venue="hyperliquid", venue_symbol="BTC", canonical_symbol="BTC"
+    )
+    await feed.start()
+    try:
+        await wait_until(lambda: feed.snapshot("BTC") is not None)
+        invalidation_count = len(invalidated)
+        websocket.push(
+            l2_book_message(
+                "xyz:TSLA",
+                bids=((99.0, 1.0),),
+                asks=((101.0, 1.0),),
+            )
         )
+        await wait_until(lambda: bool(failures))
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        batch = latest.build_batch(
+            [market],
+            sample_time=OBSERVED_AT,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+        assert [(venue, str(error)) for venue, error in failures] == [
+            ("hyperliquid", "websocket coin 'xyz:TSLA' is not configured")
+        ]
+        assert feed.reconnect_count == 0
+        assert len(invalidated) == invalidation_count
+        assert feed.snapshot("BTC") is not None
+        assert len(batch.market_snapshots) == 1
+        assert batch.market_snapshots[0].best_bid == 99.0
+    finally:
+        await feed.stop()
 
 
 @pytest.mark.asyncio
@@ -222,20 +277,54 @@ async def test_hyperliquid_reconnect_clears_books_until_fresh_snapshots_arrive()
         return connections.pop(0) if connections else second
 
     invalidated: list[str] = []
+    latest = LatestMarketData()
+
+    def on_book(coin: str, snapshot) -> None:
+        latest.update_book(
+            venue="hyperliquid",
+            venue_symbol=coin,
+            bids=snapshot.bids,
+            asks=snapshot.asks,
+            observed_at=snapshot.observed_at,
+        )
+
+    def on_invalidate(coin: str) -> None:
+        invalidated.append(coin)
+        latest.invalidate(venue="hyperliquid", venue_symbol=coin)
+
+    market = MarketConfig(
+        venue="hyperliquid", venue_symbol="BTC", canonical_symbol="BTC"
+    )
     feed = HyperliquidOrderBookFeed(
         "wss://test.invalid/ws",
         ["BTC"],
         connect=connect,
         clock=lambda: OBSERVED_AT,
         venue="hyperliquid",
-        on_invalidate=invalidated.append,
+        on_book=on_book,
+        on_invalidate=on_invalidate,
         reconnect_delay_seconds=0,
     )
     await feed.start()
     try:
         await wait_until(lambda: feed.snapshot("BTC") is not None)
+        assert len(
+            latest.build_batch(
+                [market],
+                sample_time=OBSERVED_AT,
+                now=OBSERVED_AT,
+                stale_after_seconds=30,
+            ).market_snapshots
+        ) == 1
+
         await first.close()
         await wait_until(lambda: feed.snapshot("BTC") is None and len(second.sent) == 1)
+        assert latest.build_batch(
+            [market],
+            sample_time=OBSERVED_AT,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        ).market_snapshots == ()
 
         second.push(
             l2_book_message(
@@ -246,6 +335,22 @@ async def test_hyperliquid_reconnect_clears_books_until_fresh_snapshots_arrive()
         )
         await wait_until(lambda: feed.snapshot("BTC") is not None)
         assert feed.snapshot("BTC").bids == (BookLevel(price=98.0, base_size=2.0),)
+        republished = latest.build_batch(
+            [market],
+            sample_time=OBSERVED_AT,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+        assert len(republished.market_snapshots) == 1
+        assert republished.market_snapshots[0].best_bid == 98.0
+
+        await feed.stop()
+        assert latest.build_batch(
+            [market],
+            sample_time=OBSERVED_AT,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        ).market_snapshots == ()
         assert invalidated
     finally:
         await feed.stop()

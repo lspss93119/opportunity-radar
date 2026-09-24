@@ -271,8 +271,13 @@ class HyperliquidOrderBookFeed:
         if not isinstance(data, dict):
             raise ValueError("l2Book websocket data must be an object")
         coin = data.get("coin")
-        if coin not in self._coin_set:
-            raise ValueError(f"websocket coin {coin!r} is not configured")
+        if not isinstance(coin, str) or coin not in self._coin_set:
+            report_collector_error(
+                self._error_handler,
+                self._venue,
+                ValueError(f"websocket coin {coin!r} is not configured"),
+            )
+            return
         try:
             bids, asks = parse_hyperliquid_l2_book(data, expected_coin=coin)
         except Exception as error:  # noqa: BLE001
