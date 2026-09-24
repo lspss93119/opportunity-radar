@@ -10,7 +10,7 @@ from radar.collectors.hyperliquid import HyperliquidCollector
 from radar.collectors.lighter import LighterCollector
 from radar.config import MarketConfig
 from radar.market_data import LatestMarketData
-from radar.pipeline import MarketDataPipeline
+from radar.pipeline import MarketDataPipeline, aligned_sample_time
 from radar.state import RadarState
 
 UTC = timezone.utc
@@ -273,7 +273,8 @@ async def test_trade_xyz_hip3_public_read_only_live_smoke_matches_lighter_tsla()
     assert {item.canonical_symbol for item in hip3_batch.funding_snapshots} == {"TSLA"}
     assert {item.canonical_symbol for item in lighter_batch.hourly_contexts} == {"TSLA"}
     assert {item.canonical_symbol for item in hip3_batch.hourly_contexts} == {"TSLA"}
-    assert lighter.sample_time == hip3.sample_time
+    assert lighter.sample_time == aligned_sample_time(lighter.sample_time)
+    assert hip3.sample_time == aligned_sample_time(hip3.sample_time)
     assert lighter.observed_at.tzinfo is not None
     assert hip3.observed_at.tzinfo is not None
 

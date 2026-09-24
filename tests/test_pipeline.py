@@ -683,8 +683,16 @@ async def test_all_seven_venue_pipeline_fails_closed_without_synthetic_samples(
     }
     target = target_by_failure[failure]
     for market in ALL_SEVEN_MARKETS:
-        if market != target:
-            seed_pipeline_book(latest, market)
+        seed_pipeline_book(latest, market)
+
+    all_identities = {
+        (market.venue, market.venue_symbol) for market in ALL_SEVEN_MARKETS
+    }
+    before_failure = await pipeline.collect_once(now=NOW)
+    assert {
+        (snapshot.venue, snapshot.venue_symbol)
+        for snapshot in before_failure.market_snapshots
+    } == all_identities
 
     if failure == "stale":
         seed_pipeline_book(
@@ -708,9 +716,14 @@ async def test_all_seven_venue_pipeline_fails_closed_without_synthetic_samples(
             asks=(BookLevel(price=101.0, base_size=200.0),),
             observed_at=NOW,
         )
+        latest.invalidate(
+            venue=target.venue,
+            venue_symbol=target.venue_symbol,
+        )
     elif failure in {"backpack_gap", "lighter_reconnect", "arcus_timeout"}:
         latest.invalidate(venue=target.venue, venue_symbol=target.venue_symbol)
     elif failure == "metadata_failure":
+        latest.invalidate(venue=target.venue, venue_symbol=target.venue_symbol)
         latest.update_metadata(
             venue=target.venue,
             venue_symbol=target.venue_symbol,
@@ -734,6 +747,15 @@ async def test_all_seven_venue_pipeline_fails_closed_without_synthetic_samples(
         (snapshot.venue, snapshot.venue_symbol)
         for snapshot in pipeline.state.markets
     } == expected
+    target_view = latest._views[(target.venue, target.venue_symbol)]
+    if failure in {
+        "mismatched_hyperliquid_coin",
+        "backpack_gap",
+        "lighter_reconnect",
+        "arcus_timeout",
+        "metadata_failure",
+    }:
+        assert not target_view.ready
 
 
 @pytest.mark.asyncio

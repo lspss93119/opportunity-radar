@@ -118,9 +118,11 @@ class MetadataFailureTransport(FixtureTransport):
     def __init__(self) -> None:
         super().__init__()
         self.fail_metadata = False
+        self.metadata_failure_seen = asyncio.Event()
 
     async def __call__(self, url: str, *, method: str, json_body=None, params=None):
         if self.fail_metadata and url == ArcusCollector.MARKETS_URL:
+            self.metadata_failure_seen.set()
             raise OSError("Arcus metadata unavailable")
         return await super().__call__(
             url,
@@ -199,21 +201,22 @@ async def test_arcus_background_refresh_does_not_block_cache_sampler():
 async def test_arcus_refresh_publishes_complete_book_with_rest_observation_time():
     transport = FixtureTransport()
     latest = LatestMarketData()
+    markets = configured_markets()[:1]
     collector = ArcusCollector(
-        configured_markets()[:1],
+        markets,
         request_json=transport,
         clock=lambda: OBSERVED_AT,
         latest_market_data=latest,
     )
 
-    await collector.refresh_once()
+    pipeline = cache_pipeline(collector, markets, latest)
+    try:
+        await collector.start()
+        await wait_for_ready_cache(latest, markets)
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
+    finally:
+        await collector.stop()
 
-    batch = latest.build_batch(
-        configured_markets()[:1],
-        sample_time=SAMPLE_TIME,
-        now=OBSERVED_AT,
-        stale_after_seconds=30,
-    )
     assert len(batch.market_snapshots) == 1
     assert batch.market_snapshots[0].observed_at == OBSERVED_AT
     assert batch.market_snapshots[0].observed_at != SAMPLE_TIME
@@ -223,33 +226,38 @@ async def test_arcus_refresh_publishes_complete_book_with_rest_observation_time(
 async def test_arcus_metadata_failure_retains_prior_cache_book():
     transport = MetadataFailureTransport()
     latest = LatestMarketData()
+    markets = configured_markets()[:1]
     collector = ArcusCollector(
-        configured_markets()[:1],
+        markets,
         request_json=transport,
         clock=lambda: OBSERVED_AT,
         latest_market_data=latest,
+        refresh_interval_seconds=0.001,
     )
 
-    await collector.refresh_once()
-    transport.fail_metadata = True
-    await collector.refresh_once()
+    pipeline = cache_pipeline(collector, markets, latest)
+    try:
+        await collector.start()
+        await wait_for_ready_cache(latest, markets)
+        before = await pipeline.collect_once(now=OBSERVED_AT)
+        transport.fail_metadata = True
+        await asyncio.wait_for(transport.metadata_failure_seen.wait(), timeout=0.2)
+        after = await pipeline.collect_once(now=OBSERVED_AT)
+    finally:
+        await collector.stop()
 
-    batch = latest.build_batch(
-        configured_markets()[:1],
-        sample_time=SAMPLE_TIME,
-        now=OBSERVED_AT,
-        stale_after_seconds=30,
-    )
-    assert len(batch.market_snapshots) == 1
-    assert batch.market_snapshots[0].observed_at == OBSERVED_AT
-    assert batch.market_snapshots[0].mark_price == 1875.54
-    assert batch.market_snapshots[0].index_price == 1875.5
+    assert len(before.market_snapshots) == 1
+    assert len(after.market_snapshots) == 1
+    assert after.market_snapshots[0].observed_at == OBSERVED_AT
+    assert after.market_snapshots[0].mark_price == 1875.54
+    assert after.market_snapshots[0].index_price == 1875.5
 
 
 @pytest.mark.asyncio
 async def test_arcus_refresh_omits_only_failed_market():
     transport = FixtureTransport()
     failures: list[tuple[str, Exception]] = []
+    markets = configured_markets()
 
     async def failing_transport(url: str, *, method: str, json_body=None, params=None):
         if url.endswith("NVDA-USD"):
@@ -258,21 +266,21 @@ async def test_arcus_refresh_omits_only_failed_market():
 
     latest = LatestMarketData()
     collector = ArcusCollector(
-        configured_markets(),
+        markets,
         request_json=failing_transport,
         clock=lambda: OBSERVED_AT,
         error_handler=lambda venue, error: failures.append((venue, error)),
         latest_market_data=latest,
     )
 
-    await collector.refresh_once()
+    pipeline = cache_pipeline(collector, markets, latest)
+    try:
+        await collector.start()
+        await wait_for_ready_cache(latest, markets[:1])
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
+    finally:
+        await collector.stop()
 
-    batch = latest.build_batch(
-        configured_markets(),
-        sample_time=SAMPLE_TIME,
-        now=OBSERVED_AT,
-        stale_after_seconds=30,
-    )
     assert [snapshot.canonical_symbol for snapshot in batch.market_snapshots] == [
         "SNDK"
     ]
@@ -285,16 +293,27 @@ async def test_arcus_refresh_omits_only_failed_market():
 async def test_arcus_refresh_keeps_hourly_funding_and_context_separate():
     transport = FixtureTransport()
     latest = LatestMarketData()
+    markets = configured_markets()
     collector = ArcusCollector(
-        configured_markets(),
+        markets,
         request_json=transport,
         clock=lambda: OBSERVED_AT,
         latest_market_data=latest,
     )
 
-    await collector.refresh_once()
-    batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+    pipeline = cache_pipeline(collector, markets, latest)
+    try:
+        await collector.start()
+        await wait_for_ready_cache(latest, markets)
+        market_batch = await pipeline.collect_once(now=OBSERVED_AT)
+        batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+    finally:
+        await collector.stop()
 
+    assert [snapshot.canonical_symbol for snapshot in market_batch.market_snapshots] == [
+        "SNDK",
+        "NVDA",
+    ]
     assert batch.market_snapshots == ()
     assert len(batch.funding_snapshots) == 1
     assert batch.funding_snapshots[0].canonical_symbol == "SNDK"
