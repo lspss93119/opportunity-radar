@@ -22,14 +22,20 @@ def _request_json_sync(
     method: str,
     params: Mapping[str, object] | None,
     json_body: Mapping[str, object] | None,
+    headers: Mapping[str, str] | None,
     timeout: float,
 ) -> Any:
     request_url = _with_query(url, params)
     body = None if json_body is None else json.dumps(json_body).encode("utf-8")
-    headers = {"Accept": "application/json"}
+    request_headers = {
+        "Accept": "application/json",
+        "User-Agent": "opportunity-radar/readonly",
+    }
+    if headers is not None:
+        request_headers.update(headers)
     if body is not None:
-        headers["Content-Type"] = "application/json"
-    request = Request(request_url, data=body, headers=headers, method=method)
+        request_headers["Content-Type"] = "application/json"
+    request = Request(request_url, data=body, headers=request_headers, method=method)
     with urlopen(request, timeout=timeout) as response:
         if response.status != 200:
             raise RuntimeError("public API returned a non-200 response")
@@ -42,6 +48,7 @@ async def request_json(
     method: str = "GET",
     params: Mapping[str, object] | None = None,
     json_body: Mapping[str, object] | None = None,
+    headers: Mapping[str, str] | None = None,
     timeout: float = 10.0,
 ) -> Any:
     return await asyncio.to_thread(
@@ -50,5 +57,6 @@ async def request_json(
         method=method,
         params=params,
         json_body=json_body,
+        headers=headers,
         timeout=timeout,
     )

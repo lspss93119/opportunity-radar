@@ -173,6 +173,54 @@ def test_example_config_loads():
         for symbol in ("AMD", "AMZN", "CRCL", "SPY", "QQQ")
     }
     assert len(cfg.markets) == 127
+    assert len(cfg.quoted_markets) == 28
+    assert {market.venue for market in cfg.quoted_markets} == {"variational"}
+    assert {
+        (market.venue_symbol, market.canonical_symbol)
+        for market in cfg.quoted_markets
+    } == {
+        (symbol, symbol)
+        for symbol in (
+            "AAPL",
+            "AAVE",
+            "AMD",
+            "AMZN",
+            "BABA",
+            "BTC",
+            "COIN",
+            "CRCL",
+            "DOGE",
+            "ETH",
+            "GOOGL",
+            "HOOD",
+            "HYPE",
+            "LINK",
+            "META",
+            "MSFT",
+            "MU",
+            "NVDA",
+            "ORCL",
+            "PLTR",
+            "QQQ",
+            "SNDK",
+            "SOL",
+            "SUI",
+            "TSLA",
+            "UNI",
+            "XRP",
+        )
+    } | {("US500", "SPY")}
+
+
+def test_quoted_markets_reject_non_variational_venues():
+    with pytest.raises(ValidationError, match="quoted_markets"):
+        RadarConfig(
+            quoted_markets=[
+                MarketConfig(
+                    venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+                )
+            ]
+        )
 
 
 def test_primary_size_is_limited_to_fixed_supported_sizes():

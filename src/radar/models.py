@@ -80,3 +80,38 @@ class HourlyContext(BaseModel):
 
     _sample_time_utc = field_validator("sample_time")(_require_utc)
     _observed_at_utc = field_validator("observed_at")(_require_utc)
+
+
+class QuotedMarketSnapshot(BaseModel):
+    """A size-specific public quote that is not an order-book VWAP."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    quote_time: datetime
+    fetched_at: datetime
+    venue: str = Field(min_length=1)
+    venue_symbol: str = Field(min_length=1)
+    canonical_symbol: str = Field(min_length=1)
+
+    mark_price: float = Field(gt=0, allow_inf_nan=False)
+
+    bid_1k: float = Field(gt=0, allow_inf_nan=False)
+    ask_1k: float = Field(gt=0, allow_inf_nan=False)
+    bid_100k: float = Field(gt=0, allow_inf_nan=False)
+    ask_100k: float = Field(gt=0, allow_inf_nan=False)
+    bid_1m: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    ask_1m: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
+    funding_rate: float = Field(allow_inf_nan=False)
+    funding_interval_seconds: int = Field(gt=0)
+
+    volume_24h: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    long_open_interest: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    short_open_interest: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+
+    _quote_time_utc = field_validator("quote_time")(_require_utc)
+    _fetched_at_utc = field_validator("fetched_at")(_require_utc)

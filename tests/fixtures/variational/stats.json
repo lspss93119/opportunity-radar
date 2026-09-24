@@ -1,0 +1,82 @@
+{
+  "num_markets": 4,
+  "listings": [
+    {
+      "ticker": "AAPL",
+      "name": "Apple Inc.",
+      "mark_price": "100.25",
+      "volume_24h": "123456.7",
+      "open_interest": {
+        "long_open_interest": "1000.5",
+        "short_open_interest": "900.25"
+      },
+      "funding_rate": "0.044923",
+      "funding_interval_s": 28800,
+      "base_spread_bps": "8.5",
+      "quotes": {
+        "updated_at": "2026-09-24T12:00:20.000Z",
+        "base": {"bid": "100.10", "ask": "100.40"},
+        "size_1k": {"bid": "100.00", "ask": "100.50"},
+        "size_100k": {"bid": "99.00", "ask": "101.50"}
+      }
+    },
+    {
+      "ticker": "US500",
+      "name": "State Street SPDR S&P 500 ETF Trust",
+      "mark_price": "764.58",
+      "volume_24h": "222222.2",
+      "open_interest": {
+        "long_open_interest": "2000.0",
+        "short_open_interest": "1800.0"
+      },
+      "funding_rate": "0.0012",
+      "funding_interval_s": 28800,
+      "base_spread_bps": "10.0",
+      "quotes": {
+        "updated_at": "2026-09-24T12:00:21.000Z",
+        "base": {"bid": "764.40", "ask": "764.75"},
+        "size_1k": {"bid": "764.30", "ask": "764.80"},
+        "size_100k": {"bid": "763.00", "ask": "766.00"},
+        "size_1m": {"bid": "760.00", "ask": "769.00"}
+      }
+    },
+    {
+      "ticker": "CL",
+      "name": "WTI Crude Oil",
+      "mark_price": "96.25",
+      "volume_24h": "10000.0",
+      "open_interest": {
+        "long_open_interest": "100.0",
+        "short_open_interest": "100.0"
+      },
+      "funding_rate": "0.01",
+      "funding_interval_s": 14400,
+      "base_spread_bps": "12.0",
+      "quotes": {
+        "updated_at": "2026-09-24T12:00:22.000Z",
+        "base": {"bid": "96.20", "ask": "96.30"},
+        "size_1k": {"bid": "96.10", "ask": "96.40"},
+        "size_100k": {"bid": "95.00", "ask": "97.50"}
+      }
+    },
+    {
+      "ticker": "USOILP",
+      "name": "Swap on WTI Crude Oil",
+      "mark_price": "95.50",
+      "volume_24h": "5000.0",
+      "open_interest": {
+        "long_open_interest": "50.0",
+        "short_open_interest": "40.0"
+      },
+      "funding_rate": "0",
+      "funding_interval_s": 0,
+      "base_spread_bps": "12.0",
+      "quotes": {
+        "updated_at": "2026-09-24T12:00:22.000Z",
+        "base": {"bid": "95.45", "ask": "95.55"},
+        "size_1k": {"bid": "95.40", "ask": "95.60"},
+        "size_100k": {"bid": "94.00", "ask": "97.00"}
+      }
+    }
+  ]
+}

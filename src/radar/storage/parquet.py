@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import uuid
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -10,11 +11,21 @@ import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from radar.collectors.base import CollectorBatch
-from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
+from radar.models import (
+    FundingSnapshot,
+    HourlyContext,
+    MarketSnapshot,
+    QuotedMarketSnapshot,
+)
 
 UTC = timezone.utc
-DATASET_NAMES = ("market", "funding", "hourly_context")
-NormalizedRecord = MarketSnapshot | FundingSnapshot | HourlyContext
+DATASET_NAMES = ("market", "funding", "hourly_context", "quoted_market")
+NormalizedRecord = (
+    MarketSnapshot
+    | FundingSnapshot
+    | HourlyContext
+    | QuotedMarketSnapshot
+)
 PendingKey = tuple[str, date]
 UTC_TIMESTAMP = pa.timestamp("us", tz="UTC")
 
@@ -64,10 +75,33 @@ HOURLY_CONTEXT_SCHEMA = pa.schema(
     ]
 )
 
+QUOTED_MARKET_SCHEMA = pa.schema(
+    [
+        pa.field("quote_time", UTC_TIMESTAMP, nullable=False),
+        pa.field("fetched_at", UTC_TIMESTAMP, nullable=False),
+        pa.field("venue", pa.string(), nullable=False),
+        pa.field("venue_symbol", pa.string(), nullable=False),
+        pa.field("canonical_symbol", pa.string(), nullable=False),
+        pa.field("mark_price", pa.float64(), nullable=False),
+        pa.field("bid_1k", pa.float64(), nullable=False),
+        pa.field("ask_1k", pa.float64(), nullable=False),
+        pa.field("bid_100k", pa.float64(), nullable=False),
+        pa.field("ask_100k", pa.float64(), nullable=False),
+        pa.field("bid_1m", pa.float64()),
+        pa.field("ask_1m", pa.float64()),
+        pa.field("funding_rate", pa.float64(), nullable=False),
+        pa.field("funding_interval_seconds", pa.int64(), nullable=False),
+        pa.field("volume_24h", pa.float64()),
+        pa.field("long_open_interest", pa.float64()),
+        pa.field("short_open_interest", pa.float64()),
+    ]
+)
+
 DATASET_SCHEMAS = {
     "market": MARKET_SCHEMA,
     "funding": FUNDING_SCHEMA,
     "hourly_context": HOURLY_CONTEXT_SCHEMA,
+    "quoted_market": QUOTED_MARKET_SCHEMA,
 }
 
 
@@ -95,7 +129,13 @@ class ParquetStorage:
 
     def append(
         self,
-        value: CollectorBatch | MarketSnapshot | FundingSnapshot | HourlyContext,
+        value: (
+            CollectorBatch
+            | MarketSnapshot
+            | FundingSnapshot
+            | HourlyContext
+            | QuotedMarketSnapshot
+        ),
     ) -> None:
         with self._pending_lock:
             if isinstance(value, CollectorBatch):
@@ -115,13 +155,25 @@ class ParquetStorage:
             if isinstance(value, HourlyContext):
                 self._append_record("hourly_context", value)
                 return
+            if isinstance(value, QuotedMarketSnapshot):
+                self._append_record("quoted_market", value)
+                return
             raise TypeError("value must be a CollectorBatch or normalized snapshot")
+
+    def append_quoted(self, snapshots: Iterable[QuotedMarketSnapshot]) -> None:
+        with self._pending_lock:
+            for snapshot in snapshots:
+                self._append_record("quoted_market", snapshot)
 
     def _append_record(self, dataset: str, record: NormalizedRecord) -> None:
         if dataset == "funding":
             if not isinstance(record, FundingSnapshot):
                 raise TypeError("funding dataset requires FundingSnapshot")
             timestamp = record.effective_time
+        elif dataset == "quoted_market":
+            if not isinstance(record, QuotedMarketSnapshot):
+                raise TypeError("quoted_market dataset requires QuotedMarketSnapshot")
+            timestamp = record.quote_time
         else:
             if not isinstance(record, (MarketSnapshot, HourlyContext)):
                 raise TypeError("market datasets require a sample_time")

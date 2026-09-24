@@ -519,6 +519,120 @@ markets:
     canonical_symbol: QQQ
     enabled: true
 
+quoted_markets:
+  - venue: variational
+    venue_symbol: AAPL
+    canonical_symbol: AAPL
+    enabled: true
+  - venue: variational
+    venue_symbol: AAVE
+    canonical_symbol: AAVE
+    enabled: true
+  - venue: variational
+    venue_symbol: AMD
+    canonical_symbol: AMD
+    enabled: true
+  - venue: variational
+    venue_symbol: AMZN
+    canonical_symbol: AMZN
+    enabled: true
+  - venue: variational
+    venue_symbol: BABA
+    canonical_symbol: BABA
+    enabled: true
+  - venue: variational
+    venue_symbol: BTC
+    canonical_symbol: BTC
+    enabled: true
+  - venue: variational
+    venue_symbol: COIN
+    canonical_symbol: COIN
+    enabled: true
+  - venue: variational
+    venue_symbol: CRCL
+    canonical_symbol: CRCL
+    enabled: true
+  - venue: variational
+    venue_symbol: DOGE
+    canonical_symbol: DOGE
+    enabled: true
+  - venue: variational
+    venue_symbol: ETH
+    canonical_symbol: ETH
+    enabled: true
+  - venue: variational
+    venue_symbol: GOOGL
+    canonical_symbol: GOOGL
+    enabled: true
+  - venue: variational
+    venue_symbol: HOOD
+    canonical_symbol: HOOD
+    enabled: true
+  - venue: variational
+    venue_symbol: HYPE
+    canonical_symbol: HYPE
+    enabled: true
+  - venue: variational
+    venue_symbol: LINK
+    canonical_symbol: LINK
+    enabled: true
+  - venue: variational
+    venue_symbol: META
+    canonical_symbol: META
+    enabled: true
+  - venue: variational
+    venue_symbol: MSFT
+    canonical_symbol: MSFT
+    enabled: true
+  - venue: variational
+    venue_symbol: MU
+    canonical_symbol: MU
+    enabled: true
+  - venue: variational
+    venue_symbol: NVDA
+    canonical_symbol: NVDA
+    enabled: true
+  - venue: variational
+    venue_symbol: ORCL
+    canonical_symbol: ORCL
+    enabled: true
+  - venue: variational
+    venue_symbol: PLTR
+    canonical_symbol: PLTR
+    enabled: true
+  - venue: variational
+    venue_symbol: QQQ
+    canonical_symbol: QQQ
+    enabled: true
+  - venue: variational
+    venue_symbol: SNDK
+    canonical_symbol: SNDK
+    enabled: true
+  - venue: variational
+    venue_symbol: SOL
+    canonical_symbol: SOL
+    enabled: true
+  - venue: variational
+    venue_symbol: SUI
+    canonical_symbol: SUI
+    enabled: true
+  - venue: variational
+    venue_symbol: TSLA
+    canonical_symbol: TSLA
+    enabled: true
+  - venue: variational
+    venue_symbol: UNI
+    canonical_symbol: UNI
+    enabled: true
+  - venue: variational
+    venue_symbol: XRP
+    canonical_symbol: XRP
+    enabled: true
+  - venue: variational
+    venue_symbol: US500
+    canonical_symbol: SPY
+    enabled: true
+
 monitors:
   spread:
     enabled: true

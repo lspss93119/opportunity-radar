@@ -12,6 +12,7 @@ from radar.collectors.base import (
     markets_for_venue,
     report_collector_error,
 )
+from radar.collectors.variational import VariationalCollector
 from radar.config import MarketConfig, RadarConfig
 from radar.market_data import LatestMarketData
 from radar.state import RadarState
@@ -101,11 +102,15 @@ class MarketDataPipeline:
         storage: ParquetStorage | None = None,
         collector_error_handler: CollectorErrorHandler | None = None,
         stale_after_seconds: int = 30,
+        quoted_market_collector: VariationalCollector | None = None,
+        quoted_market_poll_interval_seconds: float = 30.0,
     ) -> None:
         if sampling_seconds != SAMPLE_INTERVAL_SECONDS:
             raise ValueError("sampling_seconds must be a 10-second interval")
         if isinstance(stale_after_seconds, bool) or stale_after_seconds < 0:
             raise ValueError("stale_after_seconds must be non-negative")
+        if quoted_market_poll_interval_seconds <= 0:
+            raise ValueError("quoted_market_poll_interval_seconds must be positive")
         self._collectors = tuple(collectors)
         self.state = state
         self._markets = tuple(markets)
@@ -122,6 +127,11 @@ class MarketDataPipeline:
         self._last_hourly_sample: datetime | None = None
         self._hourly_task: asyncio.Task[None] | None = None
         self._hourly_stop_event: asyncio.Event | None = None
+        self._quoted_market_collector = quoted_market_collector
+        self._quoted_market_poll_interval_seconds = (
+            quoted_market_poll_interval_seconds
+        )
+        self._quoted_market_task: asyncio.Task[None] | None = None
         self._started = False
 
     @classmethod
@@ -216,6 +226,21 @@ class MarketDataPipeline:
                     **collector_kwargs,
                 )
             )
+        quoted_market_collector = None
+        if config.quoted_markets:
+            if request_json is None:
+                quoted_market_collector = VariationalCollector(
+                    config.quoted_markets,
+                    clock=clock,
+                    error_handler=collector_error_handler,
+                )
+            else:
+                quoted_market_collector = VariationalCollector(
+                    config.quoted_markets,
+                    request_json=request_json,
+                    clock=clock,
+                    error_handler=collector_error_handler,
+                )
         return cls(
             collectors,
             RadarState() if state is None else state,
@@ -226,6 +251,7 @@ class MarketDataPipeline:
             storage=storage,
             collector_error_handler=collector_error_handler,
             stale_after_seconds=config.monitors.spread.stale_after_seconds,
+            quoted_market_collector=quoted_market_collector,
         )
 
     @property
@@ -247,6 +273,11 @@ class MarketDataPipeline:
             self._run_hourly(),
             name="radar-hourly-context",
         )
+        if self._quoted_market_collector is not None:
+            self._quoted_market_task = asyncio.create_task(
+                self._run_quoted_market(),
+                name="radar-variational-quoted-market",
+            )
 
     async def stop(self) -> None:
         self._started = False
@@ -258,6 +289,11 @@ class MarketDataPipeline:
             await asyncio.gather(hourly_task, return_exceptions=True)
         self._hourly_task = None
         self._hourly_stop_event = None
+        quoted_market_task = self._quoted_market_task
+        if quoted_market_task is not None and not quoted_market_task.done():
+            quoted_market_task.cancel()
+            await asyncio.gather(quoted_market_task, return_exceptions=True)
+        self._quoted_market_task = None
         lifecycle_hooks = [
             hook
             for collector in self._collectors
@@ -400,6 +436,25 @@ class MarketDataPipeline:
                 hourly_contexts=result.hourly_contexts,
             )
         raise TypeError("collector does not provide an hourly collection method")
+
+    async def _run_quoted_market(self) -> None:
+        collector = self._quoted_market_collector
+        if collector is None:
+            return
+        while True:
+            try:
+                snapshots = await collector.poll_once()
+                if snapshots and self.storage is not None:
+                    self.storage.append_quoted(snapshots)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                report_collector_error(
+                    self._collector_error_handler,
+                    collector.venue,
+                    error,
+                )
+            await asyncio.sleep(self._quoted_market_poll_interval_seconds)
 
     async def _run_hourly(self) -> None:
         stop_event = self._hourly_stop_event

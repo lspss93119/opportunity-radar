@@ -8,9 +8,11 @@ from radar.collectors.arcus import ArcusCollector
 from radar.collectors.backpack import BackpackCollector
 from radar.collectors.hyperliquid import HyperliquidCollector
 from radar.collectors.lighter import LighterCollector
+from radar.collectors.variational import VariationalCollector
 from radar.config import MarketConfig, RadarConfig
 from radar.market_data import LatestMarketData
 from radar.models import HourlyContext, MarketSnapshot
+from radar.models import QuotedMarketSnapshot
 from radar.pipeline import (
     MarketDataPipeline,
     aligned_sample_time,
@@ -233,6 +235,42 @@ class NetworkOnlyCollector:
         raise AssertionError("cache-only sampling must not call collectors")
 
 
+class BlockingQuotedCollector:
+    def __init__(self, snapshot: QuotedMarketSnapshot) -> None:
+        self.snapshot = snapshot
+        self.poll_started = asyncio.Event()
+        self.poll_cancelled = asyncio.Event()
+
+    async def poll_once(self) -> tuple[QuotedMarketSnapshot, ...]:
+        self.poll_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.poll_cancelled.set()
+            raise
+        return (self.snapshot,)
+
+
+def make_quoted_snapshot() -> QuotedMarketSnapshot:
+    return QuotedMarketSnapshot(
+        quote_time=NOW,
+        fetched_at=NOW,
+        venue="variational",
+        venue_symbol="AAPL",
+        canonical_symbol="AAPL",
+        mark_price=100.0,
+        bid_1k=99.0,
+        ask_1k=101.0,
+        bid_100k=98.0,
+        ask_100k=102.0,
+        funding_rate=0.01,
+        funding_interval_seconds=28_800,
+        volume_24h=1.0,
+        long_open_interest=2.0,
+        short_open_interest=3.0,
+    )
+
+
 @pytest.mark.asyncio
 async def test_pipeline_starts_and_stops_collectors_with_optional_lifecycle_hooks():
     collector = LifecycleCollector()
@@ -360,6 +398,26 @@ async def test_collect_once_reads_latest_cache_without_invoking_collectors():
     assert len(batch.market_snapshots) == 1
     assert batch.market_snapshots[0].observed_at == NOW
     assert state.get_market("lighter", "BTC") == batch.market_snapshots[0]
+
+
+@pytest.mark.asyncio
+async def test_variational_background_task_does_not_enter_market_state_and_stops_cleanly():
+    collector = BlockingQuotedCollector(make_quoted_snapshot())
+    pipeline = MarketDataPipeline(
+        [],
+        RadarState(),
+        quoted_market_collector=collector,  # type: ignore[arg-type]
+        quoted_market_poll_interval_seconds=0.01,
+    )
+
+    await pipeline.start()
+    await asyncio.wait_for(collector.poll_started.wait(), timeout=0.2)
+    batch = await pipeline.collect_once(now=NOW)
+    assert batch.market_snapshots == ()
+    assert pipeline.state.markets == ()
+
+    await pipeline.stop()
+    assert collector.poll_cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -585,6 +643,25 @@ def test_pipeline_from_config_builds_backpack_collector_when_enabled():
         "backpack",
     ]
     assert isinstance(pipeline.collectors[2], BackpackCollector)
+
+
+def test_pipeline_from_config_keeps_variational_quotes_out_of_market_collectors():
+    config = RadarConfig(
+        quoted_markets=[
+            MarketConfig(
+                venue="variational", venue_symbol="AAPL", canonical_symbol="AAPL"
+            ),
+            MarketConfig(
+                venue="variational", venue_symbol="US500", canonical_symbol="SPY"
+            ),
+        ]
+    )
+
+    pipeline = MarketDataPipeline.from_config(config)
+
+    assert all(collector.venue != "variational" for collector in pipeline.collectors)
+    assert isinstance(pipeline._quoted_market_collector, VariationalCollector)
+    assert pipeline._quoted_market_collector._markets == tuple(config.quoted_markets)
 
 
 def test_pipeline_from_config_injects_one_cache_and_preserves_all_feed_identity():

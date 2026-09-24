@@ -47,6 +47,7 @@ class RadarConfig(BaseModel):
     sampling_seconds: int = Field(default=10, gt=0)
     fees_bps: dict[str, float] = Field(default_factory=dict)
     markets: list[MarketConfig] = Field(default_factory=list)
+    quoted_markets: list[MarketConfig] = Field(default_factory=list)
     monitors: MonitorConfig = Field(default_factory=MonitorConfig)
 
     @field_validator("sampling_seconds")
@@ -68,6 +69,15 @@ class RadarConfig(BaseModel):
     def fees_must_not_be_boolean(cls, value: object) -> object:
         if isinstance(value, dict) and any(isinstance(fee, bool) for fee in value.values()):
             raise ValueError("fees_bps values must be numeric, not boolean")
+        return value
+
+    @field_validator("quoted_markets")
+    @classmethod
+    def quoted_markets_must_be_variational(
+        cls, value: list[MarketConfig]
+    ) -> list[MarketConfig]:
+        if any(market.venue.lower() != "variational" for market in value):
+            raise ValueError("quoted_markets must contain only variational markets")
         return value
 
     @model_validator(mode="after")

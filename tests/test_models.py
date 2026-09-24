@@ -3,7 +3,12 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
-from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
+from radar.models import (
+    FundingSnapshot,
+    HourlyContext,
+    MarketSnapshot,
+    QuotedMarketSnapshot,
+)
 
 UTC = timezone.utc
 NOW = datetime(2026, 9, 15, 10, 0, tzinfo=UTC)
@@ -99,3 +104,27 @@ def test_hourly_context_rejects_negative_oi_or_volume():
             open_interest=-1,
             volume_24h=100,
         )
+
+
+def test_quoted_market_snapshot_keeps_quote_and_fetch_times_separate():
+    snapshot = QuotedMarketSnapshot(
+        quote_time=NOW,
+        fetched_at=NOW.replace(second=2),
+        venue="variational",
+        venue_symbol="AAPL",
+        canonical_symbol="AAPL",
+        mark_price=100.0,
+        bid_1k=99.0,
+        ask_1k=101.0,
+        bid_100k=98.0,
+        ask_100k=102.0,
+        funding_rate=0.044923,
+        funding_interval_seconds=28_800,
+        volume_24h=1.0,
+        long_open_interest=2.0,
+        short_open_interest=3.0,
+    )
+
+    assert snapshot.quote_time == NOW
+    assert snapshot.fetched_at != snapshot.quote_time
+    assert snapshot.bid_1m is None

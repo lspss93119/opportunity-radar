@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +9,7 @@ from radar.collectors.arcus import ArcusCollector
 from radar.collectors.backpack import BackpackCollector
 from radar.collectors.hyperliquid import HyperliquidCollector
 from radar.collectors.lighter import LighterCollector
+from radar.collectors.variational import VariationalCollector
 from radar.config import MarketConfig
 from radar.market_data import LatestMarketData
 from radar.pipeline import MarketDataPipeline, aligned_sample_time
@@ -230,6 +232,29 @@ async def test_lighter_robinhood_public_read_only_live_smoke():
     )
     assert {item.canonical_symbol for item in batch.funding_snapshots} == expected_symbols
     assert {context.canonical_symbol for context in batch.hourly_contexts} == expected_symbols
+
+
+@pytest.mark.live
+@pytest.mark.asyncio
+async def test_variational_public_read_only_quoted_market_live_smoke():
+    from radar.config import load_config
+
+    config = load_config(Path("config/radar.example.yaml"))
+    collector = VariationalCollector(config.quoted_markets)
+    snapshots = await collector.poll_once()
+
+    assert len(snapshots) == 28
+    assert {snapshot.venue_symbol for snapshot in snapshots} == {
+        market.venue_symbol for market in config.quoted_markets
+    }
+    assert all(snapshot.quote_time <= snapshot.fetched_at for snapshot in snapshots)
+    assert all(snapshot.bid_1k > 0 for snapshot in snapshots)
+    assert all(snapshot.ask_1k > 0 for snapshot in snapshots)
+    assert all(snapshot.bid_100k > 0 for snapshot in snapshots)
+    assert all(snapshot.ask_100k > 0 for snapshot in snapshots)
+    assert all(snapshot.funding_interval_seconds > 0 for snapshot in snapshots)
+    spy = next(snapshot for snapshot in snapshots if snapshot.venue_symbol == "US500")
+    assert spy.canonical_symbol == "SPY"
 
 
 @pytest.mark.live
