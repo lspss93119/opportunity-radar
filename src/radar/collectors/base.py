@@ -38,6 +38,23 @@ class Collector(Protocol):
         """Collect one normalized sample without placing or signing orders."""
 
 
+@runtime_checkable
+class ManagedCollector(Protocol):
+    venue: str
+
+    async def start(self) -> None:
+        """Start background market-data ingestion."""
+
+    async def stop(self) -> None:
+        """Stop background market-data ingestion."""
+
+    async def collect_hourly(self, *, sample_time: datetime) -> CollectorBatch:
+        """Collect the independent hourly funding/context batch."""
+
+
+CollectorLike: TypeAlias = Collector | ManagedCollector
+
+
 def report_collector_error(
     error_handler: CollectorErrorHandler | None,
     venue: str,

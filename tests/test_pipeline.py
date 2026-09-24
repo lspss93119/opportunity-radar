@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from radar.collectors.base import Collector, CollectorBatch
+from radar.collectors.base import Collector, CollectorBatch, CollectorLike, ManagedCollector
 from radar.collectors.arcus import ArcusCollector
 from radar.collectors.backpack import BackpackCollector
 from radar.collectors.hyperliquid import HyperliquidCollector
@@ -131,6 +131,19 @@ class LifecycleCollector(CadenceCollector):
         self.stopped = True
 
 
+class ManagedOnlyCollector:
+    venue = "hyperliquid"
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def collect_hourly(self, *, sample_time: datetime) -> CollectorBatch:
+        return CollectorBatch()
+
+
 @pytest.mark.asyncio
 async def test_pipeline_starts_and_stops_collectors_with_optional_lifecycle_hooks():
     collector = LifecycleCollector()
@@ -145,6 +158,13 @@ async def test_pipeline_starts_and_stops_collectors_with_optional_lifecycle_hook
 
 def test_collector_protocol_is_structural():
     assert isinstance(SuccessfulCollector(), Collector)
+
+
+def test_managed_collector_protocol_is_structural_and_distinct_from_legacy():
+    collector = ManagedOnlyCollector()
+
+    assert isinstance(collector, ManagedCollector)
+    assert isinstance(collector, CollectorLike)
 
 
 def test_pipeline_from_config_builds_the_two_configured_public_collectors():
