@@ -74,7 +74,6 @@ def parse_backpack_markets(payload: object) -> dict[str, BackpackMarketDetail]:
             raw_market.get("marketType") != "PERP"
             or raw_market.get("orderBookState") != "Open"
             or raw_market.get("visible") is not True
-            or raw_market.get("rwaMarketType") != "STOCK"
         ):
             continue
         symbol = raw_market.get("symbol")

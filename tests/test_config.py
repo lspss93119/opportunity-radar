@@ -33,22 +33,146 @@ def test_example_config_loads():
         for symbol in ("BTC", "ETH", "SOL")
     } | {
         ("lighter", symbol)
-        for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
+        for symbol in (
+            "SNDK",
+            "NVDA",
+            "TSLA",
+            "HOOD",
+            "GOOGL",
+            "AAPL",
+            "META",
+            "MU",
+            "XRP",
+            "HYPE",
+            "SUI",
+            "LINK",
+            "DOGE",
+            "AAVE",
+            "UNI",
+            "AMD",
+            "AMZN",
+            "CRCL",
+            "COIN",
+            "MSFT",
+            "PLTR",
+            "ORCL",
+            "BABA",
+            "SPY",
+            "QQQ",
+        )
     } | {
         ("lighter_robinhood", symbol)
-        for symbol in ("BTC", "ETH", "SOL", "SNDK", "NVDA", "TSLA", "GOOGL", "AAPL", "META", "MU")
+        for symbol in (
+            "BTC",
+            "ETH",
+            "SOL",
+            "SNDK",
+            "NVDA",
+            "TSLA",
+            "GOOGL",
+            "AAPL",
+            "META",
+            "MU",
+            "XRP",
+            "HYPE",
+            "SUI",
+            "AMD",
+            "AMZN",
+            "CRCL",
+            "COIN",
+            "MSFT",
+            "PLTR",
+            "ORCL",
+            "BABA",
+            "SPY",
+            "QQQ",
+            "USO",
+            "SLV",
+        )
+    } | {
+        ("hyperliquid", symbol)
+        for symbol in ("XRP", "HYPE", "SUI", "LINK", "DOGE", "AAVE", "UNI")
     } | {
         ("trade_xyz", f"xyz:{symbol}")
-        for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
+        for symbol in (
+            "SNDK",
+            "NVDA",
+            "TSLA",
+            "HOOD",
+            "GOOGL",
+            "AAPL",
+            "META",
+            "MU",
+            "AMD",
+            "AMZN",
+            "CRCL",
+            "COIN",
+            "MSFT",
+            "PLTR",
+            "ORCL",
+            "BABA",
+        )
     } | {
         ("entropy", "io:SNDK")
     } | {
         ("arcus", f"{symbol}-USD")
-        for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
+        for symbol in (
+            "SNDK",
+            "NVDA",
+            "TSLA",
+            "HOOD",
+            "GOOGL",
+            "AAPL",
+            "META",
+            "MU",
+            "XRP",
+            "HYPE",
+            "SUI",
+            "LINK",
+            "DOGE",
+            "AAVE",
+            "UNI",
+            "AMD",
+            "AMZN",
+            "CRCL",
+            "COIN",
+            "MSFT",
+            "PLTR",
+            "ORCL",
+            "BABA",
+            "SPY",
+            "QQQ",
+            "USO",
+            "SLV",
+        )
     } | {
         ("backpack", f"{symbol}.US_USDC_PERP")
-        for symbol in ("SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU")
+        for symbol in (
+            "SNDK",
+            "NVDA",
+            "TSLA",
+            "HOOD",
+            "GOOGL",
+            "AAPL",
+            "META",
+            "MU",
+        )
+    } | {
+        ("backpack", symbol)
+        for symbol in (
+            "XRP_USDC_PERP",
+            "HYPE_USDC_PERP",
+            "SUI_USDC_PERP",
+            "LINK_USDC_PERP",
+            "DOGE_USDC_PERP",
+            "AAVE_USDC_PERP",
+            "UNI_USDC_PERP",
+        )
+    } | {
+        ("backpack", f"{symbol}.US_USDC_PERP")
+        for symbol in ("AMD", "AMZN", "CRCL", "SPY", "QQQ")
     }
+    assert len(cfg.markets) == 127
 
 
 def test_primary_size_is_limited_to_fixed_supported_sizes():

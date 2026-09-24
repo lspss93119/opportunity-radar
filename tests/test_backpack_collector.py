@@ -40,11 +40,39 @@ def configured_markets() -> list[MarketConfig]:
     ]
 
 
-def test_backpack_markets_parser_keeps_visible_open_stock_perps_only():
+def configured_crypto_market() -> list[MarketConfig]:
+    return [
+        MarketConfig(
+            venue="backpack",
+            venue_symbol="BTC_USDC_PERP",
+            canonical_symbol="BTC",
+        )
+    ]
+
+
+def test_backpack_markets_parser_keeps_visible_open_stock_and_crypto_perps():
     markets = parse_backpack_markets(load_fixture("markets.json"))
 
-    assert sorted(markets) == ["NVDA.US_USDC_PERP", "SNDK.US_USDC_PERP"]
+    assert sorted(markets) == [
+        "BTC_USDC_PERP",
+        "NVDA.US_USDC_PERP",
+        "SNDK.US_USDC_PERP",
+    ]
     assert markets["SNDK.US_USDC_PERP"].base_symbol == "SNDK.US"
+    assert markets["BTC_USDC_PERP"].base_symbol == "BTC"
+
+
+def test_backpack_markets_parser_fails_closed_when_visibility_is_missing():
+    assert parse_backpack_markets(
+        [
+            {
+                "baseSymbol": "BTC",
+                "marketType": "PERP",
+                "orderBookState": "Open",
+                "symbol": "BTC_USDC_PERP",
+            }
+        ]
+    ) == {}
 
 
 def test_backpack_depth_parser_sorts_levels_and_reads_array_pairs():
@@ -170,6 +198,24 @@ async def test_backpack_collector_normalizes_market_funding_context_and_vwap():
     assert sum(url == BackpackCollector.TICKERS_URL for url, _, _ in transport.calls) == 1
     assert sum(url == BackpackCollector.FUNDING_RATES_URL for url, _, _ in transport.calls) == 2
     assert all(method == "GET" for _, method, _ in transport.calls)
+
+
+@pytest.mark.asyncio
+async def test_backpack_collector_collects_configured_crypto_perp():
+    collector = BackpackCollector(
+        configured_crypto_market(),
+        request_json=FixtureTransport(),
+        clock=lambda: OBSERVED_AT,
+    )
+
+    batch = await collector.collect(
+        sample_time=SAMPLE_TIME,
+        include_hourly_context=False,
+    )
+
+    assert len(batch.market_snapshots) == 1
+    assert batch.market_snapshots[0].venue_symbol == "BTC_USDC_PERP"
+    assert batch.market_snapshots[0].canonical_symbol == "BTC"
 
 
 @pytest.mark.asyncio

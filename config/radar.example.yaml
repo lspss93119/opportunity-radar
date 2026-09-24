@@ -54,6 +54,74 @@ markets:
     venue_symbol: MU
     canonical_symbol: MU
     enabled: true
+  - venue: lighter
+    venue_symbol: XRP
+    canonical_symbol: XRP
+    enabled: true
+  - venue: lighter
+    venue_symbol: HYPE
+    canonical_symbol: HYPE
+    enabled: true
+  - venue: lighter
+    venue_symbol: SUI
+    canonical_symbol: SUI
+    enabled: true
+  - venue: lighter
+    venue_symbol: LINK
+    canonical_symbol: LINK
+    enabled: true
+  - venue: lighter
+    venue_symbol: DOGE
+    canonical_symbol: DOGE
+    enabled: true
+  - venue: lighter
+    venue_symbol: AAVE
+    canonical_symbol: AAVE
+    enabled: true
+  - venue: lighter
+    venue_symbol: UNI
+    canonical_symbol: UNI
+    enabled: true
+  - venue: lighter
+    venue_symbol: AMD
+    canonical_symbol: AMD
+    enabled: true
+  - venue: lighter
+    venue_symbol: AMZN
+    canonical_symbol: AMZN
+    enabled: true
+  - venue: lighter
+    venue_symbol: CRCL
+    canonical_symbol: CRCL
+    enabled: true
+  - venue: lighter
+    venue_symbol: COIN
+    canonical_symbol: COIN
+    enabled: true
+  - venue: lighter
+    venue_symbol: MSFT
+    canonical_symbol: MSFT
+    enabled: true
+  - venue: lighter
+    venue_symbol: PLTR
+    canonical_symbol: PLTR
+    enabled: true
+  - venue: lighter
+    venue_symbol: ORCL
+    canonical_symbol: ORCL
+    enabled: true
+  - venue: lighter
+    venue_symbol: BABA
+    canonical_symbol: BABA
+    enabled: true
+  - venue: lighter
+    venue_symbol: SPY
+    canonical_symbol: SPY
+    enabled: true
+  - venue: lighter
+    venue_symbol: QQQ
+    canonical_symbol: QQQ
+    enabled: true
   - venue: lighter_robinhood
     venue_symbol: BTC
     canonical_symbol: BTC
@@ -94,6 +162,66 @@ markets:
     venue_symbol: MU
     canonical_symbol: MU
     enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: XRP
+    canonical_symbol: XRP
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: HYPE
+    canonical_symbol: HYPE
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: SUI
+    canonical_symbol: SUI
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: AMD
+    canonical_symbol: AMD
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: AMZN
+    canonical_symbol: AMZN
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: CRCL
+    canonical_symbol: CRCL
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: COIN
+    canonical_symbol: COIN
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: MSFT
+    canonical_symbol: MSFT
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: PLTR
+    canonical_symbol: PLTR
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: ORCL
+    canonical_symbol: ORCL
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: BABA
+    canonical_symbol: BABA
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: SPY
+    canonical_symbol: SPY
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: QQQ
+    canonical_symbol: QQQ
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: USO
+    canonical_symbol: USO
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: SLV
+    canonical_symbol: SLV
+    enabled: true
   - venue: hyperliquid
     venue_symbol: BTC
     canonical_symbol: BTC
@@ -105,6 +233,34 @@ markets:
   - venue: hyperliquid
     venue_symbol: SOL
     canonical_symbol: SOL
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: XRP
+    canonical_symbol: XRP
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: HYPE
+    canonical_symbol: HYPE
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: SUI
+    canonical_symbol: SUI
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: LINK
+    canonical_symbol: LINK
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: DOGE
+    canonical_symbol: DOGE
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: AAVE
+    canonical_symbol: AAVE
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: UNI
+    canonical_symbol: UNI
     enabled: true
   - venue: trade_xyz
     venue_symbol: xyz:SNDK
@@ -137,6 +293,38 @@ markets:
   - venue: trade_xyz
     venue_symbol: xyz:MU
     canonical_symbol: MU
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:AMD
+    canonical_symbol: AMD
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:AMZN
+    canonical_symbol: AMZN
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:CRCL
+    canonical_symbol: CRCL
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:COIN
+    canonical_symbol: COIN
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:MSFT
+    canonical_symbol: MSFT
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:PLTR
+    canonical_symbol: PLTR
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:ORCL
+    canonical_symbol: ORCL
+    enabled: true
+  - venue: trade_xyz
+    venue_symbol: xyz:BABA
+    canonical_symbol: BABA
     enabled: true
   - venue: entropy
     venue_symbol: io:SNDK
@@ -174,6 +362,82 @@ markets:
     venue_symbol: MU-USD
     canonical_symbol: MU
     enabled: true
+  - venue: arcus
+    venue_symbol: XRP-USD
+    canonical_symbol: XRP
+    enabled: true
+  - venue: arcus
+    venue_symbol: HYPE-USD
+    canonical_symbol: HYPE
+    enabled: true
+  - venue: arcus
+    venue_symbol: SUI-USD
+    canonical_symbol: SUI
+    enabled: true
+  - venue: arcus
+    venue_symbol: LINK-USD
+    canonical_symbol: LINK
+    enabled: true
+  - venue: arcus
+    venue_symbol: DOGE-USD
+    canonical_symbol: DOGE
+    enabled: true
+  - venue: arcus
+    venue_symbol: AAVE-USD
+    canonical_symbol: AAVE
+    enabled: true
+  - venue: arcus
+    venue_symbol: UNI-USD
+    canonical_symbol: UNI
+    enabled: true
+  - venue: arcus
+    venue_symbol: AMD-USD
+    canonical_symbol: AMD
+    enabled: true
+  - venue: arcus
+    venue_symbol: AMZN-USD
+    canonical_symbol: AMZN
+    enabled: true
+  - venue: arcus
+    venue_symbol: CRCL-USD
+    canonical_symbol: CRCL
+    enabled: true
+  - venue: arcus
+    venue_symbol: COIN-USD
+    canonical_symbol: COIN
+    enabled: true
+  - venue: arcus
+    venue_symbol: MSFT-USD
+    canonical_symbol: MSFT
+    enabled: true
+  - venue: arcus
+    venue_symbol: PLTR-USD
+    canonical_symbol: PLTR
+    enabled: true
+  - venue: arcus
+    venue_symbol: ORCL-USD
+    canonical_symbol: ORCL
+    enabled: true
+  - venue: arcus
+    venue_symbol: BABA-USD
+    canonical_symbol: BABA
+    enabled: true
+  - venue: arcus
+    venue_symbol: SPY-USD
+    canonical_symbol: SPY
+    enabled: true
+  - venue: arcus
+    venue_symbol: QQQ-USD
+    canonical_symbol: QQQ
+    enabled: true
+  - venue: arcus
+    venue_symbol: USO-USD
+    canonical_symbol: USO
+    enabled: true
+  - venue: arcus
+    venue_symbol: SLV-USD
+    canonical_symbol: SLV
+    enabled: true
   - venue: backpack
     venue_symbol: SNDK.US_USDC_PERP
     canonical_symbol: SNDK
@@ -205,6 +469,54 @@ markets:
   - venue: backpack
     venue_symbol: MU.US_USDC_PERP
     canonical_symbol: MU
+    enabled: true
+  - venue: backpack
+    venue_symbol: XRP_USDC_PERP
+    canonical_symbol: XRP
+    enabled: true
+  - venue: backpack
+    venue_symbol: HYPE_USDC_PERP
+    canonical_symbol: HYPE
+    enabled: true
+  - venue: backpack
+    venue_symbol: SUI_USDC_PERP
+    canonical_symbol: SUI
+    enabled: true
+  - venue: backpack
+    venue_symbol: LINK_USDC_PERP
+    canonical_symbol: LINK
+    enabled: true
+  - venue: backpack
+    venue_symbol: DOGE_USDC_PERP
+    canonical_symbol: DOGE
+    enabled: true
+  - venue: backpack
+    venue_symbol: AAVE_USDC_PERP
+    canonical_symbol: AAVE
+    enabled: true
+  - venue: backpack
+    venue_symbol: UNI_USDC_PERP
+    canonical_symbol: UNI
+    enabled: true
+  - venue: backpack
+    venue_symbol: AMD.US_USDC_PERP
+    canonical_symbol: AMD
+    enabled: true
+  - venue: backpack
+    venue_symbol: AMZN.US_USDC_PERP
+    canonical_symbol: AMZN
+    enabled: true
+  - venue: backpack
+    venue_symbol: CRCL.US_USDC_PERP
+    canonical_symbol: CRCL
+    enabled: true
+  - venue: backpack
+    venue_symbol: SPY.US_USDC_PERP
+    canonical_symbol: SPY
+    enabled: true
+  - venue: backpack
+    venue_symbol: QQQ.US_USDC_PERP
+    canonical_symbol: QQQ
     enabled: true
 
 monitors:
