@@ -179,10 +179,38 @@ The hourly task uses the existing `+60` second grace rule:
 - funding `effective_time` continues to come from the venue response;
 - slow hourly work cannot block or move the 10-second market clock.
 
-Hourly collection errors are isolated per collector and reported through the
-existing collector error path. A slow hourly call may take longer than one
-market interval; it must not create overlapping market work or backfill market
-slots.
+Each due UTC hour is handled by one hourly coordinator cycle. The coordinator
+gathers all configured venue hourly results, isolates and reports individual
+venue errors, merges the successful results into one `CollectorBatch`, applies
+funding/hourly context to `RadarState` exactly once, and appends that same
+merged batch to storage exactly once. Venue results must not apply state or
+append storage independently as they finish; completion order must not allow
+one venue to overwrite another venue's context.
+
+A slow hourly call may take longer than one market interval; it must not create
+overlapping market work or backfill market slots. The hourly coordinator itself
+does not start a second hourly cycle while the current cycle is still running.
+
+Shutdown ordering is explicit:
+
+1. stop the market scheduling loop so no new market sample can start;
+2. await `MarketDataPipeline.stop()`, which cancels and awaits all ingestion
+   and hourly coordinator tasks and closes their WebSockets;
+3. perform the final Parquet flush;
+4. stop/cancel and await the alert worker;
+5. close the SQLite runtime store.
+
+`pipeline.stop()` is the barrier that guarantees no background task can append
+to storage after the final flush begins. A final flush must not begin until
+that barrier has completed.
+
+The `telegram-smoke` command is a compatibility path for the cache-only
+sampler. It must explicitly start the pipeline, wait for the requested symbol
+to have the required ready/fresh executable feeds from at least two distinct
+venues with a bounded timeout, call `collect_once()` only after that wait, and
+then stop the pipeline in a `finally` path. The bounded readiness wait may
+poll in-process state, but `collect_once()` itself must never regain network
+I/O. Smoke startup and cleanup must work both on success and on timeout/error.
 
 Shutdown cancels the hourly task and all collector tasks, awaits them, closes
 WebSockets, and leaves no orphan task. Startup creates no synthetic snapshot.
@@ -207,9 +235,13 @@ order-book state:
   `order_book/<market_id>`.
 
 The current initial snapshot plus nonce-checked delta semantics remain in use.
-Zero-size updates delete levels, bids remain descending, and asks remain
-ascending. A reconnect clears all books, resubscribes all configured market
-IDs, and stays not-ready until new valid snapshots and updates are received.
+A valid full `subscribed/order_book` snapshot is sufficient to make that market
+ready immediately; a subsequent delta is not required before sampling. The
+snapshot nonce becomes the continuity baseline for later updates. Subsequent
+updates must still have valid contiguous nonce ranges. Zero-size updates delete
+levels, bids remain descending, and asks remain ascending. A reconnect clears
+all books, resubscribes all configured market IDs, and stays not-ready until a
+new valid full snapshot is received.
 
 `orderBookDetails` is used at startup to discover market IDs and in a low-
 frequency metadata refresh task for mark/index/OI/volume. It is removed from
@@ -282,8 +314,10 @@ never cross-populated.
 
 Arcus remains REST-only because no documented public WebSocket contract has
 been approved. A background refresh task performs the existing markets and L2
-requests, without overlap within that task, and records the latest complete
-book plus its actual observation time.
+requests without overlapping refresh cycles and records the latest complete
+book plus its actual observation time. "No overlap" applies to refresh cycles;
+requests within one refresh may remain concurrent or bounded-concurrent as
+appropriate, so the 27 configured markets do not need to be serialized.
 
 The 10-second sampler reads Arcus cache state only. A slow or failed Arcus
 refresh can make individual symbols stale or absent, but it cannot delay the
