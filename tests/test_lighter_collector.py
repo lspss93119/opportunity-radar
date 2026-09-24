@@ -212,6 +212,23 @@ def ws_snapshot(symbol: str, market_id: int, nonce: int = 1) -> dict:
     }
 
 
+def ws_zero_delete_all_asks(market_id: int, *, begin_nonce: int = 1, nonce: int = 2):
+    return {
+        "type": "update/order_book",
+        "channel": f"order_book:{market_id}",
+        "order_book": {
+            "code": 0,
+            "asks": [
+                {"price": "100", "size": "0"},
+                {"price": "101", "size": "0"},
+            ],
+            "bids": [],
+            "begin_nonce": begin_nonce,
+            "nonce": nonce,
+        },
+    }
+
+
 def fixture_websocket(*, include_symbols: tuple[str, ...] = ("btc", "eth", "sol")):
     market_ids = {"btc": 1, "eth": 0, "sol": 2}
     websocket = FixtureWebSocket(
@@ -439,6 +456,64 @@ async def test_lighter_metadata_failure_preserves_ready_cache_book(
 
     assert len(batch.market_snapshots) == 1
     assert batch.market_snapshots[0].observed_at == OBSERVED_AT
+
+
+@pytest.mark.parametrize(
+    ("venue", "base_url"),
+    [
+        ("lighter", LighterCollector.BASE_URL),
+        ("lighter_robinhood", ROBINHOOD_BASE_URL),
+    ],
+)
+@pytest.mark.asyncio
+async def test_lighter_invalid_zero_delete_invalidates_previous_cache_view(
+    venue: str, base_url: str
+):
+    transport = FixtureTransport(base_url)
+    websocket, websocket_connect = fixture_websocket(include_symbols=("btc",))
+    latest = LatestMarketData()
+    market = MarketConfig(venue=venue, venue_symbol="BTC", canonical_symbol="BTC")
+    collector = LighterCollector(
+        [market],
+        venue=venue,
+        base_url=base_url,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        websocket_connect=websocket_connect,
+        latest_market_data=latest,
+    )
+
+    await collector.start()
+    try:
+        await wait_for_books(collector, (1,))
+        before = latest.build_batch(
+            [market],
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+        assert len(before.market_snapshots) == 1
+
+        websocket.push(ws_zero_delete_all_asks(1))
+        after = None
+        for _ in range(100):
+            after = latest.build_batch(
+                [market],
+                sample_time=SAMPLE_TIME,
+                now=OBSERVED_AT,
+                stale_after_seconds=30,
+            )
+            if after.market_snapshots == ():
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("invalid publication left a ready cache view")
+    finally:
+        await collector.stop()
+
+    assert after is not None
+    assert after.market_snapshots == ()
+    assert latest._views[(venue, "BTC")].ready is False
 
 
 @pytest.mark.parametrize(

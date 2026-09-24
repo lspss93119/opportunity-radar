@@ -316,10 +316,17 @@ class LighterOrderBookFeed:
         if state is None:
             raise ValueError(f"websocket market {market_id} is not configured")
         order_book = message.get("order_book")
-        if message_type == "subscribed/order_book":
-            state.apply_snapshot(order_book, received_at)
-        else:
-            state.apply_delta(order_book, received_at)
+        try:
+            if message_type == "subscribed/order_book":
+                state.apply_snapshot(order_book, received_at)
+            else:
+                state.apply_delta(order_book, received_at)
+        except Exception as error:  # noqa: BLE001
+            state.clear()
+            if self._on_invalidate is not None:
+                self._on_invalidate(market_id)
+            report_collector_error(self._error_handler, self._venue, error)
+            return
         snapshot = state.snapshot()
         if snapshot is None:
             raise ValueError("valid websocket order_book did not produce a snapshot")
@@ -603,6 +610,7 @@ class LighterCollector:
                 )
             except Exception as error:  # noqa: BLE001
                 report_collector_error(self._error_handler, self.venue, error)
+                self._invalidate_book(market_id)
 
     def _invalidate_book(self, market_id: int) -> None:
         if self._latest_market_data is None:

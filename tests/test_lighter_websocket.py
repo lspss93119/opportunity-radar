@@ -13,6 +13,7 @@ from radar.collectors.lighter import (
     LighterCollector,
 )
 from radar.config import MarketConfig
+from radar.market_data import LatestMarketData
 
 OBSERVED_AT = datetime(2026, 9, 24, 10, 0, 1, 123000, tzinfo=UTC)
 
@@ -179,39 +180,157 @@ async def test_lighter_order_book_feed_isolates_markets_and_resubscribes_after_r
         return connections.pop(0)
 
     invalidated: list[int] = []
+    latest = LatestMarketData()
+    symbols = {1: "BTC", 2: "ETH"}
+
+    def on_book(market_id: int, snapshot: LighterOrderBookSnapshot) -> None:
+        latest.update_book(
+            venue="lighter",
+            venue_symbol=symbols[market_id],
+            bids=snapshot.bids,
+            asks=snapshot.asks,
+            observed_at=snapshot.observed_at,
+        )
+
+    def on_invalidate(market_id: int) -> None:
+        invalidated.append(market_id)
+        latest.invalidate(venue="lighter", venue_symbol=symbols[market_id])
 
     feed = LighterOrderBookFeed(
         "wss://example.test/stream",
         (1, 2),
         connect=connect,
-        on_invalidate=invalidated.append,
+        clock=lambda: OBSERVED_AT,
+        on_book=on_book,
+        on_invalidate=on_invalidate,
         reconnect_delay_seconds=0,
     )
     await feed.start()
-    first_market = await wait_for_book(feed, 1)
-    second_market = await wait_for_book(feed, 2)
-    assert first_market.bids[0].price == 99.0
-    assert second_market.bids[0].price == 99.0
-    assert {message["channel"] for message in first.sent} == {
-        "order_book/1",
-        "order_book/2",
-    }
-    invalidations_before_disconnect = len(invalidated)
+    try:
+        first_market = await wait_for_book(feed, 1)
+        second_market = await wait_for_book(feed, 2)
+        assert first_market.bids[0].price == 99.0
+        assert second_market.bids[0].price == 99.0
+        assert {message["channel"] for message in first.sent} == {
+            "order_book/1",
+            "order_book/2",
+        }
+        assert len(
+            latest.build_batch(
+                [
+                    MarketConfig(
+                        venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+                    ),
+                    MarketConfig(
+                        venue="lighter", venue_symbol="ETH", canonical_symbol="ETH"
+                    ),
+                ],
+                sample_time=OBSERVED_AT,
+                now=OBSERVED_AT,
+                stale_after_seconds=30,
+            ).market_snapshots
+        ) == 2
+        invalidations_before_disconnect = len(invalidated)
 
-    await first.close()
-    await wait_until(lambda: len(invalidated) > invalidations_before_disconnect)
-    assert feed.snapshot(1) is None
-    assert feed.snapshot(2) is None
-    assert set(invalidated[invalidations_before_disconnect:]) == {1, 2}
+        await first.close()
+        await wait_until(lambda: len(invalidated) > invalidations_before_disconnect)
+        assert feed.snapshot(1) is None
+        assert feed.snapshot(2) is None
+        assert set(invalidated[invalidations_before_disconnect:]) == {1, 2}
+        assert latest.build_batch(
+            [
+                MarketConfig(
+                    venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+                ),
+                MarketConfig(
+                    venue="lighter", venue_symbol="ETH", canonical_symbol="ETH"
+                ),
+            ],
+            sample_time=OBSERVED_AT,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        ).market_snapshots == ()
 
-    second.push(snapshot_message(1, nonce=30))
-    await wait_for_book(feed, 1)
-    assert {message["channel"] for message in second.sent} == {
-        "order_book/1",
-        "order_book/2",
-    }
-    assert feed.reconnect_count >= 1
-    await feed.stop()
+        second.push(snapshot_message(1, nonce=30))
+        await wait_for_book(feed, 1)
+        assert {message["channel"] for message in second.sent} == {
+            "order_book/1",
+            "order_book/2",
+        }
+        assert feed.reconnect_count >= 1
+    finally:
+        await feed.stop()
+
+
+@pytest.mark.asyncio
+async def test_lighter_order_book_feed_invalidates_only_market_with_nonce_gap():
+    first = FakeWebSocket(
+        [
+            {"type": "connected"},
+            snapshot_message(1),
+            snapshot_message(2, nonce=20),
+        ]
+    )
+    second = FakeWebSocket([{"type": "connected"}])
+    connections = [first, second]
+
+    def connect(_url: str):
+        return connections.pop(0)
+
+    invalidated: list[int] = []
+    latest = LatestMarketData()
+    symbols = {1: "BTC", 2: "ETH"}
+
+    def on_book(market_id: int, snapshot: LighterOrderBookSnapshot) -> None:
+        latest.update_book(
+            venue="lighter",
+            venue_symbol=symbols[market_id],
+            bids=snapshot.bids,
+            asks=snapshot.asks,
+            observed_at=snapshot.observed_at,
+        )
+
+    def on_invalidate(market_id: int) -> None:
+        invalidated.append(market_id)
+        latest.invalidate(venue="lighter", venue_symbol=symbols[market_id])
+
+    feed = LighterOrderBookFeed(
+        "wss://example.test/stream",
+        (1, 2),
+        connect=connect,
+        clock=lambda: OBSERVED_AT,
+        on_book=on_book,
+        on_invalidate=on_invalidate,
+        reconnect_delay_seconds=1.0,
+    )
+    markets = [
+        MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),
+        MarketConfig(venue="lighter", venue_symbol="ETH", canonical_symbol="ETH"),
+    ]
+    await feed.start()
+    try:
+        await wait_for_book(feed, 1)
+        await wait_for_book(feed, 2)
+        invalidations_before_gap = len(invalidated)
+
+        first.push(update_message(1, begin_nonce=9, nonce=11))
+        await wait_until(lambda: len(invalidated) > invalidations_before_gap)
+
+        assert invalidated[invalidations_before_gap:] == [1]
+        assert feed.snapshot(1) is None
+        assert feed.snapshot(2) is not None
+        assert feed.reconnect_count == 0
+        assert [
+            snapshot.canonical_symbol
+            for snapshot in latest.build_batch(
+                markets,
+                sample_time=OBSERVED_AT,
+                now=OBSERVED_AT,
+                stale_after_seconds=30,
+            ).market_snapshots
+        ] == ["ETH"]
+    finally:
+        await feed.stop()
 
 
 @pytest.mark.asyncio
