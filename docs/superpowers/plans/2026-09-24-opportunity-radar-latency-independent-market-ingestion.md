@@ -259,7 +259,7 @@ Expected: existing application-cycle tests pass after their fixtures seed the ca
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add src/radar/state.py src/radar/pipeline.py tests/test_pipeline.py tests/test_app.py
+git add src/radar/state.py src/radar/pipeline.py src/radar/storage/parquet.py tests/test_pipeline.py tests/test_storage_parquet.py tests/test_app.py
 git commit -m "Decouple sampling from hourly collection"
 ```
 
