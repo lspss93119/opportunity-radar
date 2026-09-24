@@ -7,11 +7,13 @@ import pytest
 
 from radar.collectors.base import CollectorBatch
 from radar.config import MarketConfig, RadarConfig
+from radar.market_data import LatestMarketData
 from radar.models import MarketSnapshot
 from radar.monitors.base import AlertRequest
 from radar.pipeline import MarketDataPipeline
 from radar.state import RadarState
 from radar.storage.parquet import ParquetStorage
+from radar.vwap import BookLevel
 
 NOW = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
 
@@ -177,10 +179,25 @@ async def test_application_cycle_updates_state_appends_storage_and_runs_monitor(
     from radar.app import RadarApplication
 
     state = RadarState()
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="BTC",
+        bids=(BookLevel(price=99.0, base_size=200.0),),
+        asks=(BookLevel(price=100.0, base_size=200.0),),
+        observed_at=NOW,
+    )
     storage = ParquetStorage(tmp_path / "data")
     pipeline = MarketDataPipeline(
-        [FakeCollector()],
+        [],
         state,
+        markets=(
+            MarketConfig(
+                venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+            ),
+        ),
+        latest_market_data=latest,
+        clock=lambda: NOW,
         storage=storage,
     )
     queue: asyncio.Queue[AlertRequest] = asyncio.Queue()

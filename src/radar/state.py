@@ -12,30 +12,37 @@ class RadarState:
         self._funding: dict[tuple[str, str, str], FundingSnapshot] = {}
         self._hourly_context: dict[tuple[str, str, str], HourlyContext] = {}
 
-    def apply(self, batch: CollectorBatch, *, replace_context: bool = False) -> None:
+    def apply_market_batch(self, batch: CollectorBatch) -> None:
         # A collection round is authoritative for executable market data. Missing
         # venues/symbols are deliberately absent instead of being carried forward.
         self._markets = {
             (snapshot.venue, snapshot.venue_symbol): snapshot
             for snapshot in batch.market_snapshots
         }
+
+    def apply_context_batch(self, batch: CollectorBatch) -> None:
+        self._funding = {
+            (
+                snapshot.venue,
+                snapshot.venue_symbol,
+                snapshot.canonical_symbol,
+            ): snapshot
+            for snapshot in batch.funding_snapshots
+        }
+        self._hourly_context = {
+            (
+                context.venue,
+                context.venue_symbol,
+                context.canonical_symbol,
+            ): context
+            for context in batch.hourly_contexts
+        }
+
+    def apply(self, batch: CollectorBatch, *, replace_context: bool = False) -> None:
+        """Apply a legacy combined batch using the separated state paths."""
+        self.apply_market_batch(batch)
         if replace_context:
-            self._funding = {
-                (
-                    snapshot.venue,
-                    snapshot.venue_symbol,
-                    snapshot.canonical_symbol,
-                ): snapshot
-                for snapshot in batch.funding_snapshots
-            }
-            self._hourly_context = {
-                (
-                    context.venue,
-                    context.venue_symbol,
-                    context.canonical_symbol,
-                ): context
-                for context in batch.hourly_contexts
-            }
+            self.apply_context_batch(batch)
 
     @property
     def markets(self) -> tuple[MarketSnapshot, ...]:

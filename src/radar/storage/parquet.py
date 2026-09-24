@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -85,33 +86,36 @@ class ParquetStorage:
         self.root = Path(root)
         self.retention_days = retention_days
         self._pending: dict[PendingKey, list[dict[str, object]]] = {}
+        self._pending_lock = threading.Lock()
 
     @property
     def pending_count(self) -> int:
-        return sum(len(rows) for rows in self._pending.values())
+        with self._pending_lock:
+            return sum(len(rows) for rows in self._pending.values())
 
     def append(
         self,
         value: CollectorBatch | MarketSnapshot | FundingSnapshot | HourlyContext,
     ) -> None:
-        if isinstance(value, CollectorBatch):
-            for market_snapshot in value.market_snapshots:
-                self._append_record("market", market_snapshot)
-            for funding_snapshot in value.funding_snapshots:
-                self._append_record("funding", funding_snapshot)
-            for context in value.hourly_contexts:
-                self._append_record("hourly_context", context)
-            return
-        if isinstance(value, MarketSnapshot):
-            self._append_record("market", value)
-            return
-        if isinstance(value, FundingSnapshot):
-            self._append_record("funding", value)
-            return
-        if isinstance(value, HourlyContext):
-            self._append_record("hourly_context", value)
-            return
-        raise TypeError("value must be a CollectorBatch or normalized snapshot")
+        with self._pending_lock:
+            if isinstance(value, CollectorBatch):
+                for market_snapshot in value.market_snapshots:
+                    self._append_record("market", market_snapshot)
+                for funding_snapshot in value.funding_snapshots:
+                    self._append_record("funding", funding_snapshot)
+                for context in value.hourly_contexts:
+                    self._append_record("hourly_context", context)
+                return
+            if isinstance(value, MarketSnapshot):
+                self._append_record("market", value)
+                return
+            if isinstance(value, FundingSnapshot):
+                self._append_record("funding", value)
+                return
+            if isinstance(value, HourlyContext):
+                self._append_record("hourly_context", value)
+                return
+            raise TypeError("value must be a CollectorBatch or normalized snapshot")
 
     def _append_record(self, dataset: str, record: NormalizedRecord) -> None:
         if dataset == "funding":
@@ -132,11 +136,16 @@ class ParquetStorage:
             datetime.now(UTC) if now is None else now,
             "now",
         )
-        if not self._pending:
+        with self._pending_lock:
+            if not self._pending:
+                pending = None
+            else:
+                pending = self._pending
+                self._pending = {}
+        if pending is None:
             self.prune(now=current_time)
             return 0
 
-        pending = self._pending
         staged: list[tuple[Path, Path]] = []
         replaced: list[Path] = []
         try:
@@ -158,9 +167,16 @@ class ParquetStorage:
                 temp_path.unlink(missing_ok=True)
             for final_path in replaced:
                 final_path.unlink(missing_ok=True)
+            with self._pending_lock:
+                restored = {
+                    key: list(rows)
+                    for key, rows in pending.items()
+                }
+                for key, rows in self._pending.items():
+                    restored.setdefault(key, []).extend(rows)
+                self._pending = restored
             raise
 
-        self._pending.clear()
         self.prune(now=current_time)
         return len(staged)
 

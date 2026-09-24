@@ -1,4 +1,5 @@
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pyarrow as pa
@@ -250,6 +251,55 @@ def test_failed_write_leaves_existing_parquet_untouched(tmp_path, monkeypatch):
     assert store.pending_count == 1
     assert not tuple((root / "market").glob("date=*/*.tmp"))
     assert len(query_dataset(root, "market", "*")) == 1
+
+
+def test_append_during_flush_remains_pending_for_the_next_flush(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    first_time = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    second_time = first_time + timedelta(seconds=10)
+    store = ParquetStorage(root)
+    store.append(make_market(first_time, "BTC"))
+
+    write_started = threading.Event()
+    release_write = threading.Event()
+    original_write = pq.write_table
+
+    def blocked_write(*args, **kwargs):
+        write_started.set()
+        assert release_write.wait(timeout=1.0)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr("radar.storage.parquet.pq.write_table", blocked_write)
+    flush_error: list[BaseException] = []
+
+    def flush_in_worker() -> None:
+        try:
+            store.flush(now=first_time)
+        except BaseException as error:  # pragma: no cover - diagnostic only
+            flush_error.append(error)
+
+    worker = threading.Thread(target=flush_in_worker)
+    worker.start()
+    assert write_started.wait(timeout=1.0)
+
+    store.append(make_market(second_time, "ETH"))
+    assert store.pending_count == 1
+    release_write.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert flush_error == []
+    assert store.pending_count == 1
+    assert {row[0] for row in query_dataset(root, "market", "venue_symbol")} == {
+        "BTC"
+    }
+
+    assert store.flush(now=second_time) == 1
+    assert store.pending_count == 0
+    assert {row[0] for row in query_dataset(root, "market", "venue_symbol")} == {
+        "BTC",
+        "ETH",
+    }
 
 
 def test_partial_file_commit_rolls_back_without_duplicate_retry_rows(tmp_path, monkeypatch):
