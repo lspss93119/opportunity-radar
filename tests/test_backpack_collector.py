@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from radar.collectors.backpack import (
     parse_backpack_tickers,
 )
 from radar.config import MarketConfig
+from radar.market_data import LatestMarketData
 
 UTC = timezone.utc
 FIXTURES = Path(__file__).parent / "fixtures" / "backpack"
@@ -141,19 +143,257 @@ class FixtureTransport:
         raise AssertionError(f"unexpected request: {url} {params}")
 
 
+class FixtureWebSocket:
+    def __init__(self, messages: list[dict]) -> None:
+        self.sent: list[dict] = []
+        self.closed = False
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        for message in messages:
+            self.push(message)
+
+    def push(self, message: dict) -> None:
+        self._queue.put_nowait(json.dumps(message))
+
+    async def send(self, message: str) -> None:
+        self.sent.append(json.loads(message))
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._queue.put_nowait(None)
+
+    async def __aenter__(self) -> "FixtureWebSocket":
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        await self.close()
+
+    def __aiter__(self) -> "FixtureWebSocket":
+        return self
+
+    async def __anext__(self) -> str:
+        message = await self._queue.get()
+        if message is None:
+            raise StopAsyncIteration
+        return message
+
+
+def depth_update(
+    symbol: str,
+    *,
+    first_update_id: int,
+    final_update_id: int,
+    bids: tuple[tuple[float, float], ...] = (),
+    asks: tuple[tuple[float, float], ...] = (),
+) -> dict:
+    return {
+        "stream": f"depth.{symbol}",
+        "data": {
+            "e": "depth",
+            "s": symbol,
+            "U": first_update_id,
+            "u": final_update_id,
+            "b": [[str(price), str(size)] for price, size in bids],
+            "a": [[str(price), str(size)] for price, size in asks],
+        },
+    }
+
+
+async def wait_until(predicate) -> None:
+    for _ in range(100):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("predicate was not satisfied")
+
+
+def collector_websocket() -> FixtureWebSocket:
+    return FixtureWebSocket(
+        [
+            {"id": 1, "result": None},
+            depth_update(
+                "SNDK.US_USDC_PERP",
+                first_update_id=12345,
+                final_update_id=12346,
+                bids=((99.0, 20.0),),
+                asks=((100.0, 20.0), (101.0, 100.0)),
+            ),
+            depth_update(
+                "NVDA.US_USDC_PERP",
+                first_update_id=12346,
+                final_update_id=12347,
+                bids=((199.0, 20.0),),
+                asks=((200.0, 20.0), (201.0, 100.0)),
+            ),
+        ]
+    )
+
+
 @pytest.mark.asyncio
-async def test_backpack_collector_normalizes_market_funding_context_and_vwap():
+async def test_backpack_collector_uses_ws_books_and_keeps_depth_out_of_sampling():
     transport = FixtureTransport()
+    websocket = collector_websocket()
+    latest = LatestMarketData()
     collector = BackpackCollector(
         configured_markets(),
         request_json=transport,
         clock=lambda: OBSERVED_AT,
+        websocket_connect=lambda _url: websocket,
+        latest_market_data=latest,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME,
-        include_hourly_context=True,
+    await collector.start()
+    try:
+        await wait_until(
+            lambda: all(
+                collector._order_book_feed.snapshot(symbol) is not None
+                for symbol in ("SNDK.US_USDC_PERP", "NVDA.US_USDC_PERP")
+            )
+        )
+        depth_calls_after_start = sum(
+            url == BackpackCollector.DEPTH_URL for url, _, _ in transport.calls
+        )
+        market_batch = latest.build_batch(
+            configured_markets(),
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+        hourly_batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+        compatibility_batch = await collector.collect(
+            sample_time=SAMPLE_TIME,
+            include_hourly_context=False,
+        )
+    finally:
+        await collector.stop()
+
+    assert depth_calls_after_start == 2
+    assert sum(url == BackpackCollector.DEPTH_URL for url, _, _ in transport.calls) == 2
+    assert [snapshot.canonical_symbol for snapshot in market_batch.market_snapshots] == [
+        "SNDK",
+        "NVDA",
+    ]
+    assert [snapshot.canonical_symbol for snapshot in compatibility_batch.market_snapshots] == [
+        "SNDK",
+        "NVDA",
+    ]
+    assert market_batch.market_snapshots[0].buy_10k_vwap is not None
+    assert market_batch.market_snapshots[0].sell_10k_vwap is not None
+    assert len(hourly_batch.funding_snapshots) == 1
+    assert [context.canonical_symbol for context in hourly_batch.hourly_contexts] == [
+        "SNDK",
+        "NVDA",
+    ]
+    assert websocket.sent == [
+        {
+            "method": "SUBSCRIBE",
+            "params": ["depth.SNDK.US_USDC_PERP", "depth.NVDA.US_USDC_PERP"],
+        }
+    ]
+
+
+class MetadataFailureTransport(FixtureTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_metadata = False
+
+    async def __call__(self, url: str, *, method: str, json_body=None, params=None):
+        if self.fail_metadata and url in {
+            BackpackCollector.MARKETS_URL,
+            BackpackCollector.MARK_PRICES_URL,
+            BackpackCollector.OPEN_INTEREST_URL,
+            BackpackCollector.TICKERS_URL,
+        }:
+            raise OSError("Backpack metadata refresh unavailable")
+        return await super().__call__(
+            url,
+            method=method,
+            json_body=json_body,
+            params=params,
+        )
+
+
+@pytest.mark.asyncio
+async def test_backpack_metadata_failure_preserves_ready_cache_book():
+    transport = MetadataFailureTransport()
+    websocket = FixtureWebSocket(
+        [
+            {"id": 1, "result": None},
+            depth_update(
+                "BTC_USDC_PERP",
+                first_update_id=12346,
+                final_update_id=12347,
+                bids=((199.0, 20.0),),
+                asks=((200.0, 20.0), (201.0, 100.0)),
+            ),
+        ]
     )
+    market = MarketConfig(
+        venue="backpack", venue_symbol="BTC_USDC_PERP", canonical_symbol="BTC"
+    )
+    latest = LatestMarketData()
+    collector = BackpackCollector(
+        [market],
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        websocket_connect=lambda _url: websocket,
+        latest_market_data=latest,
+    )
+
+    await collector.start()
+    try:
+        await wait_until(
+            lambda: collector._order_book_feed.snapshot(market.venue_symbol) is not None
+        )
+        before = latest.build_batch(
+            [market],
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+        transport.fail_metadata = True
+        assert await collector._refresh_metadata_once() is False
+        after = latest.build_batch(
+            [market],
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+    finally:
+        await collector.stop()
+
+    assert len(before.market_snapshots) == 1
+    assert len(after.market_snapshots) == 1
+    assert after.market_snapshots[0].observed_at == OBSERVED_AT
+    assert after.market_snapshots[0].mark_price == before.market_snapshots[0].mark_price
+    assert after.market_snapshots[0].index_price == before.market_snapshots[0].index_price
+
+
+@pytest.mark.asyncio
+async def test_backpack_collector_normalizes_market_funding_context_and_vwap():
+    transport = FixtureTransport()
+    websocket = collector_websocket()
+    collector = BackpackCollector(
+        configured_markets(),
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        websocket_connect=lambda _url: websocket,
+    )
+
+    await collector.start()
+    try:
+        await wait_until(
+            lambda: all(
+                collector._order_book_feed.snapshot(symbol) is not None
+                for symbol in ("SNDK.US_USDC_PERP", "NVDA.US_USDC_PERP")
+            )
+        )
+        batch = await collector.collect(
+            sample_time=SAMPLE_TIME,
+            include_hourly_context=True,
+        )
+    finally:
+        await collector.stop()
 
     assert [snapshot.canonical_symbol for snapshot in batch.market_snapshots] == [
         "SNDK",
@@ -202,16 +442,36 @@ async def test_backpack_collector_normalizes_market_funding_context_and_vwap():
 
 @pytest.mark.asyncio
 async def test_backpack_collector_collects_configured_crypto_perp():
+    websocket = FixtureWebSocket(
+        [
+            {"id": 1, "result": None},
+            depth_update(
+                "BTC_USDC_PERP",
+                first_update_id=12346,
+                final_update_id=12347,
+                bids=((199.0, 20.0),),
+                asks=((200.0, 20.0), (201.0, 100.0)),
+            ),
+        ]
+    )
     collector = BackpackCollector(
         configured_crypto_market(),
         request_json=FixtureTransport(),
         clock=lambda: OBSERVED_AT,
+        websocket_connect=lambda _url: websocket,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME,
-        include_hourly_context=False,
-    )
+    await collector.start()
+    try:
+        await wait_until(
+            lambda: collector._order_book_feed.snapshot("BTC_USDC_PERP") is not None
+        )
+        batch = await collector.collect(
+            sample_time=SAMPLE_TIME,
+            include_hourly_context=False,
+        )
+    finally:
+        await collector.stop()
 
     assert len(batch.market_snapshots) == 1
     assert batch.market_snapshots[0].venue_symbol == "BTC_USDC_PERP"
@@ -221,6 +481,7 @@ async def test_backpack_collector_collects_configured_crypto_perp():
 @pytest.mark.asyncio
 async def test_backpack_collector_omits_only_symbol_when_depth_fails():
     transport = FixtureTransport()
+    websocket = collector_websocket()
     failures: list[tuple[str, Exception]] = []
 
     async def failing_transport(url: str, *, method: str, json_body=None, params=None):
@@ -231,12 +492,20 @@ async def test_backpack_collector_omits_only_symbol_when_depth_fails():
     collector = BackpackCollector(
         configured_markets(),
         request_json=failing_transport,
+        websocket_connect=lambda _url: websocket,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME,
-        include_hourly_context=False,
-    )
+    await collector.start()
+    try:
+        await wait_until(
+            lambda: collector._order_book_feed.snapshot("SNDK.US_USDC_PERP") is not None
+        )
+        batch = await collector.collect(
+            sample_time=SAMPLE_TIME,
+            include_hourly_context=False,
+        )
+    finally:
+        await collector.stop()
 
     assert [snapshot.canonical_symbol for snapshot in batch.market_snapshots] == ["SNDK"]
     assert [(venue, str(error)) for venue, error in failures] == [
@@ -254,29 +523,45 @@ async def test_backpack_collector_returns_empty_batch_when_markets_request_fails
     collector = BackpackCollector(
         configured_markets(),
         request_json=failing_transport,
+        websocket_connect=lambda _url: FixtureWebSocket(),
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME,
-        include_hourly_context=True,
-    )
+    await collector.start()
+    try:
+        batch = await collector.collect(
+            sample_time=SAMPLE_TIME,
+            include_hourly_context=True,
+        )
+    finally:
+        await collector.stop()
 
     assert batch.market_snapshots == ()
     assert batch.funding_snapshots == ()
     assert batch.hourly_contexts == ()
-    assert [(venue, str(error)) for venue, error in failures] == [
-        ("backpack", "Backpack metadata unavailable")
+    assert ("backpack", "Backpack metadata unavailable") in [
+        (venue, str(error)) for venue, error in failures
     ]
 
 
 @pytest.mark.asyncio
 async def test_backpack_collector_marks_unfilled_vwap_targets_unavailable():
     transport = FixtureTransport()
+    websocket = FixtureWebSocket(
+        [
+            {"id": 1, "result": None},
+            depth_update(
+                "SNDK.US_USDC_PERP",
+                first_update_id=12345,
+                final_update_id=12346,
+            ),
+        ]
+    )
 
     async def sparse_transport(url: str, *, method: str, json_body=None, params=None):
         if url == BackpackCollector.DEPTH_URL:
             return {
+                "lastUpdateId": "12345",
                 "bids": [["99", "0.1"]],
                 "asks": [["100", "0.1"]],
             }
@@ -286,12 +571,20 @@ async def test_backpack_collector_marks_unfilled_vwap_targets_unavailable():
         configured_markets()[:1],
         request_json=sparse_transport,
         clock=lambda: OBSERVED_AT,
+        websocket_connect=lambda _url: websocket,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME,
-        include_hourly_context=False,
-    )
+    await collector.start()
+    try:
+        await wait_until(
+            lambda: collector._order_book_feed.snapshot("SNDK.US_USDC_PERP") is not None
+        )
+        batch = await collector.collect(
+            sample_time=SAMPLE_TIME,
+            include_hourly_context=False,
+        )
+    finally:
+        await collector.stop()
 
     snapshot = batch.market_snapshots[0]
     assert snapshot.buy_1k_vwap is None
