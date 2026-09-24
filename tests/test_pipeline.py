@@ -302,6 +302,33 @@ async def test_collect_once_reads_latest_cache_without_invoking_collectors():
 
 
 @pytest.mark.asyncio
+async def test_arcus_stale_cache_is_omitted_by_cache_only_sampler():
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="arcus",
+        venue_symbol="SNDK-USD",
+        bids=(BookLevel(price=1876.19, base_size=100.0),),
+        asks=(BookLevel(price=1876.2, base_size=100.0),),
+        observed_at=datetime(2026, 9, 15, 9, 59, 39, tzinfo=UTC),
+    )
+    market = MarketConfig(
+        venue="arcus", venue_symbol="SNDK-USD", canonical_symbol="SNDK"
+    )
+    pipeline = MarketDataPipeline(
+        [],
+        RadarState(),
+        markets=[market],
+        latest_market_data=latest,
+    )
+
+    batch = await pipeline.collect_once(
+        now=datetime(2026, 9, 15, 10, 0, 10, tzinfo=UTC)
+    )
+
+    assert batch.market_snapshots == ()
+
+
+@pytest.mark.asyncio
 async def test_wait_for_market_feeds_polls_only_latest_cache():
     latest = LatestMarketData()
     pipeline = MarketDataPipeline(

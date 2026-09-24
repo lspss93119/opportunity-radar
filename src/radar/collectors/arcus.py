@@ -15,6 +15,7 @@ from radar.collectors.base import (
 )
 from radar.collectors.http import request_json as default_request_json
 from radar.config import MarketConfig
+from radar.market_data import LatestMarketData
 from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
@@ -153,6 +154,7 @@ class ArcusCollector:
     MARKETS_URL = f"{BASE_URL}/markets"
     L2_ORDER_BOOK_URL = f"{BASE_URL}/l2OrderBook"
     FUNDING_RATES_URL = f"{BASE_URL}/fundingRates"
+    REFRESH_INTERVAL_SECONDS = 10.0
 
     def __init__(
         self,
@@ -161,11 +163,121 @@ class ArcusCollector:
         request_json=default_request_json,
         clock=lambda: datetime.now(UTC),
         error_handler: CollectorErrorHandler | None = None,
+        latest_market_data: LatestMarketData | None = None,
+        refresh_interval_seconds: float = REFRESH_INTERVAL_SECONDS,
     ) -> None:
+        if refresh_interval_seconds < 0:
+            raise ValueError("refresh_interval_seconds must be non-negative")
         self._markets = markets_for_venue(markets, self.venue)
         self._request_json = request_json
         self._clock = clock
         self._error_handler = error_handler
+        self._latest_market_data = latest_market_data
+        self._refresh_interval_seconds = refresh_interval_seconds
+        self._details: dict[str, ArcusMarketDetail] = {}
+        self._metadata_observed_at: datetime | None = None
+        self._refresh_lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task[None] | None = None
+        self._started = False
+
+    async def start(self) -> None:
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return
+        self._started = True
+        self._refresh_task = asyncio.create_task(
+            self._run_refresh(),
+            name=f"{self.venue}-market-refresh",
+        )
+
+    async def stop(self) -> None:
+        self._started = False
+        refresh_task = self._refresh_task
+        if refresh_task is not None:
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
+        self._refresh_task = None
+
+    async def refresh_once(self) -> None:
+        async with self._refresh_lock:
+            try:
+                markets_payload = await self._request_json(
+                    self.MARKETS_URL,
+                    method="GET",
+                )
+                details = parse_arcus_markets(markets_payload)
+                metadata_observed_at = self._clock()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                report_collector_error(self._error_handler, self.venue, error)
+                return
+
+            self._details = details
+            self._metadata_observed_at = metadata_observed_at
+            self._refresh_cache_metadata(details)
+            await asyncio.gather(
+                *(
+                    self._refresh_market(market, details)
+                    for market in self._markets
+                )
+            )
+
+    async def _run_refresh(self) -> None:
+        while self._started:
+            await self.refresh_once()
+            if not self._started:
+                return
+            await asyncio.sleep(self._refresh_interval_seconds)
+
+    def _refresh_cache_metadata(
+        self, details: dict[str, ArcusMarketDetail]
+    ) -> None:
+        if self._latest_market_data is None:
+            return
+        for market in self._markets:
+            detail = details.get(market.venue_symbol)
+            try:
+                if detail is None:
+                    self._latest_market_data.invalidate(
+                        venue=self.venue,
+                        venue_symbol=market.venue_symbol,
+                    )
+                    continue
+                self._latest_market_data.update_metadata(
+                    venue=self.venue,
+                    venue_symbol=market.venue_symbol,
+                    mark_price=detail.mark_price,
+                    index_price=detail.oracle_price,
+                )
+            except Exception as error:  # noqa: BLE001
+                report_collector_error(self._error_handler, self.venue, error)
+
+    async def _refresh_market(
+        self,
+        market: MarketConfig,
+        details: dict[str, ArcusMarketDetail],
+    ) -> None:
+        if market.venue_symbol not in details:
+            return
+        try:
+            payload = await self._request_json(
+                f"{self.L2_ORDER_BOOK_URL}/{market.venue_symbol}",
+                method="GET",
+            )
+            observed_at = self._clock()
+            bids, asks = parse_arcus_l2_order_book(payload)
+            if self._latest_market_data is not None:
+                self._latest_market_data.update_book(
+                    venue=self.venue,
+                    venue_symbol=market.venue_symbol,
+                    bids=bids,
+                    asks=asks,
+                    observed_at=observed_at,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            report_collector_error(self._error_handler, self.venue, error)
 
     async def collect(
         self, *, sample_time: datetime, include_hourly_context: bool
@@ -181,6 +293,10 @@ class ArcusCollector:
             report_collector_error(self._error_handler, self.venue, error)
             return CollectorBatch()
 
+        self._details = details
+        self._metadata_observed_at = metadata_observed_at
+        self._refresh_cache_metadata(details)
+
         market_snapshots = await asyncio.gather(
             *(
                 self._collect_market(market, details, sample_time)
@@ -193,38 +309,71 @@ class ArcusCollector:
             if market.venue_symbol in details
         )
 
-        funding_snapshots: tuple[FundingSnapshot, ...] = ()
-        hourly_contexts: tuple[HourlyContext, ...] = ()
-        if include_hourly_context:
-            funding_results = await asyncio.gather(
-                *(
-                    self._collect_funding(market, detail)
-                    for market, detail in configured_details
-                )
+        hourly_batch = (
+            await self._collect_hourly_from_details(
+                sample_time=sample_time,
+                configured_details=configured_details,
+                metadata_observed_at=metadata_observed_at,
             )
-            funding_snapshots = tuple(
-                funding for funding in funding_results if funding is not None
-            )
-            hourly_sample = sample_time.astimezone(UTC).replace(
-                minute=0, second=0, microsecond=0
-            )
-            hourly_contexts = tuple(
-                HourlyContext(
-                    sample_time=hourly_sample,
-                    observed_at=metadata_observed_at,
-                    venue=self.venue,
-                    venue_symbol=market.venue_symbol,
-                    canonical_symbol=market.canonical_symbol,
-                    open_interest=detail.open_interest,
-                    volume_24h=detail.volume_24h,
-                )
-                for market, detail in configured_details
-            )
+            if include_hourly_context
+            else CollectorBatch()
+        )
 
         return CollectorBatch(
             market_snapshots=tuple(
                 snapshot for snapshot in market_snapshots if snapshot is not None
             ),
+            funding_snapshots=hourly_batch.funding_snapshots,
+            hourly_contexts=hourly_batch.hourly_contexts,
+        )
+
+    async def collect_hourly(self, *, sample_time: datetime) -> CollectorBatch:
+        metadata_observed_at = self._metadata_observed_at
+        if metadata_observed_at is None:
+            return CollectorBatch()
+        configured_details = tuple(
+            (market, self._details[market.venue_symbol])
+            for market in self._markets
+            if market.venue_symbol in self._details
+        )
+        return await self._collect_hourly_from_details(
+            sample_time=sample_time,
+            configured_details=configured_details,
+            metadata_observed_at=metadata_observed_at,
+        )
+
+    async def _collect_hourly_from_details(
+        self,
+        *,
+        sample_time: datetime,
+        configured_details: tuple[tuple[MarketConfig, ArcusMarketDetail], ...],
+        metadata_observed_at: datetime,
+    ) -> CollectorBatch:
+        funding_results = await asyncio.gather(
+            *(
+                self._collect_funding(market, detail)
+                for market, detail in configured_details
+            )
+        )
+        funding_snapshots = tuple(
+            funding for funding in funding_results if funding is not None
+        )
+        hourly_sample = sample_time.astimezone(UTC).replace(
+            minute=0, second=0, microsecond=0
+        )
+        hourly_contexts = tuple(
+            HourlyContext(
+                sample_time=hourly_sample,
+                observed_at=metadata_observed_at,
+                venue=self.venue,
+                venue_symbol=market.venue_symbol,
+                canonical_symbol=market.canonical_symbol,
+                open_interest=detail.open_interest,
+                volume_24h=detail.volume_24h,
+            )
+            for market, detail in configured_details
+        )
+        return CollectorBatch(
             funding_snapshots=funding_snapshots,
             hourly_contexts=hourly_contexts,
         )
