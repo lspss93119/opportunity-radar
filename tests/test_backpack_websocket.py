@@ -360,6 +360,53 @@ async def test_backpack_feed_gap_rebuilds_only_affected_symbol():
 
 
 @pytest.mark.asyncio
+async def test_backpack_feed_recovers_from_forward_gap_after_seed():
+    symbol = "BTC_USDC_PERP"
+    websocket = FixtureWebSocket(
+        [
+            {"id": 1, "result": None},
+            depth_update(symbol, first_update_id=12, final_update_id=12),
+        ]
+    )
+    loader_calls: list[int] = []
+    errors: list[Exception] = []
+
+    async def snapshot_loader(_symbol: str):
+        loader_calls.append(len(loader_calls) + 1)
+        return snapshot_payload(10 if len(loader_calls) == 1 else 12)
+
+    feed = BackpackOrderBookFeed(
+        [symbol],
+        connect=lambda _url: websocket,
+        snapshot_loader=snapshot_loader,
+        clock=lambda: OBSERVED_AT,
+        on_book=lambda _symbol, _snapshot: None,
+        error_handler=lambda _venue, error: errors.append(error),
+        reconnect_delay_seconds=1.0,
+    )
+
+    await feed.start()
+    try:
+        await wait_until(lambda: len(loader_calls) >= 2)
+        assert feed.snapshot(symbol) is None
+
+        websocket.push(
+            depth_update(
+                symbol,
+                first_update_id=12,
+                final_update_id=13,
+                bids=((99.0, 2.0),),
+                asks=((101.0, 2.0),),
+            )
+        )
+        await wait_until(lambda: feed.snapshot(symbol) is not None)
+        assert feed.snapshot(symbol).bids == (BookLevel(99.0, 2.0),)
+        assert any("gap" in str(error) for error in errors)
+    finally:
+        await feed.stop()
+
+
+@pytest.mark.asyncio
 async def test_backpack_feed_reconnect_clears_cache_and_resubscribes():
     symbol = "BTC_USDC_PERP"
     first = FixtureWebSocket(

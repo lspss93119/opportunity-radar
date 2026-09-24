@@ -272,7 +272,10 @@ class BackpackOrderBookState:
 
         expected = self._last_update_id + 1
         if not self._ready:
-            if first_update_id > expected or final_update_id < expected:
+            if first_update_id > expected:
+                self.clear()
+                return "gap"
+            if final_update_id < expected:
                 return "buffered"
             self._apply_levels(parsed_bids, parsed_asks)
             self._ready = True
