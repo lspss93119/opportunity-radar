@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
+from typing import Any, TypedDict
 
 from radar.collectors.base import (
     CollectorBatch,
@@ -19,6 +20,11 @@ from radar.storage.parquet import ParquetStorage
 UTC = timezone.utc
 SAMPLE_INTERVAL_SECONDS = 10
 HOURLY_CONTEXT_GRACE_SECONDS = 60
+
+
+class _CollectorOptions(TypedDict, total=False):
+    latest_market_data: LatestMarketData
+    request_json: Any
 
 
 def utc_now() -> datetime:
@@ -138,7 +144,9 @@ class MarketDataPipeline:
         )
 
         latest_market_data = LatestMarketData()
-        collector_kwargs = {"latest_market_data": latest_market_data}
+        collector_kwargs: _CollectorOptions = {
+            "latest_market_data": latest_market_data,
+        }
         if request_json is not None:
             collector_kwargs["request_json"] = request_json
         collectors: list[CollectorLike] = [

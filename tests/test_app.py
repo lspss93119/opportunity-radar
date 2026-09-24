@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -333,17 +335,202 @@ async def test_application_flushes_at_interval_not_after_each_sample():
         clock=lambda: NOW,
     )
 
-    assert await app.maybe_flush(NOW) == 0
-    assert await app.maybe_flush(NOW + timedelta(seconds=59)) == 0
-    assert await app.maybe_flush(NOW + timedelta(seconds=60)) == 1
-    assert await app.maybe_flush(NOW + timedelta(seconds=61)) == 0
+    assert app.maybe_flush(NOW) is False
+    assert app.maybe_flush(NOW + timedelta(seconds=59)) is False
+    assert app.maybe_flush(NOW + timedelta(seconds=60)) is True
+    assert app.maybe_flush(NOW + timedelta(seconds=61)) is False
+    await app._wait_for_periodic_flush()
 
     assert pipeline.flush_calls == [NOW + timedelta(seconds=60)]
 
 
 @pytest.mark.asyncio
-async def test_application_shutdown_orders_pipeline_flush_worker_and_runtime():
+async def test_blocked_periodic_flush_does_not_block_samples_or_overlap():
     from radar.app import RadarApplication
+
+    flush_started = threading.Event()
+    release_flush = threading.Event()
+
+    class BlockedFlushPipeline(RecordingPipeline):
+        def flush_storage(self, *, now: datetime | None = None) -> int:
+            assert now is not None
+            self.flush_calls.append(now)
+            if len(self.flush_calls) == 1:
+                flush_started.set()
+                assert release_flush.wait(timeout=1.0)
+            return 1
+
+    events: list[str] = []
+    pipeline = BlockedFlushPipeline(events)
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    app = RadarApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=FakeRuntimeStore(events),  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    app._last_flush_at = NOW - timedelta(seconds=60)
+
+    assert app.maybe_flush(NOW) is True
+    for _ in range(100):
+        if flush_started.is_set():
+            break
+        await asyncio.sleep(0.001)
+    assert flush_started.is_set()
+
+    await app.collect_and_evaluate_once(NOW + timedelta(seconds=10))
+    assert app.maybe_flush(NOW + timedelta(seconds=10)) is False
+    await app.collect_and_evaluate_once(NOW + timedelta(seconds=20))
+
+    assert app.stats.collection_cycles == 2
+    assert len(pipeline.flush_calls) == 1
+
+    release_flush.set()
+    await app._wait_for_periodic_flush()
+    assert len(pipeline.flush_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_periodic_flush_before_final_flush_and_close():
+    from radar.app import RadarApplication
+
+    flush_started = threading.Event()
+    release_flush = threading.Event()
+
+    class BlockingFlushPipeline(RecordingPipeline):
+        def flush_storage(self, *, now: datetime | None = None) -> int:
+            assert now is not None
+            call_number = len(self.flush_calls) + 1
+            self.flush_calls.append(now)
+            events.append(f"flush.{call_number}.start")
+            if call_number == 1:
+                flush_started.set()
+                assert release_flush.wait(timeout=1.0)
+            events.append(f"flush.{call_number}.done")
+            return 1
+
+    class OneCycleApplication(RadarApplication):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.boundary_calls = 0
+
+        async def _wait_until_next_boundary(self, stop_event: asyncio.Event) -> bool:
+            self.boundary_calls += 1
+            if self.boundary_calls == 1:
+                return False
+            stop_event.set()
+            return True
+
+    events: list[str] = []
+    pipeline = BlockingFlushPipeline(events)
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    worker = FakeWorker(events)
+    runtime = FakeRuntimeStore(events)
+    stop_event = asyncio.Event()
+    app = OneCycleApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=worker,  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=runtime,  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    app._last_flush_at = NOW - timedelta(seconds=60)
+
+    run_task = asyncio.create_task(app.run(stop_event=stop_event))
+    for _ in range(100):
+        if flush_started.is_set():
+            break
+        await asyncio.sleep(0.001)
+    assert flush_started.is_set()
+    await asyncio.sleep(0)
+    assert not run_task.done()
+
+    release_flush.set()
+    await run_task
+
+    assert events.index("pipeline.stop") < events.index("flush.1.done")
+    assert events.index("flush.1.done") < events.index("flush.2.start")
+    assert events.index("flush.2.done") < events.index("worker.stop")
+    assert events.index("worker.stop") < events.index("runtime.close")
+
+
+@pytest.mark.asyncio
+async def test_final_flush_preserves_rows_appended_during_periodic_flush(
+    tmp_path, monkeypatch
+):
+    import pyarrow.parquet as parquet
+
+    from radar.app import RadarApplication
+
+    root = tmp_path / "data"
+    storage = ParquetStorage(root)
+    storage.append(make_market(NOW))
+
+    class StoragePipeline:
+        state = RadarState()
+
+        def flush_storage(self, *, now: datetime | None = None) -> int:
+            assert now is not None
+            return storage.flush(now=now)
+
+    write_started = threading.Event()
+    release_write = threading.Event()
+    original_write = parquet.write_table
+
+    def blocked_write(*args, **kwargs):
+        write_started.set()
+        assert release_write.wait(timeout=1.0)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr("radar.storage.parquet.pq.write_table", blocked_write)
+
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = RadarState()
+    app = RadarApplication(
+        pipeline=StoragePipeline(),  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=storage,  # type: ignore[arg-type]
+        runtime_store=FakeRuntimeStore([]),  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    app._last_flush_at = NOW - timedelta(seconds=60)
+
+    assert app.maybe_flush(NOW) is True
+    for _ in range(100):
+        if write_started.is_set():
+            break
+        await asyncio.sleep(0.001)
+    assert write_started.is_set()
+
+    storage.append(make_market(NOW + timedelta(seconds=10)))
+    assert storage.pending_count == 1
+    release_write.set()
+    await app._wait_for_periodic_flush()
+    assert storage.pending_count == 1
+
+    await app.flush_now(NOW + timedelta(seconds=10))
+    files = tuple((root / "market").glob("date=*/*.parquet"))
+    assert len(files) == 2
+    assert sum(parquet.ParquetFile(path).metadata.num_rows for path in files) == 2
+
+
+@pytest.mark.asyncio
+async def test_application_shutdown_orders_pipeline_flush_worker_and_runtime(caplog):
+    from radar.app import RadarApplication
+
+    caplog.set_level(logging.INFO, logger="radar.app")
 
     class OneCycleApplication(RadarApplication):
         def __init__(self, *args, **kwargs):
@@ -387,6 +574,15 @@ async def test_application_shutdown_orders_pipeline_flush_worker_and_runtime():
         "worker.stop",
         "runtime.close",
     ]
+    messages = [record.getMessage() for record in caplog.records]
+    cycle_message = next(message for message in messages if "market cycle=" in message)
+    assert "scheduled_sample_time=2026-09-17 12:00:00+00:00" in cycle_message
+    assert "boundary_lateness_ms=" in cycle_message
+    assert "cache_collect_ms=" in cycle_message
+    assert "monitor_ms=" in cycle_message
+    assert "scheduler_critical_ms=" in cycle_message
+    assert any("parquet flush start reason=final" in message for message in messages)
+    assert any("parquet flush complete reason=final" in message for message in messages)
     append_index = events.index("pipeline.append")
     flush_index = events.index("flush")
     assert append_index < flush_index

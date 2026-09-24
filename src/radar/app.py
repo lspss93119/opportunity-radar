@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -69,6 +70,16 @@ class PilotStats:
     latest_sample_time: datetime | None = None
 
 
+@dataclass(frozen=True)
+class _CycleTiming:
+    cache_collect_ms: float
+    monitor_ms: float
+
+
+def _elapsed_ms(started: float) -> float:
+    return (time.perf_counter() - started) * 1000.0
+
+
 class RadarApplication:
     def __init__(
         self,
@@ -97,35 +108,83 @@ class RadarApplication:
         self.flush_interval_seconds = flush_interval_seconds
         self.stats = PilotStats() if stats is None else stats
         self._last_flush_at: datetime | None = None
+        self._periodic_flush_task: asyncio.Task[None] | None = None
+        self._next_scheduled_sample_time: datetime | None = None
+        self._last_cycle_timing: _CycleTiming | None = None
 
     async def collect_and_evaluate_once(self, now: datetime) -> CollectorBatch:
         current_time = _as_utc(now, "now")
+        collect_started = time.perf_counter()
         batch = await self.pipeline.collect_once(now=current_time)
+        cache_collect_ms = _elapsed_ms(collect_started)
         self.stats.collection_cycles += 1
         if batch.market_snapshots:
             self.stats.latest_sample_time = max(
                 snapshot.sample_time for snapshot in batch.market_snapshots
             )
+        monitor_started = time.perf_counter()
         await self.monitor_runner.run_cycle(current_time)
+        monitor_ms = _elapsed_ms(monitor_started)
+        self._last_cycle_timing = _CycleTiming(
+            cache_collect_ms=cache_collect_ms,
+            monitor_ms=monitor_ms,
+        )
         self.stats.alerts_queued = self.monitor_runner.queue.qsize()
         return batch
 
-    async def maybe_flush(self, now: datetime) -> int:
+    def maybe_flush(self, now: datetime) -> bool:
+        """Schedule one periodic flush without awaiting storage I/O."""
         current_time = _as_utc(now, "now")
         if self._last_flush_at is None:
             self._last_flush_at = current_time
-            return 0
+            return False
         if current_time < self._last_flush_at + timedelta(
             seconds=self.flush_interval_seconds
         ):
-            return 0
-        return await self.flush_now(current_time)
+            return False
+        if (
+            self._periodic_flush_task is not None
+            and not self._periodic_flush_task.done()
+        ):
+            return False
+
+        self._last_flush_at = current_time
+        task = asyncio.create_task(
+            self._run_periodic_flush(current_time),
+            name="radar-periodic-parquet-flush",
+        )
+        self._periodic_flush_task = task
+        task.add_done_callback(self._periodic_flush_done)
+        return True
+
+    def _periodic_flush_done(self, task: asyncio.Task[None]) -> None:
+        if self._periodic_flush_task is task:
+            self._periodic_flush_task = None
+
+    async def _run_periodic_flush(self, scheduled_at: datetime) -> None:
+        try:
+            await self._flush_now(scheduled_at, reason="periodic")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            LOGGER.error("periodic Parquet flush failed", exc_info=error)
+
+    async def _wait_for_periodic_flush(self) -> None:
+        task = self._periodic_flush_task
+        if task is None:
+            return
+        await task
 
     async def flush_now(self, now: datetime | None = None) -> int:
         current_time = _as_utc(
             self.clock() if now is None else now,
             "now",
         )
+        return await self._flush_now(current_time, reason="final")
+
+    async def _flush_now(self, current_time: datetime, *, reason: str) -> int:
+        started = time.perf_counter()
+        LOGGER.info("parquet flush start reason=%s at=%s", reason, current_time)
         files_written = await asyncio.to_thread(
             self.pipeline.flush_storage,
             now=current_time,
@@ -133,7 +192,9 @@ class RadarApplication:
         self._last_flush_at = current_time
         self.stats.parquet_flushes += 1
         LOGGER.info(
-            "parquet flush files=%d pending=%d",
+            "parquet flush complete reason=%s duration_ms=%.3f files=%d pending=%d",
+            reason,
+            _elapsed_ms(started),
             files_written,
             self.storage.pending_count,
         )
@@ -144,9 +205,12 @@ class RadarApplication:
         stop_event: asyncio.Event,
     ) -> bool:
         now = _as_utc(self.clock(), "now")
-        next_sample = aligned_sample_time(now, self.pipeline.sampling_seconds) + timedelta(
-            seconds=self.pipeline.sampling_seconds
-        )
+        next_sample = self._next_scheduled_sample_time
+        if next_sample is None:
+            next_sample = aligned_sample_time(
+                now, self.pipeline.sampling_seconds
+            ) + timedelta(seconds=self.pipeline.sampling_seconds)
+            self._next_scheduled_sample_time = next_sample
         delay = max(0.0, (next_sample - now).total_seconds())
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=delay)
@@ -158,6 +222,7 @@ class RadarApplication:
         event = asyncio.Event() if stop_event is None else stop_event
         worker_task = asyncio.create_task(self.alert_worker.run_forever())
         await asyncio.sleep(0)
+        self._next_scheduled_sample_time = None
         try:
             start_pipeline = getattr(self.pipeline, "start", None)
             if callable(start_pipeline):
@@ -169,14 +234,36 @@ class RadarApplication:
                 if event.is_set():
                     break
                 cycle_time = _as_utc(self.clock(), "now")
+                scheduled_sample_time = self._next_scheduled_sample_time
+                if scheduled_sample_time is None:
+                    scheduled_sample_time = aligned_sample_time(
+                        cycle_time, self.pipeline.sampling_seconds
+                    )
+                boundary_lateness_ms = max(
+                    0.0,
+                    (cycle_time - scheduled_sample_time).total_seconds() * 1000.0,
+                )
+                critical_started = time.perf_counter()
                 try:
                     batch = await self.collect_and_evaluate_once(cycle_time)
-                    await self.maybe_flush(cycle_time)
+                    self.maybe_flush(cycle_time)
+                    scheduler_critical_ms = _elapsed_ms(critical_started)
+                    timing = self._last_cycle_timing
+                    if timing is None:
+                        raise RuntimeError("cycle timing was not recorded")
                     LOGGER.info(
-                        "collection cycle=%d sample_time=%s markets=%d funding=%d "
+                        "market cycle=%d scheduled_sample_time=%s "
+                        "actual_cycle_start=%s boundary_lateness_ms=%.3f "
+                        "cache_collect_ms=%.3f monitor_ms=%.3f "
+                        "scheduler_critical_ms=%.3f markets=%d funding=%d "
                         "hourly_context=%d queue_size=%d",
                         self.stats.collection_cycles,
-                        self.stats.latest_sample_time,
+                        scheduled_sample_time,
+                        cycle_time,
+                        boundary_lateness_ms,
+                        timing.cache_collect_ms,
+                        timing.monitor_ms,
+                        scheduler_critical_ms,
                         len(batch.market_snapshots),
                         len(batch.funding_snapshots),
                         len(batch.hourly_contexts),
@@ -186,6 +273,16 @@ class RadarApplication:
                     raise
                 except Exception as error:  # noqa: BLE001
                     LOGGER.error("application cycle failed", exc_info=error)
+                finally:
+                    next_sample_time = scheduled_sample_time + timedelta(
+                        seconds=self.pipeline.sampling_seconds
+                    )
+                    after_cycle = _as_utc(self.clock(), "now")
+                    if after_cycle >= next_sample_time:
+                        next_sample_time = aligned_sample_time(
+                            after_cycle, self.pipeline.sampling_seconds
+                        ) + timedelta(seconds=self.pipeline.sampling_seconds)
+                    self._next_scheduled_sample_time = next_sample_time
         finally:
             event.set()
             try:
@@ -194,6 +291,10 @@ class RadarApplication:
                     await stop_pipeline()
             except Exception as error:  # noqa: BLE001
                 LOGGER.error("shutdown collectors stop failed", exc_info=error)
+            try:
+                await self._wait_for_periodic_flush()
+            except Exception as error:  # noqa: BLE001
+                LOGGER.error("waiting for periodic Parquet flush failed", exc_info=error)
             try:
                 await self.flush_now()
             except Exception as error:  # noqa: BLE001
@@ -211,6 +312,7 @@ class RadarApplication:
                 self.stats.parquet_flushes,
                 self.monitor_runner.queue.qsize(),
             )
+            self._next_scheduled_sample_time = None
 
 
 def _configured_fee_bps(config: RadarConfig, venue: str) -> float:
