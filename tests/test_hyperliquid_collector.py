@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from radar.collectors.hyperliquid import (
     parse_hyperliquid_meta_and_asset_ctxs,
 )
 from radar.config import MarketConfig
+from radar.market_data import LatestMarketData
 
 UTC = timezone.utc
 FIXTURES = Path(__file__).parent / "fixtures" / "hyperliquid"
@@ -43,6 +45,88 @@ def configured_hip3_markets() -> list[MarketConfig]:
             canonical_symbol="NVDA",
         ),
     ]
+
+
+class FixtureWebSocket:
+    def __init__(self, messages: list[dict]) -> None:
+        self.sent: list[dict] = []
+        self.closed = False
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        for message in messages:
+            self.push(message)
+
+    def push(self, message: dict) -> None:
+        self._queue.put_nowait(json.dumps(message))
+
+    async def send(self, message: str) -> None:
+        self.sent.append(json.loads(message))
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._queue.put_nowait(None)
+
+    async def __aenter__(self) -> "FixtureWebSocket":
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        await self.close()
+
+    def __aiter__(self) -> "FixtureWebSocket":
+        return self
+
+    async def __anext__(self) -> str:
+        message = await self._queue.get()
+        if message is None:
+            raise StopAsyncIteration
+        return message
+
+
+def load_l2_fixture(coin: str) -> dict:
+    if coin == "xyz:TSLA":
+        return load_fixture("hip3_l2_xyz_tsla.json")
+    if coin == "io:SNDK":
+        return load_fixture_from_entropy("l2_io_sndk.json")
+    return load_fixture(f"l2_{coin.lower()}.json")
+
+
+def fixture_websocket(
+    coins: tuple[str, ...], *, include_coins: tuple[str, ...] | None = None
+):
+    included = set(coins if include_coins is None else include_coins)
+    messages = [
+        {
+            "channel": "subscriptionResponse",
+            "data": {
+                "method": "subscribe",
+                "subscription": {"type": "l2Book", "coin": coin},
+            },
+        }
+        for coin in coins
+    ]
+    messages.extend(
+        {"channel": "l2Book", "data": load_l2_fixture(coin)}
+        for coin in coins
+        if coin in included
+    )
+    websocket = FixtureWebSocket(messages)
+    return websocket, lambda _url: websocket
+
+
+async def wait_for_books(collector: HyperliquidCollector, coins: tuple[str, ...]) -> None:
+    for _ in range(100):
+        if all(collector._order_book_feed.snapshot(coin) is not None for coin in coins):
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("fixture websocket books were not populated")
+
+
+async def wait_until(predicate) -> None:
+    for _ in range(100):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("predicate was not satisfied")
 
 
 def test_hyperliquid_meta_contexts_are_mapped_by_universe_order():
@@ -88,20 +172,44 @@ class FixtureTransport:
 @pytest.mark.asyncio
 async def test_hyperliquid_collector_normalizes_market_funding_and_hourly_context():
     transport = FixtureTransport()
+    websocket, websocket_connect = fixture_websocket(("BTC", "ETH", "SOL"))
+    latest = LatestMarketData()
     collector = HyperliquidCollector(
-        configured_markets(), request_json=transport, clock=lambda: OBSERVED_AT
+        configured_markets(),
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        websocket_connect=websocket_connect,
+        latest_market_data=latest,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=True
-    )
+    await collector.start()
+    await wait_for_books(collector, ("BTC", "ETH", "SOL"))
+    try:
+        batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+        market_batch = latest.build_batch(
+            configured_markets(),
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+        compatibility_batch = await collector.collect(
+            sample_time=SAMPLE_TIME, include_hourly_context=False
+        )
+    finally:
+        await collector.stop()
 
-    assert [snapshot.canonical_symbol for snapshot in batch.market_snapshots] == [
+    assert batch.market_snapshots == ()
+    assert [snapshot.canonical_symbol for snapshot in market_batch.market_snapshots] == [
         "BTC",
         "ETH",
         "SOL",
     ]
-    btc = batch.market_snapshots[0]
+    assert [snapshot.canonical_symbol for snapshot in compatibility_batch.market_snapshots] == [
+        "BTC",
+        "ETH",
+        "SOL",
+    ]
+    btc = market_batch.market_snapshots[0]
     assert btc.best_bid == 99.0
     assert btc.best_bid_size == 60.0
     assert btc.best_ask == 100.0
@@ -128,12 +236,10 @@ async def test_hyperliquid_collector_normalizes_market_funding_and_hourly_contex
     assert btc_context.volume_24h == 456789.0
     assert btc_context.observed_at == OBSERVED_AT
 
-    assert {url for url, _, _ in transport.calls} == {
-        HyperliquidCollector.INFO_URL
-    }
+    assert {url for url, _, _ in transport.calls} == {HyperliquidCollector.INFO_URL}
     assert all(method == "POST" for _, method, _ in transport.calls)
     assert sum(body["type"] == "metaAndAssetCtxs" for _, _, body in transport.calls) == 1
-    assert sum(body["type"] == "l2Book" for _, _, body in transport.calls) == 3
+    assert sum(body["type"] == "l2Book" for _, _, body in transport.calls) == 0
     assert sum(body["type"] == "fundingHistory" for _, _, body in transport.calls) == 3
     assert [
         body for _, _, body in transport.calls if body["type"] == "metaAndAssetCtxs"
@@ -141,37 +247,47 @@ async def test_hyperliquid_collector_normalizes_market_funding_and_hourly_contex
 
 
 @pytest.mark.asyncio
-async def test_hyperliquid_collector_omits_symbol_when_its_book_request_fails():
+async def test_hyperliquid_collector_omits_symbol_until_its_ws_snapshot_arrives():
     transport = FixtureTransport()
+    websocket, websocket_connect = fixture_websocket(
+        ("BTC", "ETH", "SOL"), include_coins=("BTC", "SOL")
+    )
     failures: list[tuple[str, Exception]] = []
 
-    async def failing_transport(url: str, *, method: str, json_body=None, params=None):
-        if json_body.get("type") == "l2Book" and json_body.get("coin") == "ETH":
-            raise OSError("temporary outage")
-        return await transport(url, method=method, json_body=json_body, params=params)
-
+    latest = LatestMarketData()
     collector = HyperliquidCollector(
         configured_markets(),
-        request_json=failing_transport,
+        request_json=transport,
         clock=lambda: OBSERVED_AT,
+        websocket_connect=websocket_connect,
+        latest_market_data=latest,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=False
-    )
+    await collector.start()
+    await wait_for_books(collector, ("BTC", "SOL"))
+    try:
+        batch = latest.build_batch(
+            configured_markets(),
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+    finally:
+        await collector.stop()
 
     assert {snapshot.canonical_symbol for snapshot in batch.market_snapshots} == {
         "BTC",
         "SOL",
     }
-    assert [(venue, str(error)) for venue, error in failures] == [
-        ("hyperliquid", "temporary outage")
-    ]
+    assert failures == []
+    assert sum(body["type"] == "l2Book" for _, _, body in transport.calls) == 0
 
 
 @pytest.mark.asyncio
 async def test_hyperliquid_collector_reports_metadata_failure():
+    websocket, websocket_connect = fixture_websocket(("BTC", "ETH", "SOL"))
     failures: list[tuple[str, Exception]] = []
+    latest = LatestMarketData()
 
     async def failing_transport(url: str, *, method: str, json_body=None, params=None):
         raise OSError("metadata unavailable")
@@ -179,17 +295,80 @@ async def test_hyperliquid_collector_reports_metadata_failure():
     collector = HyperliquidCollector(
         configured_markets(),
         request_json=failing_transport,
+        websocket_connect=websocket_connect,
+        latest_market_data=latest,
+        clock=lambda: OBSERVED_AT,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=False
-    )
+    await collector.start()
+    await wait_for_books(collector, ("BTC", "ETH", "SOL"))
+    try:
+        batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+        market_batch = latest.build_batch(
+            configured_markets(),
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+    finally:
+        await collector.stop()
 
-    assert batch.market_snapshots == ()
+    assert batch == CollectorBatch()
+    assert len(market_batch.market_snapshots) == 3
     assert [(venue, str(error)) for venue, error in failures] == [
         ("hyperliquid", "metadata unavailable")
     ]
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_invalid_cache_publication_clears_local_book():
+    transport = FixtureTransport()
+    websocket = FixtureWebSocket(
+        [
+            {
+                "channel": "subscriptionResponse",
+                "data": {
+                    "method": "subscribe",
+                    "subscription": {"type": "l2Book", "coin": "BTC"},
+                },
+            },
+            {
+                "channel": "l2Book",
+                "data": {
+                    "coin": "BTC",
+                    "levels": [
+                        [{"px": "101", "sz": "1", "n": 1}],
+                        [{"px": "100", "sz": "1", "n": 1}],
+                    ],
+                },
+            },
+        ]
+    )
+    failures: list[tuple[str, Exception]] = []
+    latest = LatestMarketData()
+    market = MarketConfig(venue="hyperliquid", venue_symbol="BTC", canonical_symbol="BTC")
+    collector = HyperliquidCollector(
+        [market],
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        websocket_connect=lambda _url: websocket,
+        latest_market_data=latest,
+        error_handler=lambda venue, error: failures.append((venue, error)),
+    )
+
+    await collector.start()
+    try:
+        await wait_until(lambda: bool(failures))
+        assert collector._order_book_feed.snapshot("BTC") is None
+        assert latest.build_batch(
+            [market],
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        ).market_snapshots == ()
+    finally:
+        await collector.stop()
 
 
 class Hip3FixtureTransport:
@@ -236,19 +415,34 @@ def load_fixture_from_entropy(name: str):
 @pytest.mark.asyncio
 async def test_trade_xyz_collector_adds_dex_only_to_metadata_and_normalizes_hip3_data():
     transport = Hip3FixtureTransport()
+    websocket, websocket_connect = fixture_websocket(("xyz:TSLA",))
+    market = configured_hip3_markets()[:1]
+    latest = LatestMarketData()
     collector = HyperliquidCollector(
-        configured_hip3_markets()[:1],
+        market,
         venue="trade_xyz",
         dex="xyz",
         request_json=transport,
         clock=lambda: OBSERVED_AT,
+        websocket_connect=websocket_connect,
+        latest_market_data=latest,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=True
-    )
+    await collector.start()
+    await wait_for_books(collector, ("xyz:TSLA",))
+    try:
+        batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+        market_batch = latest.build_batch(
+            market,
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+    finally:
+        await collector.stop()
 
-    snapshot = batch.market_snapshots[0]
+    assert batch.market_snapshots == ()
+    snapshot = market_batch.market_snapshots[0]
     assert snapshot.venue == "trade_xyz"
     assert snapshot.venue_symbol == "xyz:TSLA"
     assert snapshot.canonical_symbol == "TSLA"
@@ -284,31 +478,47 @@ async def test_trade_xyz_collector_adds_dex_only_to_metadata_and_normalizes_hip3
         for body in transport.calls
         if body["type"] in {"l2Book", "fundingHistory"}
     )
+    assert sum(body["type"] == "l2Book" for body in transport.calls) == 0
 
 
 @pytest.mark.asyncio
 async def test_entropy_collector_uses_io_namespace_and_maps_sndk():
     transport = EntropyFixtureTransport()
+    websocket, websocket_connect = fixture_websocket(("io:SNDK",))
+    market = [
+        MarketConfig(
+            venue="entropy",
+            venue_symbol="io:SNDK",
+            canonical_symbol="SNDK",
+        )
+    ]
+    latest = LatestMarketData()
     collector = HyperliquidCollector(
-        [
-            MarketConfig(
-                venue="entropy",
-                venue_symbol="io:SNDK",
-                canonical_symbol="SNDK",
-            )
-        ],
+        market,
         venue="entropy",
         dex="io",
         request_json=transport,
         clock=lambda: OBSERVED_AT,
+        websocket_connect=websocket_connect,
+        latest_market_data=latest,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=True
-    )
+    await collector.start()
+    await wait_for_books(collector, ("io:SNDK",))
+    try:
+        batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+        market_batch = latest.build_batch(
+            market,
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+    finally:
+        await collector.stop()
 
-    assert len(batch.market_snapshots) == 1
-    snapshot = batch.market_snapshots[0]
+    assert batch.market_snapshots == ()
+    assert len(market_batch.market_snapshots) == 1
+    snapshot = market_batch.market_snapshots[0]
     assert snapshot.venue == "entropy"
     assert snapshot.venue_symbol == "io:SNDK"
     assert snapshot.canonical_symbol == "SNDK"
@@ -327,42 +537,48 @@ async def test_entropy_collector_uses_io_namespace_and_maps_sndk():
         for body in transport.calls
         if body["type"] in {"l2Book", "fundingHistory"}
     )
+    assert sum(body["type"] == "l2Book" for body in transport.calls) == 0
 
 
 @pytest.mark.asyncio
-async def test_trade_xyz_book_failure_omits_only_failed_symbol_and_reports_trade_venue():
+async def test_trade_xyz_ws_failure_omits_only_unready_symbol_and_keeps_trade_venue():
     transport = Hip3FixtureTransport()
-    failures: list[tuple[str, Exception]] = []
-
-    async def failing_transport(url: str, *, method: str, json_body=None, params=None):
-        assert json_body is not None
-        if json_body.get("type") == "l2Book" and json_body.get("coin") == "xyz:NVDA":
-            raise OSError("HIP-3 book unavailable")
-        return await transport(url, method=method, json_body=json_body, params=params)
+    websocket, websocket_connect = fixture_websocket(
+        ("xyz:TSLA", "xyz:NVDA"), include_coins=("xyz:TSLA",)
+    )
+    latest = LatestMarketData()
 
     collector = HyperliquidCollector(
         configured_hip3_markets(),
         venue="trade_xyz",
         dex="xyz",
-        request_json=failing_transport,
+        request_json=transport,
         clock=lambda: OBSERVED_AT,
-        error_handler=lambda venue, error: failures.append((venue, error)),
+        websocket_connect=websocket_connect,
+        latest_market_data=latest,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=False
-    )
+    await collector.start()
+    await wait_for_books(collector, ("xyz:TSLA",))
+    try:
+        batch = latest.build_batch(
+            configured_hip3_markets(),
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+    finally:
+        await collector.stop()
 
     assert [(snapshot.venue_symbol, snapshot.canonical_symbol) for snapshot in batch.market_snapshots] == [
         ("xyz:TSLA", "TSLA")
     ]
-    assert [(venue, str(error)) for venue, error in failures] == [
-        ("trade_xyz", "HIP-3 book unavailable")
-    ]
+    assert sum(body["type"] == "l2Book" for body in transport.calls) == 0
 
 
 @pytest.mark.asyncio
 async def test_trade_xyz_metadata_failure_reports_logical_venue_and_returns_empty_batch():
+    websocket, websocket_connect = fixture_websocket(("xyz:TSLA",))
     failures: list[tuple[str, Exception]] = []
 
     async def failing_transport(url: str, *, method: str, json_body=None, params=None):
@@ -373,12 +589,15 @@ async def test_trade_xyz_metadata_failure_reports_logical_venue_and_returns_empt
         venue="trade_xyz",
         dex="xyz",
         request_json=failing_transport,
+        websocket_connect=websocket_connect,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=False
-    )
+    await collector.start()
+    try:
+        batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+    finally:
+        await collector.stop()
 
     assert batch == CollectorBatch()
     assert [(venue, str(error)) for venue, error in failures] == [
