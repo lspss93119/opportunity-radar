@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -109,6 +110,27 @@ def assert_live_market_batch(batch, venue: str, sample_time: datetime) -> None:
     }
 
 
+async def collect_lighter_live(
+    collector: LighterCollector, sample_time: datetime, expected_count: int
+):
+    await collector.start()
+    try:
+        for _ in range(100):
+            ready = sum(
+                collector._order_book_feed.snapshot(market_id) is not None
+                for market_id in collector._order_book_feed.market_ids
+            )
+            if ready >= expected_count:
+                break
+            await asyncio.sleep(0.1)
+        return await collector.collect(
+            sample_time=sample_time,
+            include_hourly_context=True,
+        )
+    finally:
+        await collector.stop()
+
+
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_hyperliquid_public_read_only_live_smoke():
@@ -127,9 +149,8 @@ async def test_hyperliquid_public_read_only_live_smoke():
 async def test_lighter_public_read_only_live_smoke():
     now = datetime.now(UTC)
     sample_time = aligned_sample_time(now, 10)
-    batch = await LighterCollector(configured_markets("lighter")).collect(
-        sample_time=sample_time,
-        include_hourly_context=True,
+    batch = await collect_lighter_live(
+        LighterCollector(configured_markets("lighter")), sample_time, 3
     )
 
     assert_live_market_batch(batch, "lighter", sample_time)
@@ -152,11 +173,15 @@ async def test_lighter_robinhood_public_read_only_live_smoke():
         "META",
         "MU",
     }
-    batch = await LighterCollector(
-        configured_lighter_robinhood_markets(),
-        venue="lighter_robinhood",
-        base_url="https://api.rh.lighter.xyz",
-    ).collect(sample_time=sample_time, include_hourly_context=True)
+    batch = await collect_lighter_live(
+        LighterCollector(
+            configured_lighter_robinhood_markets(),
+            venue="lighter_robinhood",
+            base_url="https://api.rh.lighter.xyz",
+        ),
+        sample_time,
+        len(expected_symbols),
+    )
 
     assert {snapshot.canonical_symbol for snapshot in batch.market_snapshots} == expected_symbols
     assert {snapshot.venue_symbol for snapshot in batch.market_snapshots} == expected_symbols
@@ -185,11 +210,10 @@ async def test_lighter_robinhood_public_read_only_live_smoke():
 async def test_trade_xyz_hip3_public_read_only_live_smoke_matches_lighter_tsla():
     now = datetime.now(UTC)
     sample_time = aligned_sample_time(now, 10)
-    lighter_batch = await LighterCollector(
-        configured_tsla_markets("lighter", "TSLA")
-    ).collect(
-        sample_time=sample_time,
-        include_hourly_context=True,
+    lighter_batch = await collect_lighter_live(
+        LighterCollector(configured_tsla_markets("lighter", "TSLA")),
+        sample_time,
+        1,
     )
     hip3_batch = await HyperliquidCollector(
         configured_tsla_markets("trade_xyz", "xyz:TSLA"),

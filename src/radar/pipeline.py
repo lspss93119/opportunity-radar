@@ -202,6 +202,22 @@ class MarketDataPipeline:
     def collectors(self) -> tuple[Collector, ...]:
         return self._collectors
 
+    async def start(self) -> None:
+        lifecycle_hooks = [
+            hook
+            for collector in self._collectors
+            if (hook := getattr(collector, "start", None)) is not None
+        ]
+        await asyncio.gather(*(hook() for hook in lifecycle_hooks))
+
+    async def stop(self) -> None:
+        lifecycle_hooks = [
+            hook
+            for collector in self._collectors
+            if (hook := getattr(collector, "stop", None)) is not None
+        ]
+        await asyncio.gather(*(hook() for hook in lifecycle_hooks))
+
     def flush_storage(self, *, now: datetime | None = None) -> int:
         """Flush the optional storage buffer at an application-owned boundary."""
         return 0 if self.storage is None else self.storage.flush(now=now)

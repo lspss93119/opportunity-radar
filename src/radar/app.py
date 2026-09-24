@@ -158,8 +158,11 @@ class RadarApplication:
         event = asyncio.Event() if stop_event is None else stop_event
         worker_task = asyncio.create_task(self.alert_worker.run_forever())
         await asyncio.sleep(0)
-        LOGGER.info("radar pilot startup")
         try:
+            start_pipeline = getattr(self.pipeline, "start", None)
+            if callable(start_pipeline):
+                await start_pipeline()
+            LOGGER.info("radar pilot startup")
             while not event.is_set():
                 if await self._wait_until_next_boundary(event):
                     break
@@ -184,6 +187,12 @@ class RadarApplication:
                 except Exception as error:  # noqa: BLE001
                     LOGGER.error("application cycle failed", exc_info=error)
         finally:
+            try:
+                stop_pipeline = getattr(self.pipeline, "stop", None)
+                if callable(stop_pipeline):
+                    await stop_pipeline()
+            except Exception as error:  # noqa: BLE001
+                LOGGER.error("shutdown collectors stop failed", exc_info=error)
             try:
                 await self.flush_now()
             except Exception as error:  # noqa: BLE001

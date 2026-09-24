@@ -101,6 +101,14 @@ class RecordingPipeline:
         return 1
 
 
+class LifecycleRecordingPipeline(RecordingPipeline):
+    async def start(self) -> None:
+        self.events.append("pipeline.start")
+
+    async def stop(self) -> None:
+        self.events.append("pipeline.stop")
+
+
 class SmokePipeline:
     sampling_seconds = 10
 
@@ -252,6 +260,33 @@ async def test_application_shutdown_flushes_then_cancels_worker_then_closes_runt
     assert worker.cancelled.is_set()
     assert events == ["flush", "runtime.close"]
     assert runtime.closed
+
+
+@pytest.mark.asyncio
+async def test_application_starts_and_stops_pipeline_lifecycle_hooks():
+    from radar.app import RadarApplication
+
+    events: list[str] = []
+    pipeline = LifecycleRecordingPipeline(events)
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    runtime = FakeRuntimeStore(events)
+    app = RadarApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=runtime,  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    await app.run(stop_event=stop_event)
+
+    assert events[:2] == ["pipeline.start", "pipeline.stop"]
 
 
 def test_build_application_wires_monitor_runner_and_worker_to_one_queue(tmp_path):

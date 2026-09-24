@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -155,6 +156,78 @@ class FixtureTransport:
         raise AssertionError(f"unexpected request: {url} {params}")
 
 
+class FixtureWebSocket:
+    def __init__(self, messages: list[dict]) -> None:
+        self.sent: list[dict] = []
+        self.closed = False
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        for message in messages:
+            self.push(message)
+
+    def push(self, message: dict) -> None:
+        self._queue.put_nowait(json.dumps(message))
+
+    async def send(self, message: str) -> None:
+        self.sent.append(json.loads(message))
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._queue.put_nowait(None)
+
+    async def __aenter__(self) -> "FixtureWebSocket":
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        await self.close()
+
+    def __aiter__(self) -> "FixtureWebSocket":
+        return self
+
+    async def __anext__(self) -> str:
+        message = await self._queue.get()
+        if message is None:
+            raise StopAsyncIteration
+        return message
+
+
+def ws_snapshot(symbol: str, market_id: int, nonce: int = 1) -> dict:
+    payload = load_fixture(f"order_book_{symbol.lower()}.json")
+    return {
+        "type": "subscribed/order_book",
+        "channel": f"order_book:{market_id}",
+        "order_book": {
+            "code": 0,
+            "asks": [
+                {"price": order["price"], "size": order["remaining_base_amount"]}
+                for order in payload["asks"]
+            ],
+            "bids": [
+                {"price": order["price"], "size": order["remaining_base_amount"]}
+                for order in payload["bids"]
+            ],
+            "nonce": nonce,
+        },
+    }
+
+
+def fixture_websocket(*, include_symbols: tuple[str, ...] = ("btc", "eth", "sol")):
+    market_ids = {"btc": 1, "eth": 0, "sol": 2}
+    websocket = FixtureWebSocket(
+        [{"type": "connected"}]
+        + [ws_snapshot(symbol, market_ids[symbol]) for symbol in include_symbols]
+    )
+    return websocket, lambda _url: websocket
+
+
+async def wait_for_books(collector: LighterCollector, market_ids: tuple[int, ...]) -> None:
+    for _ in range(100):
+        if all(collector._order_book_feed.snapshot(market_id) is not None for market_id in market_ids):
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("fixture websocket books were not populated")
+
+
 @pytest.mark.parametrize(
     ("venue", "base_url"),
     [
@@ -167,17 +240,24 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
     venue: str, base_url: str
 ):
     transport = FixtureTransport(base_url)
+    websocket, websocket_connect = fixture_websocket()
     collector = LighterCollector(
         configured_markets(venue),
         venue=venue,
         base_url=base_url,
         request_json=transport,
         clock=lambda: OBSERVED_AT,
+        websocket_connect=websocket_connect,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=True
-    )
+    await collector.start()
+    await wait_for_books(collector, (1, 0, 2))
+    try:
+        batch = await collector.collect(
+            sample_time=SAMPLE_TIME, include_hourly_context=True
+        )
+    finally:
+        await collector.stop()
 
     assert [snapshot.canonical_symbol for snapshot in batch.market_snapshots] == [
         "BTC",
@@ -199,6 +279,11 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
     assert btc.sell_10k_vwap == pytest.approx(10000 / (60 + 4060 / 98))
     assert all(snapshot.venue == venue for snapshot in batch.market_snapshots)
     assert collector.base_url == base_url
+    assert collector.ws_url == (
+        "wss://api.rh.lighter.xyz/stream"
+        if venue == "lighter_robinhood"
+        else "wss://mainnet.zklighter.elliot.ai/stream"
+    )
     assert btc.sample_time == SAMPLE_TIME
     assert btc.observed_at == OBSERVED_AT
     assert btc.observed_at != btc.sample_time
@@ -217,8 +302,8 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
     assert btc_context.observed_at == OBSERVED_AT
 
     assert all(method == "GET" for _, method, _ in transport.calls)
-    assert sum(url == transport.order_book_details_url for url, _, _ in transport.calls) == 1
-    assert sum(url == transport.order_book_orders_url for url, _, _ in transport.calls) == 3
+    assert sum(url == transport.order_book_details_url for url, _, _ in transport.calls) == 2
+    assert sum(url == transport.order_book_orders_url for url, _, _ in transport.calls) == 0
     assert sum(url == transport.fundings_url for url, _, _ in transport.calls) == 3
 
 
@@ -234,32 +319,32 @@ async def test_lighter_collector_omits_symbol_when_its_book_request_fails(
     venue: str, base_url: str
 ):
     transport = FixtureTransport(base_url)
+    websocket, websocket_connect = fixture_websocket(include_symbols=("btc", "sol"))
     failures: list[tuple[str, Exception]] = []
-
-    async def failing_transport(url: str, *, method: str, json_body=None, params=None):
-        if url == transport.order_book_orders_url and params["market_id"] == 0:
-            raise OSError("temporary outage")
-        return await transport(url, method=method, json_body=json_body, params=params)
 
     collector = LighterCollector(
         configured_markets(venue),
         venue=venue,
         base_url=base_url,
-        request_json=failing_transport,
+        request_json=transport,
         clock=lambda: OBSERVED_AT,
+        websocket_connect=websocket_connect,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=False
-    )
+    await collector.start()
+    await wait_for_books(collector, (1, 2))
+    try:
+        batch = await collector.collect(
+            sample_time=SAMPLE_TIME, include_hourly_context=False
+        )
+    finally:
+        await collector.stop()
 
     assert {snapshot.canonical_symbol for snapshot in batch.market_snapshots} == {
         "BTC",
         "SOL",
     }
-    assert [(venue, str(error)) for venue, error in failures] == [
-        (venue, "temporary outage")
-    ]
+    assert failures == []
 
 
 @pytest.mark.parametrize(

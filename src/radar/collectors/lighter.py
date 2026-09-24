@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
+
+import websockets
 
 from radar.collectors.base import (
     CollectorBatch,
@@ -21,6 +24,8 @@ from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
 LIGHTER_ROBINHOOD_BASE_URL = "https://api.rh.lighter.xyz"
+LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
+LIGHTER_ROBINHOOD_WS_URL = "wss://api.rh.lighter.xyz/stream"
 
 
 @dataclass(frozen=True)
@@ -37,6 +42,281 @@ class LighterMarketDetail:
 class LighterFundingPoint:
     effective_time: datetime
     funding_rate: float
+
+
+@dataclass(frozen=True)
+class LighterOrderBookSnapshot:
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+    observed_at: datetime
+
+
+def _parse_lighter_ws_level(raw_level: object, side: str) -> tuple[float, float]:
+    if not isinstance(raw_level, dict):
+        raise ValueError(f"{side} websocket level must be an object")
+    price = positive_float(raw_level.get("price"), f"{side} price")
+    size = non_negative_float(raw_level.get("size"), f"{side} size")
+    return price, size
+
+
+def _parse_lighter_ws_levels(raw_levels: object, side: str) -> dict[float, float]:
+    if not isinstance(raw_levels, list):
+        raise ValueError(f"{side} websocket levels must be a list")
+    levels: dict[float, float] = {}
+    for raw_level in raw_levels:
+        price, size = _parse_lighter_ws_level(raw_level, side)
+        if size > 0:
+            levels[price] = levels.get(price, 0.0) + size
+    return levels
+
+
+def _parse_lighter_ws_nonce(raw_value: object, field_name: str) -> int:
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (str, int)):
+        raise ValueError(f"{field_name} must be an integer")
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return value
+
+
+class LighterOrderBookState:
+    """Mutable state for one Lighter order-book channel."""
+
+    def __init__(self, market_id: int) -> None:
+        self.market_id = market_id
+        self._bids: dict[float, float] = {}
+        self._asks: dict[float, float] = {}
+        self._last_nonce: int | None = None
+        self._observed_at: datetime | None = None
+
+    def clear(self) -> None:
+        self._bids.clear()
+        self._asks.clear()
+        self._last_nonce = None
+        self._observed_at = None
+
+    def apply_snapshot(self, raw_order_book: object, observed_at: datetime) -> None:
+        order_book = _validate_lighter_ws_order_book(raw_order_book)
+        self._asks = _parse_lighter_ws_levels(order_book.get("asks"), "ask")
+        self._bids = _parse_lighter_ws_levels(order_book.get("bids"), "bid")
+        self._last_nonce = _parse_lighter_ws_nonce(
+            order_book.get("nonce"), "snapshot nonce"
+        )
+        self._observed_at = observed_at
+
+    def apply_delta(self, raw_order_book: object, observed_at: datetime) -> None:
+        if self._last_nonce is None:
+            raise ValueError("order-book delta arrived before snapshot")
+        order_book = _validate_lighter_ws_order_book(raw_order_book)
+        begin_nonce = _parse_lighter_ws_nonce(
+            order_book.get("begin_nonce"), "delta begin_nonce"
+        )
+        nonce = _parse_lighter_ws_nonce(order_book.get("nonce"), "delta nonce")
+        if begin_nonce != self._last_nonce:
+            raise ValueError(
+                "order-book delta nonce gap: "
+                f"expected {self._last_nonce}, got {begin_nonce}"
+            )
+        if nonce < begin_nonce:
+            raise ValueError("delta nonce must not precede begin_nonce")
+        ask_updates = _parse_lighter_ws_levels_with_zero(
+            order_book.get("asks"), "ask"
+        )
+        bid_updates = _parse_lighter_ws_levels_with_zero(
+            order_book.get("bids"), "bid"
+        )
+        self._apply_updates(self._asks, ask_updates)
+        self._apply_updates(self._bids, bid_updates)
+        self._last_nonce = nonce
+        self._observed_at = observed_at
+
+    @staticmethod
+    def _apply_updates(
+        levels: dict[float, float], updates: list[tuple[float, float]]
+    ) -> None:
+        for price, size in updates:
+            if size == 0:
+                levels.pop(price, None)
+            else:
+                levels[price] = size
+
+    def snapshot(self) -> LighterOrderBookSnapshot | None:
+        if self._last_nonce is None or self._observed_at is None:
+            return None
+        bids = tuple(
+            BookLevel(price=price, base_size=size)
+            for price, size in sorted(self._bids.items(), reverse=True)
+        )
+        asks = tuple(
+            BookLevel(price=price, base_size=size)
+            for price, size in sorted(self._asks.items())
+        )
+        return LighterOrderBookSnapshot(
+            bids=bids,
+            asks=asks,
+            observed_at=self._observed_at,
+        )
+
+
+def _validate_lighter_ws_order_book(raw_order_book: object) -> dict[str, Any]:
+    if not isinstance(raw_order_book, dict):
+        raise ValueError("websocket order_book must be an object")
+    if raw_order_book.get("code") != 0:
+        raise ValueError("websocket order_book code must be 0")
+    return raw_order_book
+
+
+def _parse_lighter_ws_levels_with_zero(
+    raw_levels: object, side: str
+) -> list[tuple[float, float]]:
+    if not isinstance(raw_levels, list):
+        raise ValueError(f"{side} websocket levels must be a list")
+    return [_parse_lighter_ws_level(raw_level, side) for raw_level in raw_levels]
+
+
+class LighterOrderBookFeed:
+    """One persistent public WebSocket feed for a Lighter deployment."""
+
+    def __init__(
+        self,
+        ws_url: str,
+        market_ids: tuple[int, ...] | list[int],
+        *,
+        connect: Callable[[str], Any] = websockets.connect,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        error_handler: CollectorErrorHandler | None = None,
+        venue: str = "lighter",
+        reconnect_delay_seconds: float = 1.0,
+    ) -> None:
+        if reconnect_delay_seconds < 0:
+            raise ValueError("reconnect_delay_seconds must be non-negative")
+        self.ws_url = ws_url
+        self._market_ids = tuple(sorted(set(market_ids)))
+        self._connect = connect
+        self._clock = clock
+        self._error_handler = error_handler
+        self._venue = venue
+        self._reconnect_delay_seconds = reconnect_delay_seconds
+        self._states: dict[int, LighterOrderBookState] = {
+            market_id: LighterOrderBookState(market_id)
+            for market_id in self._market_ids
+        }
+        self._task: asyncio.Task[None] | None = None
+        self._websocket: Any | None = None
+        self._stopping = False
+        self.reconnect_count = 0
+
+    @property
+    def market_ids(self) -> tuple[int, ...]:
+        return self._market_ids
+
+    async def set_market_ids(self, market_ids: tuple[int, ...] | list[int]) -> None:
+        new_market_ids = tuple(sorted(set(market_ids)))
+        if new_market_ids == self._market_ids:
+            return
+        self._market_ids = new_market_ids
+        self._states = {
+            market_id: self._states.get(market_id, LighterOrderBookState(market_id))
+            for market_id in new_market_ids
+        }
+        if self._websocket is not None:
+            await self._websocket.close()
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stopping = False
+        self._clear_states()
+        if not self._market_ids:
+            return
+        self._task = asyncio.create_task(self._run(), name=f"{self._venue}-order-book")
+
+    async def stop(self) -> None:
+        self._stopping = True
+        if self._websocket is not None:
+            await self._websocket.close()
+        task = self._task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._task = None
+        self._websocket = None
+        self._clear_states()
+
+    def snapshot(self, market_id: int) -> LighterOrderBookSnapshot | None:
+        state = self._states.get(market_id)
+        return None if state is None else state.snapshot()
+
+    def _clear_states(self) -> None:
+        for state in self._states.values():
+            state.clear()
+
+    async def _run(self) -> None:
+        while not self._stopping:
+            self._clear_states()
+            try:
+                async with self._connect(self.ws_url) as websocket:
+                    self._websocket = websocket
+                    async for raw_message in websocket:
+                        await self._handle_message(websocket, raw_message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                report_collector_error(self._error_handler, self._venue, error)
+            finally:
+                self._websocket = None
+                self._clear_states()
+            if self._stopping:
+                return
+            self.reconnect_count += 1
+            await asyncio.sleep(self._reconnect_delay_seconds)
+
+    async def _handle_message(self, websocket: Any, raw_message: object) -> None:
+        received_at = self._clock()
+        if isinstance(raw_message, bytes):
+            raw_message = raw_message.decode()
+        if not isinstance(raw_message, str):
+            raise ValueError("websocket message must be text")
+        try:
+            message = json.loads(raw_message)
+        except json.JSONDecodeError as exc:
+            raise ValueError("websocket message must be valid JSON") from exc
+        if not isinstance(message, dict):
+            raise ValueError("websocket message must be an object")
+
+        message_type = message.get("type")
+        if message_type == "connected":
+            for market_id in self._market_ids:
+                await websocket.send(
+                    json.dumps(
+                        {"type": "subscribe", "channel": f"order_book/{market_id}"}
+                    )
+                )
+            return
+        if message_type == "ping":
+            await websocket.send(json.dumps({"type": "pong"}))
+            return
+        if message_type not in {"subscribed/order_book", "update/order_book"}:
+            raise ValueError(f"unexpected websocket message type: {message_type}")
+
+        market_id = self._market_id_from_channel(message.get("channel"))
+        state = self._states.get(market_id)
+        if state is None:
+            raise ValueError(f"websocket market {market_id} is not configured")
+        order_book = message.get("order_book")
+        if message_type == "subscribed/order_book":
+            state.apply_snapshot(order_book, received_at)
+        else:
+            state.apply_delta(order_book, received_at)
+
+    @staticmethod
+    def _market_id_from_channel(channel: object) -> int:
+        if not isinstance(channel, str) or not channel.startswith("order_book:"):
+            raise ValueError("websocket order-book channel is invalid")
+        return _parse_lighter_ws_nonce(channel.removeprefix("order_book:"), "market_id")
 
 
 def _require_success(payload: object, endpoint: str) -> dict[str, Any]:
@@ -147,6 +427,7 @@ def parse_lighter_fundings(payload: object) -> LighterFundingPoint | None:
 class LighterCollector:
     venue = "lighter"
     BASE_URL = "https://mainnet.zklighter.elliot.ai"
+    WS_URL = LIGHTER_WS_URL
     ORDER_BOOK_DETAILS_URL = f"{BASE_URL}/api/v1/orderBookDetails"
     ORDER_BOOK_ORDERS_URL = f"{BASE_URL}/api/v1/orderBookOrders"
     FUNDINGS_URL = f"{BASE_URL}/api/v1/fundings"
@@ -161,9 +442,18 @@ class LighterCollector:
         request_json=default_request_json,
         clock=lambda: datetime.now(UTC),
         error_handler: CollectorErrorHandler | None = None,
+        websocket_connect: Callable[[str], Any] = websockets.connect,
+        ws_url: str | None = None,
     ) -> None:
         self.venue = venue
         self.base_url = (self.BASE_URL if base_url is None else base_url).rstrip("/")
+        if ws_url is None:
+            ws_url = (
+                LIGHTER_ROBINHOOD_WS_URL
+                if self.venue == "lighter_robinhood"
+                else LIGHTER_WS_URL
+            )
+        self.ws_url = ws_url
         self.order_book_details_url = f"{self.base_url}/api/v1/orderBookDetails"
         self.order_book_orders_url = f"{self.base_url}/api/v1/orderBookOrders"
         self.fundings_url = f"{self.base_url}/api/v1/fundings"
@@ -171,18 +461,58 @@ class LighterCollector:
         self._request_json = request_json
         self._clock = clock
         self._error_handler = error_handler
+        self._order_book_feed = LighterOrderBookFeed(
+            self.ws_url,
+            (),
+            connect=websocket_connect,
+            clock=clock,
+            error_handler=error_handler,
+            venue=self.venue,
+        )
+        self._started = False
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        try:
+            details, _ = await self._fetch_market_details()
+            await self._sync_order_book_feed(details)
+        except Exception as error:  # noqa: BLE001
+            report_collector_error(self._error_handler, self.venue, error)
+
+    async def stop(self) -> None:
+        self._started = False
+        await self._order_book_feed.stop()
+
+    async def _fetch_market_details(
+        self,
+    ) -> tuple[dict[str, LighterMarketDetail], datetime]:
+        details_payload = await self._request_json(
+            self.order_book_details_url,
+            method="GET",
+            params={"filter": "perp"},
+        )
+        return parse_lighter_order_book_details(details_payload), self._clock()
+
+    async def _sync_order_book_feed(
+        self, details: dict[str, LighterMarketDetail]
+    ) -> None:
+        market_ids = tuple(
+            details[market.venue_symbol].market_id
+            for market in self._markets
+            if market.venue_symbol in details
+        )
+        await self._order_book_feed.set_market_ids(market_ids)
+        if not self._started:
+            await self._order_book_feed.start()
+            self._started = True
 
     async def collect(
         self, *, sample_time: datetime, include_hourly_context: bool
     ) -> CollectorBatch:
         try:
-            details_payload = await self._request_json(
-                self.order_book_details_url,
-                method="GET",
-                params={"filter": "perp"},
-            )
-            details = parse_lighter_order_book_details(details_payload)
-            details_observed_at = self._clock()
+            details, details_observed_at = await self._fetch_market_details()
+            await self._sync_order_book_feed(details)
         except Exception as error:  # noqa: BLE001
             report_collector_error(self._error_handler, self.venue, error)
             return CollectorBatch()
@@ -244,16 +574,11 @@ class LighterCollector:
         if detail is None:
             return None
         try:
-            payload = await self._request_json(
-                self.order_book_orders_url,
-                method="GET",
-                params={
-                    "market_id": detail.market_id,
-                    "limit": self.ORDER_BOOK_LIMIT,
-                },
-            )
-            bids, asks = parse_lighter_order_book_orders(payload)
-            observed_at = self._clock()
+            book = self._order_book_feed.snapshot(detail.market_id)
+            if book is None or not book.bids or not book.asks:
+                return None
+            bids, asks = list(book.bids), list(book.asks)
+            observed_at = book.observed_at
             return MarketSnapshot(
                 sample_time=sample_time,
                 observed_at=observed_at,

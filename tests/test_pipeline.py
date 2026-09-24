@@ -118,6 +118,31 @@ class CadenceCollector:
         return CollectorBatch()
 
 
+class LifecycleCollector(CadenceCollector):
+    def __init__(self):
+        super().__init__()
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+@pytest.mark.asyncio
+async def test_pipeline_starts_and_stops_collectors_with_optional_lifecycle_hooks():
+    collector = LifecycleCollector()
+    pipeline = MarketDataPipeline([collector], RadarState(), sampling_seconds=10)
+
+    await pipeline.start()
+    await pipeline.stop()
+
+    assert collector.started
+    assert collector.stopped
+
+
 def test_collector_protocol_is_structural():
     assert isinstance(SuccessfulCollector(), Collector)
 
