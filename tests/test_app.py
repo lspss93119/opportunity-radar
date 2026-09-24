@@ -55,10 +55,11 @@ class RecordingRunner:
 
 
 class FakeWorker:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
         self.running = asyncio.Event()
+        self.events = events
 
     async def run_forever(self) -> None:
         self.started.set()
@@ -67,6 +68,8 @@ class FakeWorker:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             self.cancelled.set()
+            if self.events is not None:
+                self.events.append("worker.stop")
             raise
 
 
@@ -93,8 +96,11 @@ class RecordingPipeline:
         self.flush_calls: list[datetime] = []
 
     async def collect_once(self, *, now: datetime) -> CollectorBatch:
-        self.events.append("collect")
+        self.events.append("pipeline.append")
         return CollectorBatch()
+
+    async def stop(self) -> None:
+        self.events.append("pipeline.stop")
 
     def flush_storage(self, *, now: datetime | None = None) -> int:
         assert now is not None
@@ -120,6 +126,18 @@ class SmokePipeline:
         self.collect_calls: list[datetime] = []
         self.flush_calls: list[datetime] = []
 
+    async def start(self) -> None:
+        return None
+
+    async def wait_for_market_feeds(
+        self,
+        canonical_symbol: str,
+        *,
+        required_venues: int = 2,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        return None
+
     async def collect_once(self, *, now: datetime) -> CollectorBatch:
         self.collect_calls.append(now)
         self.state.apply(self.batch, replace_context=True)
@@ -129,6 +147,76 @@ class SmokePipeline:
         assert now is not None
         self.flush_calls.append(now)
         return 1
+
+    async def stop(self) -> None:
+        return None
+
+
+class SmokePipelineWithEvents:
+    sampling_seconds = 10
+
+    def __init__(
+        self,
+        state: RadarState,
+        batch: CollectorBatch,
+        events: list[str],
+    ) -> None:
+        self.state = state
+        self.batch = batch
+        self.events = events
+
+    async def start(self) -> None:
+        self.events.append("start")
+
+    async def wait_for_market_feeds(
+        self,
+        canonical_symbol: str,
+        *,
+        required_venues: int = 2,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        self.events.append(f"wait_for_market_feeds:{canonical_symbol}")
+
+    async def collect_once(self, *, now: datetime) -> CollectorBatch:
+        self.events.append("collect_once")
+        self.state.apply(self.batch, replace_context=True)
+        return self.batch
+
+    async def stop(self) -> None:
+        self.events.append("stop")
+
+    def flush_storage(self, *, now: datetime | None = None) -> int:
+        assert now is not None
+        self.events.append("flush")
+        return 1
+
+
+class RecordingProcessor:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def process(self, alert: AlertRequest) -> None:
+        self.events.append("process")
+
+
+def make_smoke_application(
+    pipeline: SmokePipelineWithEvents,
+    events: list[str],
+):
+    from radar.app import RadarApplication
+
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    return RadarApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=FakeRuntimeStore(events),  # type: ignore[arg-type]
+        processor=RecordingProcessor(events),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
 
 
 def make_smoke_market(
@@ -250,7 +338,7 @@ async def test_application_flushes_at_interval_not_after_each_sample():
 
 
 @pytest.mark.asyncio
-async def test_application_shutdown_flushes_then_cancels_worker_then_closes_runtime():
+async def test_application_shutdown_orders_pipeline_flush_worker_and_runtime():
     from radar.app import RadarApplication
 
     events: list[str] = []
@@ -258,7 +346,7 @@ async def test_application_shutdown_flushes_then_cancels_worker_then_closes_runt
     queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
     runner = RecordingRunner(queue)
     runner.state = pipeline.state
-    worker = FakeWorker()
+    worker = FakeWorker(events)
     runtime = FakeRuntimeStore(events)
     app = RadarApplication(
         pipeline=pipeline,  # type: ignore[arg-type]
@@ -275,7 +363,9 @@ async def test_application_shutdown_flushes_then_cancels_worker_then_closes_runt
     await app.run(stop_event=stop_event)
 
     assert worker.cancelled.is_set()
-    assert events == ["flush", "runtime.close"]
+    assert events == ["pipeline.stop", "flush", "worker.stop", "runtime.close"]
+    flush_index = events.index("flush")
+    assert "pipeline.append" not in events[flush_index + 1 :]
     assert runtime.closed
 
 
@@ -406,6 +496,82 @@ async def test_telegram_smoke_collects_flushes_and_uses_real_processor():
     assert len(telegram.chart_calls) == 1
     assert telegram.text_calls == []
     assert runtime.closed
+
+
+@pytest.mark.asyncio
+async def test_telegram_smoke_starts_waits_samples_and_stops_pipeline(monkeypatch):
+    from radar import app as app_module
+    from radar.app import run_telegram_smoke
+
+    events: list[str] = []
+    state = RadarState()
+    batch = CollectorBatch(
+        market_snapshots=(
+            make_smoke_market("lighter", buy_10k_vwap=100.0, sell_10k_vwap=101.0),
+            make_smoke_market("hyperliquid", buy_10k_vwap=100.5, sell_10k_vwap=101.5),
+        )
+    )
+    pipeline = SmokePipelineWithEvents(state, batch, events)
+    application = make_smoke_application(pipeline, events)
+
+    real_build_alert = app_module.build_telegram_smoke_alert
+
+    def build_alert(*args, **kwargs):
+        events.append("build_alert")
+        return real_build_alert(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "build_telegram_smoke_alert", build_alert)
+
+    await run_telegram_smoke(application, symbol="BTC", now=NOW)
+
+    assert events == [
+        "start",
+        "wait_for_market_feeds:BTC",
+        "collect_once",
+        "build_alert",
+        "stop",
+        "flush",
+        "process",
+        "runtime.close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_smoke_cleanup_runs_when_readiness_fails():
+    from radar.app import run_telegram_smoke
+
+    class FailingReadinessPipeline(SmokePipelineWithEvents):
+        async def wait_for_market_feeds(
+            self,
+            canonical_symbol: str,
+            *,
+            required_venues: int = 2,
+            timeout_seconds: float = 30.0,
+        ) -> None:
+            self.events.append(f"wait_for_market_feeds:{canonical_symbol}")
+            raise TimeoutError("readiness timeout")
+
+    events: list[str] = []
+    state = RadarState()
+    batch = CollectorBatch()
+    pipeline = FailingReadinessPipeline(state, batch, events)
+    application = make_smoke_application(pipeline, events)
+
+    with pytest.raises(TimeoutError, match="readiness timeout"):
+        await run_telegram_smoke(
+            application,
+            symbol="BTC",
+            now=NOW,
+            readiness_timeout_seconds=0.01,
+        )
+
+    assert events == [
+        "start",
+        "wait_for_market_feeds:BTC",
+        "stop",
+        "flush",
+        "runtime.close",
+    ]
 
 
 def test_main_dispatches_telegram_smoke(monkeypatch, tmp_path):

@@ -187,6 +187,7 @@ class RadarApplication:
                 except Exception as error:  # noqa: BLE001
                     LOGGER.error("application cycle failed", exc_info=error)
         finally:
+            event.set()
             try:
                 stop_pipeline = getattr(self.pipeline, "stop", None)
                 if callable(stop_pipeline):
@@ -333,19 +334,28 @@ async def run_telegram_smoke(
     *,
     symbol: str = "BTC",
     now: datetime | None = None,
+    readiness_timeout_seconds: float = 30.0,
 ) -> None:
-    current_time = _as_utc(
-        application.clock() if now is None else now,
-        "now",
-    )
+    current_time: datetime | None = None
+    alert: AlertRequest | None = None
     try:
+        await application.pipeline.start()
+        canonical_symbol = symbol.strip().upper()
+        await application.pipeline.wait_for_market_feeds(
+            canonical_symbol,
+            required_venues=2,
+            timeout_seconds=readiness_timeout_seconds,
+        )
+        current_time = _as_utc(
+            application.clock() if now is None else now,
+            "now",
+        )
         batch = await application.pipeline.collect_once(now=current_time)
         application.stats.collection_cycles += 1
         if batch.market_snapshots:
             application.stats.latest_sample_time = max(
                 snapshot.sample_time for snapshot in batch.market_snapshots
             )
-        await application.flush_now(current_time)
         alert = build_telegram_smoke_alert(
             application.config,
             application.pipeline.state,
@@ -357,9 +367,20 @@ async def run_telegram_smoke(
             alert.payload["canonical_symbol"],
             alert.payload["sample_time"],
         )
-        await application.processor.process(alert)
     finally:
-        application.runtime_store.close()
+        try:
+            await application.pipeline.stop()
+        except Exception as error:  # noqa: BLE001
+            LOGGER.error("telegram smoke pipeline stop failed", exc_info=error)
+        try:
+            await application.flush_now(current_time)
+        except Exception as error:  # noqa: BLE001
+            LOGGER.error("telegram smoke Parquet flush failed", exc_info=error)
+        try:
+            if alert is not None:
+                await application.processor.process(alert)
+        finally:
+            application.runtime_store.close()
 
 
 def build_application(
