@@ -97,6 +97,10 @@ class RecordingPipeline:
 
     async def collect_once(self, *, now: datetime) -> CollectorBatch:
         self.events.append("pipeline.append")
+        shutdown_event = getattr(self, "shutdown_event", None)
+        if shutdown_event is not None:
+            self.events.append("shutdown.requested")
+            shutdown_event.set()
         return CollectorBatch()
 
     async def stop(self) -> None:
@@ -341,6 +345,18 @@ async def test_application_flushes_at_interval_not_after_each_sample():
 async def test_application_shutdown_orders_pipeline_flush_worker_and_runtime():
     from radar.app import RadarApplication
 
+    class OneCycleApplication(RadarApplication):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.boundary_calls = 0
+
+        async def _wait_until_next_boundary(self, stop_event: asyncio.Event) -> bool:
+            self.boundary_calls += 1
+            if self.boundary_calls == 1:
+                return False
+            stop_event.set()
+            return True
+
     events: list[str] = []
     pipeline = RecordingPipeline(events)
     queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
@@ -348,7 +364,9 @@ async def test_application_shutdown_orders_pipeline_flush_worker_and_runtime():
     runner.state = pipeline.state
     worker = FakeWorker(events)
     runtime = FakeRuntimeStore(events)
-    app = RadarApplication(
+    stop_event = asyncio.Event()
+    pipeline.shutdown_event = stop_event
+    app = OneCycleApplication(
         pipeline=pipeline,  # type: ignore[arg-type]
         monitor_runner=runner,  # type: ignore[arg-type]
         alert_worker=worker,  # type: ignore[arg-type]
@@ -357,14 +375,21 @@ async def test_application_shutdown_orders_pipeline_flush_worker_and_runtime():
         processor=object(),  # type: ignore[arg-type]
         clock=lambda: NOW,
     )
-    stop_event = asyncio.Event()
-    stop_event.set()
 
     await app.run(stop_event=stop_event)
 
     assert worker.cancelled.is_set()
-    assert events == ["pipeline.stop", "flush", "worker.stop", "runtime.close"]
+    assert events == [
+        "pipeline.append",
+        "shutdown.requested",
+        "pipeline.stop",
+        "flush",
+        "worker.stop",
+        "runtime.close",
+    ]
+    append_index = events.index("pipeline.append")
     flush_index = events.index("flush")
+    assert append_index < flush_index
     assert "pipeline.append" not in events[flush_index + 1 :]
     assert runtime.closed
 
