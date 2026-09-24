@@ -3,12 +3,15 @@ from datetime import datetime, timezone
 
 import pytest
 
+from radar.collectors.base import CollectorBatch
 from radar.collectors.arcus import ArcusCollector
 from radar.collectors.backpack import BackpackCollector
 from radar.collectors.hyperliquid import HyperliquidCollector
 from radar.collectors.lighter import LighterCollector
 from radar.config import MarketConfig
-from radar.pipeline import aligned_sample_time
+from radar.market_data import LatestMarketData
+from radar.pipeline import MarketDataPipeline
+from radar.state import RadarState
 
 UTC = timezone.utc
 
@@ -110,22 +113,36 @@ def assert_live_market_batch(batch, venue: str, sample_time: datetime) -> None:
     }
 
 
-async def collect_lighter_live(
-    collector: LighterCollector, sample_time: datetime, expected_count: int
+async def collect_managed_live(
+    collector,
+    markets: list[MarketConfig],
+    latest: LatestMarketData,
+    expected_count: int,
 ):
+    pipeline = MarketDataPipeline(
+        [collector],
+        RadarState(),
+        markets=markets,
+        latest_market_data=latest,
+    )
     await collector.start()
     try:
         for _ in range(100):
-            ready = sum(
-                collector._order_book_feed.snapshot(market_id) is not None
-                for market_id in collector._order_book_feed.market_ids
-            )
-            if ready >= expected_count:
+            now = datetime.now(UTC)
+            probe = await pipeline.collect_once(now=now)
+            if len(probe.market_snapshots) == expected_count:
                 break
             await asyncio.sleep(0.1)
-        return await collector.collect(
-            sample_time=sample_time,
-            include_hourly_context=True,
+        else:
+            raise AssertionError("live cache books were not populated")
+
+        market_batch = await pipeline.collect_once(now=datetime.now(UTC))
+        sample_time = market_batch.market_snapshots[0].sample_time
+        hourly_batch = await collector.collect_hourly(sample_time=sample_time)
+        return CollectorBatch(
+            market_snapshots=market_batch.market_snapshots,
+            funding_snapshots=hourly_batch.funding_snapshots,
+            hourly_contexts=hourly_batch.hourly_contexts,
         )
     finally:
         await collector.stop()
@@ -134,33 +151,40 @@ async def collect_lighter_live(
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_hyperliquid_public_read_only_live_smoke():
-    now = datetime.now(UTC)
-    sample_time = aligned_sample_time(now, 10)
-    batch = await HyperliquidCollector(configured_markets("hyperliquid")).collect(
-        sample_time=sample_time,
-        include_hourly_context=True,
+    markets = configured_markets("hyperliquid")
+    latest = LatestMarketData()
+    batch = await collect_managed_live(
+        HyperliquidCollector(markets, latest_market_data=latest),
+        markets,
+        latest,
+        len(markets),
     )
 
-    assert_live_market_batch(batch, "hyperliquid", sample_time)
+    assert_live_market_batch(
+        batch, "hyperliquid", batch.market_snapshots[0].sample_time
+    )
 
 
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_lighter_public_read_only_live_smoke():
-    now = datetime.now(UTC)
-    sample_time = aligned_sample_time(now, 10)
-    batch = await collect_lighter_live(
-        LighterCollector(configured_markets("lighter")), sample_time, 3
+    markets = configured_markets("lighter")
+    latest = LatestMarketData()
+    batch = await collect_managed_live(
+        LighterCollector(markets, latest_market_data=latest),
+        markets,
+        latest,
+        3,
     )
 
-    assert_live_market_batch(batch, "lighter", sample_time)
+    assert_live_market_batch(batch, "lighter", batch.market_snapshots[0].sample_time)
 
 
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_lighter_robinhood_public_read_only_live_smoke():
-    now = datetime.now(UTC)
-    sample_time = aligned_sample_time(now, 10)
+    markets = configured_lighter_robinhood_markets()
+    latest = LatestMarketData()
     expected_symbols = {
         "BTC",
         "ETH",
@@ -173,15 +197,18 @@ async def test_lighter_robinhood_public_read_only_live_smoke():
         "META",
         "MU",
     }
-    batch = await collect_lighter_live(
+    batch = await collect_managed_live(
         LighterCollector(
-            configured_lighter_robinhood_markets(),
+            markets,
             venue="lighter_robinhood",
             base_url="https://api.rh.lighter.xyz",
+            latest_market_data=latest,
         ),
-        sample_time,
+        markets,
+        latest,
         len(expected_symbols),
     )
+    sample_time = batch.market_snapshots[0].sample_time
 
     assert {snapshot.canonical_symbol for snapshot in batch.market_snapshots} == expected_symbols
     assert {snapshot.venue_symbol for snapshot in batch.market_snapshots} == expected_symbols
@@ -208,20 +235,26 @@ async def test_lighter_robinhood_public_read_only_live_smoke():
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_trade_xyz_hip3_public_read_only_live_smoke_matches_lighter_tsla():
-    now = datetime.now(UTC)
-    sample_time = aligned_sample_time(now, 10)
-    lighter_batch = await collect_lighter_live(
-        LighterCollector(configured_tsla_markets("lighter", "TSLA")),
-        sample_time,
+    lighter_markets = configured_tsla_markets("lighter", "TSLA")
+    lighter_latest = LatestMarketData()
+    lighter_batch = await collect_managed_live(
+        LighterCollector(lighter_markets, latest_market_data=lighter_latest),
+        lighter_markets,
+        lighter_latest,
         1,
     )
-    hip3_batch = await HyperliquidCollector(
-        configured_tsla_markets("trade_xyz", "xyz:TSLA"),
-        venue="trade_xyz",
-        dex="xyz",
-    ).collect(
-        sample_time=sample_time,
-        include_hourly_context=True,
+    hip3_markets = configured_tsla_markets("trade_xyz", "xyz:TSLA")
+    hip3_latest = LatestMarketData()
+    hip3_batch = await collect_managed_live(
+        HyperliquidCollector(
+            hip3_markets,
+            venue="trade_xyz",
+            dex="xyz",
+            latest_market_data=hip3_latest,
+        ),
+        hip3_markets,
+        hip3_latest,
+        1,
     )
 
     lighter = lighter_batch.market_snapshots[0]
@@ -240,7 +273,7 @@ async def test_trade_xyz_hip3_public_read_only_live_smoke_matches_lighter_tsla()
     assert {item.canonical_symbol for item in hip3_batch.funding_snapshots} == {"TSLA"}
     assert {item.canonical_symbol for item in lighter_batch.hourly_contexts} == {"TSLA"}
     assert {item.canonical_symbol for item in hip3_batch.hourly_contexts} == {"TSLA"}
-    assert lighter.sample_time == hip3.sample_time == sample_time
+    assert lighter.sample_time == hip3.sample_time
     assert lighter.observed_at.tzinfo is not None
     assert hip3.observed_at.tzinfo is not None
 
@@ -248,13 +281,20 @@ async def test_trade_xyz_hip3_public_read_only_live_smoke_matches_lighter_tsla()
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_entropy_io_sndk_public_read_only_live_smoke():
-    now = datetime.now(UTC)
-    sample_time = aligned_sample_time(now, 10)
-    batch = await HyperliquidCollector(
-        configured_entropy_markets(),
-        venue="entropy",
-        dex="io",
-    ).collect(sample_time=sample_time, include_hourly_context=True)
+    markets = configured_entropy_markets()
+    latest = LatestMarketData()
+    batch = await collect_managed_live(
+        HyperliquidCollector(
+            markets,
+            venue="entropy",
+            dex="io",
+            latest_market_data=latest,
+        ),
+        markets,
+        latest,
+        1,
+    )
+    sample_time = batch.market_snapshots[0].sample_time
 
     assert {snapshot.canonical_symbol for snapshot in batch.market_snapshots} == {"SNDK"}
     snapshot = batch.market_snapshots[0]
@@ -280,12 +320,16 @@ async def test_entropy_io_sndk_public_read_only_live_smoke():
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_arcus_exact_equity_universe_public_read_only_live_smoke():
-    now = datetime.now(UTC)
-    sample_time = aligned_sample_time(now, 10)
+    markets = configured_arcus_markets()
+    latest = LatestMarketData()
     expected_symbols = {"SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU"}
-    batch = await ArcusCollector(configured_arcus_markets()).collect(
-        sample_time=sample_time, include_hourly_context=True
+    batch = await collect_managed_live(
+        ArcusCollector(markets, latest_market_data=latest),
+        markets,
+        latest,
+        len(expected_symbols),
     )
+    sample_time = batch.market_snapshots[0].sample_time
 
     assert {snapshot.canonical_symbol for snapshot in batch.market_snapshots} == expected_symbols
     assert all(snapshot.venue == "arcus" for snapshot in batch.market_snapshots)
@@ -308,13 +352,16 @@ async def test_arcus_exact_equity_universe_public_read_only_live_smoke():
 @pytest.mark.live
 @pytest.mark.asyncio
 async def test_backpack_exact_equity_universe_public_read_only_live_smoke():
-    now = datetime.now(UTC)
-    sample_time = aligned_sample_time(now, 10)
+    markets = configured_backpack_markets()
+    latest = LatestMarketData()
     expected_symbols = {"SNDK", "NVDA", "TSLA", "HOOD", "GOOGL", "AAPL", "META", "MU"}
-    batch = await BackpackCollector(configured_backpack_markets()).collect(
-        sample_time=sample_time,
-        include_hourly_context=True,
+    batch = await collect_managed_live(
+        BackpackCollector(markets, latest_market_data=latest),
+        markets,
+        latest,
+        len(expected_symbols),
     )
+    sample_time = batch.market_snapshots[0].sample_time
 
     assert {snapshot.canonical_symbol for snapshot in batch.market_snapshots} == expected_symbols
     assert all(snapshot.venue == "backpack" for snapshot in batch.market_snapshots)

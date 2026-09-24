@@ -137,7 +137,10 @@ class MarketDataPipeline:
             LighterCollector,
         )
 
-        collector_kwargs = {} if request_json is None else {"request_json": request_json}
+        latest_market_data = LatestMarketData()
+        collector_kwargs = {"latest_market_data": latest_market_data}
+        if request_json is not None:
+            collector_kwargs["request_json"] = request_json
         collectors: list[CollectorLike] = [
             LighterCollector(
                 config.markets,
@@ -209,7 +212,7 @@ class MarketDataPipeline:
             collectors,
             RadarState() if state is None else state,
             markets=config.markets,
-            latest_market_data=LatestMarketData(),
+            latest_market_data=latest_market_data,
             sampling_seconds=config.sampling_seconds,
             clock=clock,
             storage=storage,
@@ -274,6 +277,14 @@ class MarketDataPipeline:
             sample_time=sample_time,
             now=current_time,
             stale_after_seconds=self._stale_after_seconds,
+        )
+        batch = CollectorBatch(
+            market_snapshots=tuple(
+                snapshot
+                for snapshot in batch.market_snapshots
+                if snapshot.buy_10k_vwap is not None
+                and snapshot.sell_10k_vwap is not None
+            )
         )
         self.state.apply_market_batch(batch)
         if self.storage is not None:

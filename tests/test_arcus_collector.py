@@ -130,6 +130,34 @@ class MetadataFailureTransport(FixtureTransport):
         )
 
 
+async def wait_for_ready_cache(
+    latest: LatestMarketData, markets: list[MarketConfig]
+) -> None:
+    for _ in range(100):
+        if all(
+            latest._views.get((market.venue, market.venue_symbol)) is not None
+            and latest._views[(market.venue, market.venue_symbol)].ready
+            for market in markets
+        ):
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("Arcus cache books were not populated")
+
+
+def cache_pipeline(
+    collector: ArcusCollector,
+    markets: list[MarketConfig],
+    latest: LatestMarketData,
+) -> MarketDataPipeline:
+    return MarketDataPipeline(
+        [collector],
+        RadarState(),
+        markets=markets,
+        latest_market_data=latest,
+        clock=lambda: OBSERVED_AT,
+    )
+
+
 @pytest.mark.asyncio
 async def test_arcus_background_refresh_does_not_block_cache_sampler():
     transport = BlockingMetadataTransport()
@@ -280,21 +308,29 @@ async def test_arcus_refresh_keeps_hourly_funding_and_context_separate():
 @pytest.mark.asyncio
 async def test_arcus_collector_normalizes_market_funding_context_and_executable_vwap():
     transport = FixtureTransport()
+    latest = LatestMarketData()
+    markets = configured_markets()
     collector = ArcusCollector(
-        configured_markets(),
+        markets,
         request_json=transport,
         clock=lambda: OBSERVED_AT,
+        latest_market_data=latest,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=True
-    )
+    pipeline = cache_pipeline(collector, markets, latest)
+    try:
+        await collector.start()
+        await wait_for_ready_cache(latest, markets)
+        market_batch = await pipeline.collect_once(now=OBSERVED_AT)
+        hourly_batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+    finally:
+        await collector.stop()
 
-    assert [snapshot.canonical_symbol for snapshot in batch.market_snapshots] == [
+    assert [snapshot.canonical_symbol for snapshot in market_batch.market_snapshots] == [
         "SNDK",
         "NVDA",
     ]
-    sndk = batch.market_snapshots[0]
+    sndk = market_batch.market_snapshots[0]
     assert sndk.venue == "arcus"
     assert sndk.venue_symbol == "SNDK-USD"
     assert sndk.best_bid == 1876.19
@@ -309,22 +345,22 @@ async def test_arcus_collector_normalizes_market_funding_context_and_executable_
     assert sndk.sell_10k_vwap is not None
     assert sndk.observed_at == OBSERVED_AT
 
-    assert len(batch.funding_snapshots) == 1
-    funding = batch.funding_snapshots[0]
+    assert len(hourly_batch.funding_snapshots) == 1
+    funding = hourly_batch.funding_snapshots[0]
     assert funding.canonical_symbol == "SNDK"
     assert funding.effective_time == datetime.fromtimestamp(1790128800, tz=UTC)
     assert funding.next_funding_time == datetime.fromtimestamp(1790132400, tz=UTC)
     assert funding.observed_at == OBSERVED_AT
 
-    assert [context.canonical_symbol for context in batch.hourly_contexts] == [
+    assert [context.canonical_symbol for context in hourly_batch.hourly_contexts] == [
         "SNDK",
         "NVDA",
     ]
-    assert batch.hourly_contexts[0].sample_time == datetime(
+    assert hourly_batch.hourly_contexts[0].sample_time == datetime(
         2026, 9, 15, 10, 0, tzinfo=UTC
     )
-    assert batch.hourly_contexts[0].open_interest == 117.5023163
-    assert batch.hourly_contexts[0].volume_24h == 1149567.4
+    assert hourly_batch.hourly_contexts[0].open_interest == 117.5023163
+    assert hourly_batch.hourly_contexts[0].volume_24h == 1149567.4
 
     assert sum(url == ArcusCollector.MARKETS_URL for url, _, _ in transport.calls) == 1
     assert sum(url.startswith(ArcusCollector.L2_ORDER_BOOK_URL) for url, _, _ in transport.calls) == 2
@@ -336,6 +372,8 @@ async def test_arcus_collector_normalizes_market_funding_context_and_executable_
 async def test_arcus_collector_omits_only_symbol_when_its_book_request_fails():
     transport = FixtureTransport()
     failures: list[tuple[str, Exception]] = []
+    latest = LatestMarketData()
+    markets = configured_markets()
 
     async def failing_transport(url: str, *, method: str, json_body=None, params=None):
         if url.endswith("NVDA-USD"):
@@ -343,14 +381,19 @@ async def test_arcus_collector_omits_only_symbol_when_its_book_request_fails():
         return await transport(url, method=method, json_body=json_body, params=params)
 
     collector = ArcusCollector(
-        configured_markets(),
+        markets,
         request_json=failing_transport,
         clock=lambda: OBSERVED_AT,
         error_handler=lambda venue, error: failures.append((venue, error)),
+        latest_market_data=latest,
     )
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=False
-    )
+    pipeline = cache_pipeline(collector, markets, latest)
+    try:
+        await collector.start()
+        await wait_for_ready_cache(latest, markets[:1])
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
+    finally:
+        await collector.stop()
 
     assert [snapshot.canonical_symbol for snapshot in batch.market_snapshots] == ["SNDK"]
     assert [(venue, str(error)) for venue, error in failures] == [
@@ -365,19 +408,30 @@ async def test_arcus_collector_returns_empty_batch_when_metadata_fails():
     async def failing_transport(url: str, *, method: str, json_body=None, params=None):
         raise OSError("Arcus metadata unavailable")
 
+    latest = LatestMarketData()
+    markets = configured_markets()
     collector = ArcusCollector(
-        configured_markets(),
+        markets,
         request_json=failing_transport,
         error_handler=lambda venue, error: failures.append((venue, error)),
+        latest_market_data=latest,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=True
-    )
+    pipeline = cache_pipeline(collector, markets, latest)
+    try:
+        await collector.start()
+        for _ in range(100):
+            if failures:
+                break
+            await asyncio.sleep(0)
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
+        hourly_batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+    finally:
+        await collector.stop()
 
     assert batch.market_snapshots == ()
-    assert batch.funding_snapshots == ()
-    assert batch.hourly_contexts == ()
+    assert hourly_batch.funding_snapshots == ()
+    assert hourly_batch.hourly_contexts == ()
     assert [(venue, str(error)) for venue, error in failures] == [
         ("arcus", "Arcus metadata unavailable")
     ]
@@ -394,20 +448,21 @@ async def test_arcus_collector_marks_unfilled_vwap_targets_unavailable():
                 }
             return await super().__call__(url, method=method, json_body=json_body, params=params)
 
+    latest = LatestMarketData()
+    markets = configured_markets()[:1]
     collector = ArcusCollector(
-        configured_markets()[:1],
+        markets,
         request_json=SparseTransport(),
         clock=lambda: OBSERVED_AT,
+        latest_market_data=latest,
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=False
-    )
+    pipeline = cache_pipeline(collector, markets, latest)
+    try:
+        await collector.start()
+        await wait_for_ready_cache(latest, markets)
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
+    finally:
+        await collector.stop()
 
-    snapshot = batch.market_snapshots[0]
-    assert snapshot.buy_1k_vwap is None
-    assert snapshot.sell_1k_vwap is None
-    assert snapshot.buy_5k_vwap is None
-    assert snapshot.sell_5k_vwap is None
-    assert snapshot.buy_10k_vwap is None
-    assert snapshot.sell_10k_vwap is None
+    assert batch.market_snapshots == ()

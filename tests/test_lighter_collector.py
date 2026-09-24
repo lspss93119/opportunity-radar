@@ -13,6 +13,8 @@ from radar.collectors.lighter import (
 )
 from radar.config import MarketConfig
 from radar.market_data import LatestMarketData
+from radar.pipeline import MarketDataPipeline
+from radar.state import RadarState
 
 UTC = timezone.utc
 FIXTURES = Path(__file__).parent / "fixtures" / "lighter"
@@ -246,6 +248,20 @@ async def wait_for_books(collector: LighterCollector, market_ids: tuple[int, ...
     raise AssertionError("fixture websocket books were not populated")
 
 
+def cache_pipeline(
+    collector: LighterCollector,
+    markets: list[MarketConfig],
+    latest: LatestMarketData,
+) -> MarketDataPipeline:
+    return MarketDataPipeline(
+        [collector],
+        RadarState(),
+        markets=markets,
+        latest_market_data=latest,
+        clock=lambda: OBSERVED_AT,
+    )
+
+
 @pytest.mark.parametrize(
     ("venue", "base_url"),
     [
@@ -270,16 +286,13 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
         latest_market_data=latest,
     )
 
-    await collector.start()
-    await wait_for_books(collector, (1, 0, 2))
+    markets = configured_markets(venue)
+    pipeline = cache_pipeline(collector, markets, latest)
     try:
+        await collector.start()
+        await wait_for_books(collector, (1, 0, 2))
+        market_batch = await pipeline.collect_once(now=OBSERVED_AT)
         batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
-        market_batch = latest.build_batch(
-            configured_markets(venue),
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
     finally:
         await collector.stop()
 
@@ -302,7 +315,7 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
     assert btc.sell_5k_vwap == pytest.approx(99.0)
     assert btc.buy_10k_vwap == pytest.approx(10000 / (60 + 4000 / 101))
     assert btc.sell_10k_vwap == pytest.approx(10000 / (60 + 4060 / 98))
-    assert all(snapshot.venue == venue for snapshot in batch.market_snapshots)
+    assert all(snapshot.venue == venue for snapshot in market_batch.market_snapshots)
     assert collector.base_url == base_url
     assert collector.ws_url == (
         "wss://api.rh.lighter.xyz/stream"
@@ -346,6 +359,7 @@ async def test_lighter_collector_omits_symbol_when_its_book_request_fails(
     transport = FixtureTransport(base_url)
     websocket, websocket_connect = fixture_websocket(include_symbols=("btc", "sol"))
     failures: list[tuple[str, Exception]] = []
+    latest = LatestMarketData()
 
     collector = LighterCollector(
         configured_markets(venue),
@@ -354,14 +368,15 @@ async def test_lighter_collector_omits_symbol_when_its_book_request_fails(
         request_json=transport,
         clock=lambda: OBSERVED_AT,
         websocket_connect=websocket_connect,
+        latest_market_data=latest,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
-    await collector.start()
-    await wait_for_books(collector, (1, 2))
+    markets = configured_markets(venue)
+    pipeline = cache_pipeline(collector, markets, latest)
     try:
-        batch = await collector.collect(
-            sample_time=SAMPLE_TIME, include_hourly_context=False
-        )
+        await collector.start()
+        await wait_for_books(collector, (1, 2))
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
     finally:
         await collector.stop()
 
@@ -439,18 +454,14 @@ async def test_lighter_metadata_failure_preserves_ready_cache_book(
         latest_market_data=latest,
     )
 
-    await collector.start()
-    await wait_for_books(collector, (1,))
+    markets = [MarketConfig(venue=venue, venue_symbol="BTC", canonical_symbol="BTC")]
+    pipeline = cache_pipeline(collector, markets, latest)
     try:
+        await collector.start()
+        await wait_for_books(collector, (1,))
         transport.fail_details = True
         await collector._refresh_metadata_once()
-
-        batch = latest.build_batch(
-            [MarketConfig(venue=venue, venue_symbol="BTC", canonical_symbol="BTC")],
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
     finally:
         await collector.stop()
 
@@ -483,26 +494,17 @@ async def test_lighter_invalid_zero_delete_invalidates_previous_cache_view(
         latest_market_data=latest,
     )
 
-    await collector.start()
+    pipeline = cache_pipeline(collector, [market], latest)
     try:
+        await collector.start()
         await wait_for_books(collector, (1,))
-        before = latest.build_batch(
-            [market],
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
+        before = await pipeline.collect_once(now=OBSERVED_AT)
         assert len(before.market_snapshots) == 1
 
         websocket.push(ws_zero_delete_all_asks(1))
         after = None
         for _ in range(100):
-            after = latest.build_batch(
-                [market],
-                sample_time=SAMPLE_TIME,
-                now=OBSERVED_AT,
-                stale_after_seconds=30,
-            )
+            after = await pipeline.collect_once(now=OBSERVED_AT)
             if after.market_snapshots == ():
                 break
             await asyncio.sleep(0)
@@ -548,27 +550,18 @@ async def test_lighter_initial_discovery_recovers_before_starting_feed(
     )
 
     transport.fail_details = True
-    await collector.start()
+    pipeline = cache_pipeline(collector, [market], latest)
     try:
+        await collector.start()
         assert collector._order_book_feed.market_ids == ()
         assert connections == []
-        assert latest.build_batch(
-            [market],
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        ).market_snapshots == ()
+        assert (await pipeline.collect_once(now=OBSERVED_AT)).market_snapshots == ()
 
         transport.fail_details = False
         await collector._refresh_metadata_once()
         await wait_for_books(collector, (1,))
 
-        batch = latest.build_batch(
-            [market],
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
     finally:
         await collector.stop()
 

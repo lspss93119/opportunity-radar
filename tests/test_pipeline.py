@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -22,6 +22,67 @@ from radar.vwap import BookLevel
 
 UTC = timezone.utc
 NOW = datetime(2026, 9, 15, 10, 0, 19, 876000, tzinfo=UTC)
+
+ALL_SEVEN_MARKETS = (
+    MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),
+    MarketConfig(
+        venue="lighter_robinhood", venue_symbol="BTC", canonical_symbol="BTC"
+    ),
+    MarketConfig(
+        venue="hyperliquid", venue_symbol="BTC", canonical_symbol="BTC"
+    ),
+    MarketConfig(
+        venue="trade_xyz", venue_symbol="xyz:TSLA", canonical_symbol="TSLA"
+    ),
+    MarketConfig(
+        venue="entropy", venue_symbol="io:SNDK", canonical_symbol="SNDK"
+    ),
+    MarketConfig(
+        venue="backpack",
+        venue_symbol="SNDK.US_USDC_PERP",
+        canonical_symbol="SNDK",
+    ),
+    MarketConfig(
+        venue="arcus", venue_symbol="SNDK-USD", canonical_symbol="SNDK"
+    ),
+)
+
+
+def all_seven_config(*, stale_after_seconds: int = 30) -> RadarConfig:
+    return RadarConfig(
+        sampling_seconds=10,
+        fees_bps={
+            "lighter_robinhood": 0.0,
+            "trade_xyz": 9.0,
+            "entropy": 9.0,
+            "backpack": 5.0,
+            "arcus": 2.25,
+        },
+        markets=list(ALL_SEVEN_MARKETS),
+        monitors={"spread": {"stale_after_seconds": stale_after_seconds}},
+    )
+
+
+def pipeline_latest_market_data(pipeline: MarketDataPipeline) -> LatestMarketData:
+    latest = getattr(pipeline.collectors[0], "_latest_market_data", None)
+    assert isinstance(latest, LatestMarketData)
+    return latest
+
+
+def seed_pipeline_book(
+    latest: LatestMarketData,
+    market: MarketConfig,
+    *,
+    observed_at: datetime = NOW,
+    base_size: float = 200.0,
+) -> None:
+    latest.update_book(
+        venue=market.venue,
+        venue_symbol=market.venue_symbol,
+        bids=(BookLevel(price=99.0, base_size=base_size),),
+        asks=(BookLevel(price=101.0, base_size=base_size),),
+        observed_at=observed_at,
+    )
 
 
 def make_market(venue: str, observed_at: datetime, price: float) -> MarketSnapshot:
@@ -524,6 +585,155 @@ def test_pipeline_from_config_builds_backpack_collector_when_enabled():
         "backpack",
     ]
     assert isinstance(pipeline.collectors[2], BackpackCollector)
+
+
+def test_pipeline_from_config_injects_one_cache_and_preserves_all_feed_identity():
+    pipeline = MarketDataPipeline.from_config(
+        all_seven_config(stale_after_seconds=7)
+    )
+
+    latest = pipeline_latest_market_data(pipeline)
+    assert pipeline._latest_market_data is latest
+    assert pipeline._stale_after_seconds == 7
+    assert [collector.venue for collector in pipeline.collectors] == [
+        "lighter",
+        "lighter_robinhood",
+        "hyperliquid",
+        "trade_xyz",
+        "entropy",
+        "arcus",
+        "backpack",
+    ]
+    assert all(
+        getattr(collector, "_latest_market_data", None) is latest
+        for collector in pipeline.collectors
+    )
+    configured_identity = [
+        (market.venue, market.venue_symbol)
+        for collector in pipeline.collectors
+        for market in getattr(collector, "_markets")
+    ]
+    assert set(configured_identity) == {
+        (market.venue, market.venue_symbol) for market in ALL_SEVEN_MARKETS
+    }
+    assert len(configured_identity) == len(ALL_SEVEN_MARKETS)
+
+
+@pytest.mark.asyncio
+async def test_all_seven_venue_pipeline_samples_only_ready_fresh_shared_books():
+    pipeline = MarketDataPipeline.from_config(all_seven_config())
+    latest = pipeline_latest_market_data(pipeline)
+    ready_markets = (
+        ALL_SEVEN_MARKETS[0],
+        ALL_SEVEN_MARKETS[2],
+        ALL_SEVEN_MARKETS[5],
+        ALL_SEVEN_MARKETS[6],
+    )
+    for market in ready_markets:
+        seed_pipeline_book(latest, market)
+
+    batch = await pipeline.collect_once(now=NOW)
+
+    expected = {
+        (market.venue, market.venue_symbol) for market in ready_markets
+    }
+    observed = {
+        (snapshot.venue, snapshot.venue_symbol)
+        for snapshot in batch.market_snapshots
+    }
+    assert observed == expected
+    assert {
+        (snapshot.venue, snapshot.venue_symbol)
+        for snapshot in pipeline.state.markets
+    } == expected
+    assert all(
+        snapshot.sample_time == datetime(2026, 9, 15, 10, 0, 10, tzinfo=UTC)
+        for snapshot in batch.market_snapshots
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "stale",
+        "future",
+        "missing_10k_depth",
+        "mismatched_hyperliquid_coin",
+        "backpack_gap",
+        "lighter_reconnect",
+        "arcus_timeout",
+        "metadata_failure",
+    ],
+)
+@pytest.mark.asyncio
+async def test_all_seven_venue_pipeline_fails_closed_without_synthetic_samples(
+    failure: str,
+):
+    pipeline = MarketDataPipeline.from_config(all_seven_config())
+    latest = pipeline_latest_market_data(pipeline)
+    target_by_failure = {
+        "stale": ALL_SEVEN_MARKETS[0],
+        "future": ALL_SEVEN_MARKETS[1],
+        "missing_10k_depth": ALL_SEVEN_MARKETS[2],
+        "mismatched_hyperliquid_coin": ALL_SEVEN_MARKETS[2],
+        "backpack_gap": ALL_SEVEN_MARKETS[5],
+        "lighter_reconnect": ALL_SEVEN_MARKETS[0],
+        "arcus_timeout": ALL_SEVEN_MARKETS[6],
+        "metadata_failure": ALL_SEVEN_MARKETS[4],
+    }
+    target = target_by_failure[failure]
+    for market in ALL_SEVEN_MARKETS:
+        if market != target:
+            seed_pipeline_book(latest, market)
+
+    if failure == "stale":
+        seed_pipeline_book(
+            latest,
+            target,
+            observed_at=NOW - timedelta(seconds=31),
+        )
+    elif failure == "future":
+        seed_pipeline_book(
+            latest,
+            target,
+            observed_at=NOW + timedelta(seconds=1),
+        )
+    elif failure == "missing_10k_depth":
+        seed_pipeline_book(latest, target, base_size=0.1)
+    elif failure == "mismatched_hyperliquid_coin":
+        latest.update_book(
+            venue="hyperliquid",
+            venue_symbol="BTC-UNCONFIGURED",
+            bids=(BookLevel(price=99.0, base_size=200.0),),
+            asks=(BookLevel(price=101.0, base_size=200.0),),
+            observed_at=NOW,
+        )
+    elif failure in {"backpack_gap", "lighter_reconnect", "arcus_timeout"}:
+        latest.invalidate(venue=target.venue, venue_symbol=target.venue_symbol)
+    elif failure == "metadata_failure":
+        latest.update_metadata(
+            venue=target.venue,
+            venue_symbol=target.venue_symbol,
+            mark_price=101.0,
+            index_price=100.0,
+        )
+
+    batch = await pipeline.collect_once(now=NOW)
+
+    expected = {
+        (market.venue, market.venue_symbol)
+        for market in ALL_SEVEN_MARKETS
+        if market != target
+    }
+    observed = {
+        (snapshot.venue, snapshot.venue_symbol)
+        for snapshot in batch.market_snapshots
+    }
+    assert observed == expected
+    assert {
+        (snapshot.venue, snapshot.venue_symbol)
+        for snapshot in pipeline.state.markets
+    } == expected
 
 
 @pytest.mark.asyncio

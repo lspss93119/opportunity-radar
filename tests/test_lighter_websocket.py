@@ -14,6 +14,8 @@ from radar.collectors.lighter import (
 )
 from radar.config import MarketConfig
 from radar.market_data import LatestMarketData
+from radar.pipeline import MarketDataPipeline
+from radar.state import RadarState
 
 OBSERVED_AT = datetime(2026, 9, 24, 10, 0, 1, 123000, tzinfo=UTC)
 
@@ -393,22 +395,30 @@ async def test_lighter_collector_reads_ws_book_without_rest_order_book_requests(
     def connect(_url: str):
         return websocket
 
+    market = MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC")
+    latest = LatestMarketData()
     collector = LighterCollector(
-        [MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC")],
+        [market],
         request_json=request_json,
         websocket_connect=connect,
         clock=lambda: OBSERVED_AT,
+        latest_market_data=latest,
     )
-    await collector.start()
-    await wait_for_book(collector._order_book_feed, 1)
-
-    batch = await collector.collect(
-        sample_time=datetime(2026, 9, 24, 10, 0, 10, tzinfo=UTC),
-        include_hourly_context=False,
+    pipeline = MarketDataPipeline(
+        [collector],
+        RadarState(),
+        markets=[market],
+        latest_market_data=latest,
+        clock=lambda: OBSERVED_AT,
     )
+    try:
+        await collector.start()
+        await wait_for_book(collector._order_book_feed, 1)
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
 
-    assert len(batch.market_snapshots) == 1
-    assert batch.market_snapshots[0].buy_10k_vwap is not None
-    assert batch.market_snapshots[0].observed_at == OBSERVED_AT
-    assert all(not url.endswith("/orderBookOrders") for url in calls)
-    await collector.stop()
+        assert len(batch.market_snapshots) == 1
+        assert batch.market_snapshots[0].buy_10k_vwap is not None
+        assert batch.market_snapshots[0].observed_at == OBSERVED_AT
+        assert all(not url.endswith("/orderBookOrders") for url in calls)
+    finally:
+        await collector.stop()

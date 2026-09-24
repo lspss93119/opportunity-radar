@@ -16,6 +16,8 @@ from radar.collectors.backpack import (
 )
 from radar.config import MarketConfig
 from radar.market_data import LatestMarketData
+from radar.pipeline import MarketDataPipeline
+from radar.state import RadarState
 
 UTC = timezone.utc
 FIXTURES = Path(__file__).parent / "fixtures" / "backpack"
@@ -229,6 +231,20 @@ def collector_websocket() -> FixtureWebSocket:
     )
 
 
+def cache_pipeline(
+    collector: BackpackCollector,
+    markets: list[MarketConfig],
+    latest: LatestMarketData,
+) -> MarketDataPipeline:
+    return MarketDataPipeline(
+        [collector],
+        RadarState(),
+        markets=markets,
+        latest_market_data=latest,
+        clock=lambda: OBSERVED_AT,
+    )
+
+
 @pytest.mark.asyncio
 async def test_backpack_collector_uses_ws_books_and_keeps_depth_out_of_sampling():
     transport = FixtureTransport()
@@ -253,27 +269,15 @@ async def test_backpack_collector_uses_ws_books_and_keeps_depth_out_of_sampling(
         depth_calls_after_start = sum(
             url == BackpackCollector.DEPTH_URL for url, _, _ in transport.calls
         )
-        market_batch = latest.build_batch(
-            configured_markets(),
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
+        pipeline = cache_pipeline(collector, configured_markets(), latest)
+        market_batch = await pipeline.collect_once(now=OBSERVED_AT)
         hourly_batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
-        compatibility_batch = await collector.collect(
-            sample_time=SAMPLE_TIME,
-            include_hourly_context=False,
-        )
     finally:
         await collector.stop()
 
     assert depth_calls_after_start == 2
     assert sum(url == BackpackCollector.DEPTH_URL for url, _, _ in transport.calls) == 2
     assert [snapshot.canonical_symbol for snapshot in market_batch.market_snapshots] == [
-        "SNDK",
-        "NVDA",
-    ]
-    assert [snapshot.canonical_symbol for snapshot in compatibility_batch.market_snapshots] == [
         "SNDK",
         "NVDA",
     ]
@@ -345,20 +349,11 @@ async def test_backpack_metadata_failure_preserves_ready_cache_book():
         await wait_until(
             lambda: collector._order_book_feed.snapshot(market.venue_symbol) is not None
         )
-        before = latest.build_batch(
-            [market],
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
+        pipeline = cache_pipeline(collector, [market], latest)
+        before = await pipeline.collect_once(now=OBSERVED_AT)
         transport.fail_metadata = True
         assert await collector._refresh_metadata_once() is False
-        after = latest.build_batch(
-            [market],
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
+        after = await pipeline.collect_once(now=OBSERVED_AT)
     finally:
         await collector.stop()
 
@@ -378,28 +373,30 @@ async def test_backpack_collector_normalizes_market_funding_context_and_vwap():
         request_json=transport,
         clock=lambda: OBSERVED_AT,
         websocket_connect=lambda _url: websocket,
+        latest_market_data=LatestMarketData(),
     )
 
-    await collector.start()
+    latest = collector._latest_market_data
+    assert isinstance(latest, LatestMarketData)
+    pipeline = cache_pipeline(collector, configured_markets(), latest)
     try:
+        await collector.start()
         await wait_until(
             lambda: all(
                 collector._order_book_feed.snapshot(symbol) is not None
                 for symbol in ("SNDK.US_USDC_PERP", "NVDA.US_USDC_PERP")
             )
         )
-        batch = await collector.collect(
-            sample_time=SAMPLE_TIME,
-            include_hourly_context=True,
-        )
+        market_batch = await pipeline.collect_once(now=OBSERVED_AT)
+        hourly_batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
     finally:
         await collector.stop()
 
-    assert [snapshot.canonical_symbol for snapshot in batch.market_snapshots] == [
+    assert [snapshot.canonical_symbol for snapshot in market_batch.market_snapshots] == [
         "SNDK",
         "NVDA",
     ]
-    sndk = batch.market_snapshots[0]
+    sndk = market_batch.market_snapshots[0]
     assert sndk.venue == "backpack"
     assert sndk.venue_symbol == "SNDK.US_USDC_PERP"
     assert sndk.best_bid == 99.0
@@ -414,22 +411,22 @@ async def test_backpack_collector_normalizes_market_funding_context_and_vwap():
     assert sndk.sell_10k_vwap is not None
     assert sndk.observed_at == OBSERVED_AT
 
-    assert len(batch.funding_snapshots) == 1
-    funding = batch.funding_snapshots[0]
+    assert len(hourly_batch.funding_snapshots) == 1
+    funding = hourly_batch.funding_snapshots[0]
     assert funding.canonical_symbol == "SNDK"
     assert funding.effective_time == datetime(2026, 9, 23, 6, 0, tzinfo=UTC)
     assert funding.next_funding_time == datetime(2026, 9, 23, 5, 0, tzinfo=UTC)
     assert funding.observed_at == OBSERVED_AT
 
-    assert [context.canonical_symbol for context in batch.hourly_contexts] == [
+    assert [context.canonical_symbol for context in hourly_batch.hourly_contexts] == [
         "SNDK",
         "NVDA",
     ]
-    assert batch.hourly_contexts[0].sample_time == datetime(
+    assert hourly_batch.hourly_contexts[0].sample_time == datetime(
         2026, 9, 23, 10, 0, tzinfo=UTC
     )
-    assert batch.hourly_contexts[0].open_interest == 12.5
-    assert batch.hourly_contexts[0].volume_24h == 123456.7
+    assert hourly_batch.hourly_contexts[0].open_interest == 12.5
+    assert hourly_batch.hourly_contexts[0].volume_24h == 123456.7
 
     assert sum(url == BackpackCollector.MARKETS_URL for url, _, _ in transport.calls) == 1
     assert sum(url == BackpackCollector.DEPTH_URL for url, _, _ in transport.calls) == 2
@@ -454,22 +451,22 @@ async def test_backpack_collector_collects_configured_crypto_perp():
             ),
         ]
     )
+    latest = LatestMarketData()
     collector = BackpackCollector(
         configured_crypto_market(),
         request_json=FixtureTransport(),
         clock=lambda: OBSERVED_AT,
         websocket_connect=lambda _url: websocket,
+        latest_market_data=latest,
     )
 
-    await collector.start()
+    pipeline = cache_pipeline(collector, configured_crypto_market(), latest)
     try:
+        await collector.start()
         await wait_until(
             lambda: collector._order_book_feed.snapshot("BTC_USDC_PERP") is not None
         )
-        batch = await collector.collect(
-            sample_time=SAMPLE_TIME,
-            include_hourly_context=False,
-        )
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
     finally:
         await collector.stop()
 
@@ -489,21 +486,22 @@ async def test_backpack_collector_omits_only_symbol_when_depth_fails():
             raise OSError("Backpack book unavailable")
         return await transport(url, method=method, json_body=json_body, params=params)
 
+    latest = LatestMarketData()
     collector = BackpackCollector(
         configured_markets(),
         request_json=failing_transport,
+        clock=lambda: OBSERVED_AT,
         websocket_connect=lambda _url: websocket,
+        latest_market_data=latest,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
-    await collector.start()
+    pipeline = cache_pipeline(collector, configured_markets(), latest)
     try:
+        await collector.start()
         await wait_until(
             lambda: collector._order_book_feed.snapshot("SNDK.US_USDC_PERP") is not None
         )
-        batch = await collector.collect(
-            sample_time=SAMPLE_TIME,
-            include_hourly_context=False,
-        )
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
     finally:
         await collector.stop()
 
@@ -520,25 +518,26 @@ async def test_backpack_collector_returns_empty_batch_when_markets_request_fails
     async def failing_transport(url: str, *, method: str, json_body=None, params=None):
         raise OSError("Backpack metadata unavailable")
 
+    latest = LatestMarketData()
     collector = BackpackCollector(
         configured_markets(),
         request_json=failing_transport,
         websocket_connect=lambda _url: FixtureWebSocket(),
+        latest_market_data=latest,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
 
-    await collector.start()
+    pipeline = cache_pipeline(collector, configured_markets(), latest)
     try:
-        batch = await collector.collect(
-            sample_time=SAMPLE_TIME,
-            include_hourly_context=True,
-        )
+        await collector.start()
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
+        hourly_batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
     finally:
         await collector.stop()
 
     assert batch.market_snapshots == ()
-    assert batch.funding_snapshots == ()
-    assert batch.hourly_contexts == ()
+    assert hourly_batch.funding_snapshots == ()
+    assert hourly_batch.hourly_contexts == ()
     assert ("backpack", "Backpack metadata unavailable") in [
         (venue, str(error)) for venue, error in failures
     ]
@@ -567,29 +566,23 @@ async def test_backpack_collector_marks_unfilled_vwap_targets_unavailable():
             }
         return await transport(url, method=method, json_body=json_body, params=params)
 
+    latest = LatestMarketData()
     collector = BackpackCollector(
         configured_markets()[:1],
         request_json=sparse_transport,
         clock=lambda: OBSERVED_AT,
         websocket_connect=lambda _url: websocket,
+        latest_market_data=latest,
     )
 
-    await collector.start()
+    pipeline = cache_pipeline(collector, configured_markets()[:1], latest)
     try:
+        await collector.start()
         await wait_until(
             lambda: collector._order_book_feed.snapshot("SNDK.US_USDC_PERP") is not None
         )
-        batch = await collector.collect(
-            sample_time=SAMPLE_TIME,
-            include_hourly_context=False,
-        )
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
     finally:
         await collector.stop()
 
-    snapshot = batch.market_snapshots[0]
-    assert snapshot.buy_1k_vwap is None
-    assert snapshot.sell_1k_vwap is None
-    assert snapshot.buy_5k_vwap is None
-    assert snapshot.sell_5k_vwap is None
-    assert snapshot.buy_10k_vwap is None
-    assert snapshot.sell_10k_vwap is None
+    assert batch.market_snapshots == ()

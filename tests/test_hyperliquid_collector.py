@@ -13,6 +13,8 @@ from radar.collectors.hyperliquid import (
 )
 from radar.config import MarketConfig
 from radar.market_data import LatestMarketData
+from radar.pipeline import MarketDataPipeline
+from radar.state import RadarState
 
 UTC = timezone.utc
 FIXTURES = Path(__file__).parent / "fixtures" / "hyperliquid"
@@ -129,6 +131,20 @@ async def wait_until(predicate) -> None:
     raise AssertionError("predicate was not satisfied")
 
 
+def cache_pipeline(
+    collector: HyperliquidCollector,
+    markets: list[MarketConfig],
+    latest: LatestMarketData,
+) -> MarketDataPipeline:
+    return MarketDataPipeline(
+        [collector],
+        RadarState(),
+        markets=markets,
+        latest_market_data=latest,
+        clock=lambda: OBSERVED_AT,
+    )
+
+
 def test_hyperliquid_meta_contexts_are_mapped_by_universe_order():
     contexts = parse_hyperliquid_meta_and_asset_ctxs(
         load_fixture("meta_and_asset_ctxs.json")
@@ -182,29 +198,18 @@ async def test_hyperliquid_collector_normalizes_market_funding_and_hourly_contex
         latest_market_data=latest,
     )
 
-    await collector.start()
-    await wait_for_books(collector, ("BTC", "ETH", "SOL"))
+    markets = configured_markets()
+    pipeline = cache_pipeline(collector, markets, latest)
     try:
+        await collector.start()
+        await wait_for_books(collector, ("BTC", "ETH", "SOL"))
+        market_batch = await pipeline.collect_once(now=OBSERVED_AT)
         batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
-        market_batch = latest.build_batch(
-            configured_markets(),
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
-        compatibility_batch = await collector.collect(
-            sample_time=SAMPLE_TIME, include_hourly_context=False
-        )
     finally:
         await collector.stop()
 
     assert batch.market_snapshots == ()
     assert [snapshot.canonical_symbol for snapshot in market_batch.market_snapshots] == [
-        "BTC",
-        "ETH",
-        "SOL",
-    ]
-    assert [snapshot.canonical_symbol for snapshot in compatibility_batch.market_snapshots] == [
         "BTC",
         "ETH",
         "SOL",
@@ -263,15 +268,11 @@ async def test_hyperliquid_collector_omits_symbol_until_its_ws_snapshot_arrives(
         latest_market_data=latest,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
-    await collector.start()
-    await wait_for_books(collector, ("BTC", "SOL"))
+    pipeline = cache_pipeline(collector, configured_markets(), latest)
     try:
-        batch = latest.build_batch(
-            configured_markets(),
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
+        await collector.start()
+        await wait_for_books(collector, ("BTC", "SOL"))
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
     finally:
         await collector.stop()
 
@@ -301,16 +302,12 @@ async def test_hyperliquid_collector_reports_metadata_failure():
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
 
-    await collector.start()
-    await wait_for_books(collector, ("BTC", "ETH", "SOL"))
+    pipeline = cache_pipeline(collector, configured_markets(), latest)
     try:
+        await collector.start()
+        await wait_for_books(collector, ("BTC", "ETH", "SOL"))
         batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
-        market_batch = latest.build_batch(
-            configured_markets(),
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
+        market_batch = await pipeline.collect_once(now=OBSERVED_AT)
     finally:
         await collector.stop()
 
@@ -357,16 +354,12 @@ async def test_hyperliquid_invalid_cache_publication_clears_local_book():
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
 
-    await collector.start()
+    pipeline = cache_pipeline(collector, [market], latest)
     try:
+        await collector.start()
         await wait_until(lambda: bool(failures))
         assert collector._order_book_feed.snapshot("BTC") is None
-        assert latest.build_batch(
-            [market],
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        ).market_snapshots == ()
+        assert (await pipeline.collect_once(now=OBSERVED_AT)).market_snapshots == ()
     finally:
         await collector.stop()
 
@@ -428,16 +421,12 @@ async def test_trade_xyz_collector_adds_dex_only_to_metadata_and_normalizes_hip3
         latest_market_data=latest,
     )
 
-    await collector.start()
-    await wait_for_books(collector, ("xyz:TSLA",))
+    pipeline = cache_pipeline(collector, market, latest)
     try:
+        await collector.start()
+        await wait_for_books(collector, ("xyz:TSLA",))
+        market_batch = await pipeline.collect_once(now=OBSERVED_AT)
         batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
-        market_batch = latest.build_batch(
-            market,
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
     finally:
         await collector.stop()
 
@@ -503,16 +492,12 @@ async def test_entropy_collector_uses_io_namespace_and_maps_sndk():
         latest_market_data=latest,
     )
 
-    await collector.start()
-    await wait_for_books(collector, ("io:SNDK",))
+    pipeline = cache_pipeline(collector, market, latest)
     try:
+        await collector.start()
+        await wait_for_books(collector, ("io:SNDK",))
+        market_batch = await pipeline.collect_once(now=OBSERVED_AT)
         batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
-        market_batch = latest.build_batch(
-            market,
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
     finally:
         await collector.stop()
 
@@ -558,15 +543,11 @@ async def test_trade_xyz_ws_failure_omits_only_unready_symbol_and_keeps_trade_ve
         latest_market_data=latest,
     )
 
-    await collector.start()
-    await wait_for_books(collector, ("xyz:TSLA",))
+    pipeline = cache_pipeline(collector, configured_hip3_markets(), latest)
     try:
-        batch = latest.build_batch(
-            configured_hip3_markets(),
-            sample_time=SAMPLE_TIME,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        )
+        await collector.start()
+        await wait_for_books(collector, ("xyz:TSLA",))
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
     finally:
         await collector.stop()
 
@@ -593,8 +574,8 @@ async def test_trade_xyz_metadata_failure_reports_logical_venue_and_returns_empt
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
 
-    await collector.start()
     try:
+        await collector.start()
         batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
     finally:
         await collector.stop()
