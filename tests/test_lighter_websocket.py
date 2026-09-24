@@ -8,6 +8,7 @@ import pytest
 
 from radar.collectors.lighter import (
     LighterOrderBookFeed,
+    LighterOrderBookSnapshot,
     LighterOrderBookState,
     LighterCollector,
 )
@@ -124,12 +125,42 @@ class FakeWebSocket:
 
 
 async def wait_for_book(feed: LighterOrderBookFeed, market_id: int):
-    for _ in range(50):
-        view = feed.snapshot(market_id)
-        if view is not None:
-            return view
+    await wait_until(lambda: feed.snapshot(market_id) is not None)
+    view = feed.snapshot(market_id)
+    assert view is not None
+    return view
+
+
+async def wait_until(predicate) -> None:
+    for _ in range(100):
+        if predicate():
+            return
         await asyncio.sleep(0)
-    raise AssertionError("book was not populated")
+    raise AssertionError("predicate was not satisfied")
+
+
+def connect_snapshot_only_fixture(_url: str):
+    return FakeWebSocket([{"type": "connected"}, snapshot_message(1)])
+
+
+@pytest.mark.asyncio
+async def test_full_lighter_snapshot_is_ready_without_followup_delta():
+    published: list[tuple[int, LighterOrderBookSnapshot]] = []
+    feed = LighterOrderBookFeed(
+        "wss://test.invalid/stream",
+        [1],
+        connect=connect_snapshot_only_fixture,
+        on_book=lambda market_id, snapshot: published.append((market_id, snapshot)),
+    )
+
+    try:
+        await feed.start()
+        await wait_until(lambda: feed.snapshot(1) is not None)
+        assert len(published) == 1
+        assert published[0][0] == 1
+        assert published[0][1].bids[0].price == 99.0
+    finally:
+        await feed.stop()
 
 
 @pytest.mark.asyncio
@@ -147,10 +178,13 @@ async def test_lighter_order_book_feed_isolates_markets_and_resubscribes_after_r
     def connect(_url: str):
         return connections.pop(0)
 
+    invalidated: list[int] = []
+
     feed = LighterOrderBookFeed(
         "wss://example.test/stream",
         (1, 2),
         connect=connect,
+        on_invalidate=invalidated.append,
         reconnect_delay_seconds=0,
     )
     await feed.start()
@@ -162,14 +196,13 @@ async def test_lighter_order_book_feed_isolates_markets_and_resubscribes_after_r
         "order_book/1",
         "order_book/2",
     }
+    invalidations_before_disconnect = len(invalidated)
 
     await first.close()
-    for _ in range(50):
-        if len(connections) == 0:
-            break
-        await asyncio.sleep(0)
+    await wait_until(lambda: len(invalidated) > invalidations_before_disconnect)
     assert feed.snapshot(1) is None
     assert feed.snapshot(2) is None
+    assert set(invalidated[invalidations_before_disconnect:]) == {1, 2}
 
     second.push(snapshot_message(1, nonce=30))
     await wait_for_book(feed, 1)

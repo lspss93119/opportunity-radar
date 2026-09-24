@@ -12,6 +12,7 @@ from radar.collectors.lighter import (
     parse_lighter_order_book_orders,
 )
 from radar.config import MarketConfig
+from radar.market_data import LatestMarketData
 
 UTC = timezone.utc
 FIXTURES = Path(__file__).parent / "fixtures" / "lighter"
@@ -241,6 +242,7 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
 ):
     transport = FixtureTransport(base_url)
     websocket, websocket_connect = fixture_websocket()
+    latest = LatestMarketData()
     collector = LighterCollector(
         configured_markets(venue),
         venue=venue,
@@ -248,23 +250,29 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
         request_json=transport,
         clock=lambda: OBSERVED_AT,
         websocket_connect=websocket_connect,
+        latest_market_data=latest,
     )
 
     await collector.start()
     await wait_for_books(collector, (1, 0, 2))
     try:
-        batch = await collector.collect(
-            sample_time=SAMPLE_TIME, include_hourly_context=True
+        batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
+        market_batch = latest.build_batch(
+            configured_markets(venue),
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
         )
     finally:
         await collector.stop()
 
-    assert [snapshot.canonical_symbol for snapshot in batch.market_snapshots] == [
+    assert batch.market_snapshots == ()
+    assert [snapshot.canonical_symbol for snapshot in market_batch.market_snapshots] == [
         "BTC",
         "ETH",
         "SOL",
     ]
-    btc = batch.market_snapshots[0]
+    btc = market_batch.market_snapshots[0]
     assert btc.best_bid == 99.0
     assert btc.best_bid_size == 60.0
     assert btc.best_ask == 100.0
@@ -302,7 +310,7 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
     assert btc_context.observed_at == OBSERVED_AT
 
     assert all(method == "GET" for _, method, _ in transport.calls)
-    assert sum(url == transport.order_book_details_url for url, _, _ in transport.calls) == 2
+    assert sum(url == transport.order_book_details_url for url, _, _ in transport.calls) == 1
     assert sum(url == transport.order_book_orders_url for url, _, _ in transport.calls) == 0
     assert sum(url == transport.fundings_url for url, _, _ in transport.calls) == 3
 
@@ -371,11 +379,126 @@ async def test_lighter_collector_reports_market_details_failure(
         error_handler=lambda venue, error: failures.append((venue, error)),
     )
 
-    batch = await collector.collect(
-        sample_time=SAMPLE_TIME, include_hourly_context=False
-    )
+    await collector.start()
+    await collector.stop()
 
-    assert batch.market_snapshots == ()
     assert [(venue, str(error)) for venue, error in failures] == [
         (venue, "market details unavailable")
+    ]
+
+
+class SequencedDetailsTransport(FixtureTransport):
+    def __init__(self, base_url: str = LighterCollector.BASE_URL) -> None:
+        super().__init__(base_url)
+        self.fail_details = False
+
+    async def __call__(self, url: str, *, method: str, json_body=None, params=None):
+        if url == self.order_book_details_url and self.fail_details:
+            raise OSError("market details unavailable")
+        return await super().__call__(url, method=method, json_body=json_body, params=params)
+
+
+@pytest.mark.parametrize(
+    ("venue", "base_url"),
+    [
+        ("lighter", LighterCollector.BASE_URL),
+        ("lighter_robinhood", ROBINHOOD_BASE_URL),
+    ],
+)
+@pytest.mark.asyncio
+async def test_lighter_metadata_failure_preserves_ready_cache_book(
+    venue: str, base_url: str
+):
+    transport = SequencedDetailsTransport(base_url)
+    websocket, websocket_connect = fixture_websocket(include_symbols=("btc",))
+    latest = LatestMarketData()
+    collector = LighterCollector(
+        [MarketConfig(venue=venue, venue_symbol="BTC", canonical_symbol="BTC")],
+        venue=venue,
+        base_url=base_url,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        websocket_connect=websocket_connect,
+        latest_market_data=latest,
+    )
+
+    await collector.start()
+    await wait_for_books(collector, (1,))
+    try:
+        transport.fail_details = True
+        await collector._refresh_metadata_once()
+
+        batch = latest.build_batch(
+            [MarketConfig(venue=venue, venue_symbol="BTC", canonical_symbol="BTC")],
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+    finally:
+        await collector.stop()
+
+    assert len(batch.market_snapshots) == 1
+    assert batch.market_snapshots[0].observed_at == OBSERVED_AT
+
+
+@pytest.mark.parametrize(
+    ("venue", "base_url"),
+    [
+        ("lighter", LighterCollector.BASE_URL),
+        ("lighter_robinhood", ROBINHOOD_BASE_URL),
+    ],
+)
+@pytest.mark.asyncio
+async def test_lighter_initial_discovery_recovers_before_starting_feed(
+    venue: str, base_url: str
+):
+    transport = SequencedDetailsTransport(base_url)
+    websocket, websocket_connect = fixture_websocket(include_symbols=("btc",))
+    connections: list[str] = []
+
+    def connect(url: str):
+        connections.append(url)
+        return websocket_connect(url)
+
+    latest = LatestMarketData()
+    market = MarketConfig(venue=venue, venue_symbol="BTC", canonical_symbol="BTC")
+    collector = LighterCollector(
+        [market],
+        venue=venue,
+        base_url=base_url,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        websocket_connect=connect,
+        latest_market_data=latest,
+    )
+
+    transport.fail_details = True
+    await collector.start()
+    try:
+        assert collector._order_book_feed.market_ids == ()
+        assert connections == []
+        assert latest.build_batch(
+            [market],
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        ).market_snapshots == ()
+
+        transport.fail_details = False
+        await collector._refresh_metadata_once()
+        await wait_for_books(collector, (1,))
+
+        batch = latest.build_batch(
+            [market],
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+    finally:
+        await collector.stop()
+
+    assert connections == [collector.ws_url]
+    assert len(batch.market_snapshots) == 1
+    assert websocket.sent == [
+        {"type": "subscribe", "channel": "order_book/1"}
     ]

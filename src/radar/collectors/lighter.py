@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -19,6 +20,7 @@ from radar.collectors.base import (
 )
 from radar.collectors.http import request_json as default_request_json
 from radar.config import MarketConfig
+from radar.market_data import LatestMarketData
 from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
@@ -183,8 +185,10 @@ class LighterOrderBookFeed:
     def __init__(
         self,
         ws_url: str,
-        market_ids: tuple[int, ...] | list[int],
+        market_ids: Sequence[int],
         *,
+        on_book: Callable[[int, LighterOrderBookSnapshot], None] | None = None,
+        on_invalidate: Callable[[int], None] | None = None,
         connect: Callable[[str], Any] = websockets.connect,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         error_handler: CollectorErrorHandler | None = None,
@@ -199,6 +203,8 @@ class LighterOrderBookFeed:
         self._clock = clock
         self._error_handler = error_handler
         self._venue = venue
+        self._on_book = on_book
+        self._on_invalidate = on_invalidate
         self._reconnect_delay_seconds = reconnect_delay_seconds
         self._states: dict[int, LighterOrderBookState] = {
             market_id: LighterOrderBookState(market_id)
@@ -213,10 +219,11 @@ class LighterOrderBookFeed:
     def market_ids(self) -> tuple[int, ...]:
         return self._market_ids
 
-    async def set_market_ids(self, market_ids: tuple[int, ...] | list[int]) -> None:
+    async def set_market_ids(self, market_ids: Sequence[int]) -> None:
         new_market_ids = tuple(sorted(set(market_ids)))
         if new_market_ids == self._market_ids:
             return
+        self._clear_states()
         self._market_ids = new_market_ids
         self._states = {
             market_id: self._states.get(market_id, LighterOrderBookState(market_id))
@@ -253,6 +260,8 @@ class LighterOrderBookFeed:
     def _clear_states(self) -> None:
         for state in self._states.values():
             state.clear()
+            if self._on_invalidate is not None:
+                self._on_invalidate(state.market_id)
 
     async def _run(self) -> None:
         while not self._stopping:
@@ -311,6 +320,11 @@ class LighterOrderBookFeed:
             state.apply_snapshot(order_book, received_at)
         else:
             state.apply_delta(order_book, received_at)
+        snapshot = state.snapshot()
+        if snapshot is None:
+            raise ValueError("valid websocket order_book did not produce a snapshot")
+        if self._on_book is not None:
+            self._on_book(market_id, snapshot)
 
     @staticmethod
     def _market_id_from_channel(channel: object) -> int:
@@ -432,6 +446,7 @@ class LighterCollector:
     ORDER_BOOK_ORDERS_URL = f"{BASE_URL}/api/v1/orderBookOrders"
     FUNDINGS_URL = f"{BASE_URL}/api/v1/fundings"
     ORDER_BOOK_LIMIT = 250
+    METADATA_REFRESH_SECONDS = 60.0
 
     def __init__(
         self,
@@ -444,7 +459,11 @@ class LighterCollector:
         error_handler: CollectorErrorHandler | None = None,
         websocket_connect: Callable[[str], Any] = websockets.connect,
         ws_url: str | None = None,
+        latest_market_data: LatestMarketData | None = None,
+        metadata_refresh_seconds: float = METADATA_REFRESH_SECONDS,
     ) -> None:
+        if metadata_refresh_seconds < 0:
+            raise ValueError("metadata_refresh_seconds must be non-negative")
         self.venue = venue
         self.base_url = (self.BASE_URL if base_url is None else base_url).rstrip("/")
         if ws_url is None:
@@ -461,6 +480,13 @@ class LighterCollector:
         self._request_json = request_json
         self._clock = clock
         self._error_handler = error_handler
+        self._latest_market_data = latest_market_data
+        self._metadata_refresh_seconds = metadata_refresh_seconds
+        self._details: dict[str, LighterMarketDetail] = {}
+        self._details_observed_at: datetime | None = None
+        self._market_id_to_markets: dict[int, tuple[MarketConfig, ...]] = {}
+        self._metadata_task: asyncio.Task[None] | None = None
+        self._feed_started = False
         self._order_book_feed = LighterOrderBookFeed(
             self.ws_url,
             (),
@@ -468,21 +494,30 @@ class LighterCollector:
             clock=clock,
             error_handler=error_handler,
             venue=self.venue,
+            on_book=self._publish_book,
+            on_invalidate=self._invalidate_book,
         )
         self._started = False
 
     async def start(self) -> None:
         if self._started:
             return
-        try:
-            details, _ = await self._fetch_market_details()
-            await self._sync_order_book_feed(details)
-        except Exception as error:  # noqa: BLE001
-            report_collector_error(self._error_handler, self.venue, error)
+        self._started = True
+        await self._refresh_metadata_once()
+        self._metadata_task = asyncio.create_task(
+            self._run_metadata_refresh(),
+            name=f"{self.venue}-metadata",
+        )
 
     async def stop(self) -> None:
         self._started = False
+        metadata_task = self._metadata_task
+        if metadata_task is not None:
+            metadata_task.cancel()
+            await asyncio.gather(metadata_task, return_exceptions=True)
+        self._metadata_task = None
         await self._order_book_feed.stop()
+        self._feed_started = False
 
     async def _fetch_market_details(
         self,
@@ -494,28 +529,94 @@ class LighterCollector:
         )
         return parse_lighter_order_book_details(details_payload), self._clock()
 
-    async def _sync_order_book_feed(
+    def _configured_market_map(
+        self, details: dict[str, LighterMarketDetail]
+    ) -> dict[int, tuple[MarketConfig, ...]]:
+        market_map: dict[int, list[MarketConfig]] = {}
+        for market in self._markets:
+            detail = details.get(market.venue_symbol)
+            if detail is not None:
+                market_map.setdefault(detail.market_id, []).append(market)
+        return {
+            market_id: tuple(markets)
+            for market_id, markets in market_map.items()
+        }
+
+    async def _ensure_order_book_feed(
         self, details: dict[str, LighterMarketDetail]
     ) -> None:
-        market_ids = tuple(
-            details[market.venue_symbol].market_id
-            for market in self._markets
-            if market.venue_symbol in details
-        )
+        market_map = self._configured_market_map(details)
+        market_ids = tuple(sorted(market_map))
         await self._order_book_feed.set_market_ids(market_ids)
-        if not self._started:
+        self._market_id_to_markets = market_map
+        if market_ids and not self._feed_started:
             await self._order_book_feed.start()
-            self._started = True
+            self._feed_started = True
+        elif not market_ids and self._feed_started:
+            await self._order_book_feed.stop()
+            self._feed_started = False
+
+    async def _refresh_metadata_once(self) -> bool:
+        try:
+            details, details_observed_at = await self._fetch_market_details()
+            await self._ensure_order_book_feed(details)
+            self._details = details
+            self._details_observed_at = details_observed_at
+            if self._latest_market_data is not None:
+                for market in self._markets:
+                    detail = details.get(market.venue_symbol)
+                    if detail is None:
+                        continue
+                    self._latest_market_data.update_metadata(
+                        venue=self.venue,
+                        venue_symbol=market.venue_symbol,
+                        mark_price=detail.mark_price,
+                        index_price=detail.index_price,
+                    )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            report_collector_error(self._error_handler, self.venue, error)
+            return False
+
+    async def _run_metadata_refresh(self) -> None:
+        while self._started:
+            await asyncio.sleep(self._metadata_refresh_seconds)
+            if not self._started:
+                return
+            await self._refresh_metadata_once()
+
+    def _publish_book(
+        self, market_id: int, snapshot: LighterOrderBookSnapshot
+    ) -> None:
+        if self._latest_market_data is None:
+            return
+        for market in self._market_id_to_markets.get(market_id, ()):
+            try:
+                self._latest_market_data.update_book(
+                    venue=self.venue,
+                    venue_symbol=market.venue_symbol,
+                    bids=snapshot.bids,
+                    asks=snapshot.asks,
+                    observed_at=snapshot.observed_at,
+                )
+            except Exception as error:  # noqa: BLE001
+                report_collector_error(self._error_handler, self.venue, error)
+
+    def _invalidate_book(self, market_id: int) -> None:
+        if self._latest_market_data is None:
+            return
+        for market in self._market_id_to_markets.get(market_id, ()):
+            self._latest_market_data.invalidate(
+                venue=self.venue,
+                venue_symbol=market.venue_symbol,
+            )
 
     async def collect(
         self, *, sample_time: datetime, include_hourly_context: bool
     ) -> CollectorBatch:
-        try:
-            details, details_observed_at = await self._fetch_market_details()
-            await self._sync_order_book_feed(details)
-        except Exception as error:  # noqa: BLE001
-            report_collector_error(self._error_handler, self.venue, error)
-            return CollectorBatch()
+        details = self._details
 
         market_snapshots = await asyncio.gather(
             *(
@@ -525,41 +626,53 @@ class LighterCollector:
         )
         funding_snapshots: tuple[FundingSnapshot, ...] = ()
         hourly_contexts: tuple[HourlyContext, ...] = ()
-        configured_details = tuple(
-            (market, details[market.venue_symbol])
-            for market in self._markets
-            if market.venue_symbol in details
-        )
         if include_hourly_context:
-            funding_results = await asyncio.gather(
-                *(
-                    self._collect_funding(market, detail)
-                    for market, detail in configured_details
-                )
-            )
-            funding_snapshots = tuple(
-                funding for funding in funding_results if funding is not None
-            )
-            hourly_sample = sample_time.astimezone(UTC).replace(
-                minute=0, second=0, microsecond=0
-            )
-            hourly_contexts = tuple(
-                HourlyContext(
-                    sample_time=hourly_sample,
-                    observed_at=details_observed_at,
-                    venue=self.venue,
-                    venue_symbol=market.venue_symbol,
-                    canonical_symbol=market.canonical_symbol,
-                    open_interest=detail.open_interest,
-                    volume_24h=detail.volume_24h,
-                )
-                for market, detail in configured_details
-            )
+            hourly_batch = await self.collect_hourly(sample_time=sample_time)
+            funding_snapshots = hourly_batch.funding_snapshots
+            hourly_contexts = hourly_batch.hourly_contexts
 
         return CollectorBatch(
             market_snapshots=tuple(
                 snapshot for snapshot in market_snapshots if snapshot is not None
             ),
+            funding_snapshots=funding_snapshots,
+            hourly_contexts=hourly_contexts,
+        )
+
+    async def collect_hourly(self, *, sample_time: datetime) -> CollectorBatch:
+        details_observed_at = self._details_observed_at
+        if details_observed_at is None:
+            return CollectorBatch()
+        configured_details = tuple(
+            (market, self._details[market.venue_symbol])
+            for market in self._markets
+            if market.venue_symbol in self._details
+        )
+        funding_results = await asyncio.gather(
+            *(
+                self._collect_funding(market, detail)
+                for market, detail in configured_details
+            )
+        )
+        funding_snapshots = tuple(
+            funding for funding in funding_results if funding is not None
+        )
+        hourly_sample = sample_time.astimezone(UTC).replace(
+            minute=0, second=0, microsecond=0
+        )
+        hourly_contexts = tuple(
+            HourlyContext(
+                sample_time=hourly_sample,
+                observed_at=details_observed_at,
+                venue=self.venue,
+                venue_symbol=market.venue_symbol,
+                canonical_symbol=market.canonical_symbol,
+                open_interest=detail.open_interest,
+                volume_24h=detail.volume_24h,
+            )
+            for market, detail in configured_details
+        )
+        return CollectorBatch(
             funding_snapshots=funding_snapshots,
             hourly_contexts=hourly_contexts,
         )

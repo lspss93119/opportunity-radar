@@ -370,6 +370,7 @@ def test_pipeline_from_config_builds_the_two_configured_public_collectors():
         LighterCollector,
         HyperliquidCollector,
     ]
+    assert isinstance(pipeline.collectors[0], ManagedCollector)
 
 
 def test_pipeline_from_config_builds_independent_lighter_robinhood_collector():
@@ -397,6 +398,8 @@ def test_pipeline_from_config_builds_independent_lighter_robinhood_collector():
         "hyperliquid",
     ]
     assert isinstance(pipeline.collectors[1], LighterCollector)
+    assert isinstance(pipeline.collectors[0], ManagedCollector)
+    assert isinstance(pipeline.collectors[1], ManagedCollector)
     assert pipeline.collectors[1].base_url == "https://api.rh.lighter.xyz"
 
 
