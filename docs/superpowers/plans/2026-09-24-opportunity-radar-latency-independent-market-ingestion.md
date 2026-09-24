@@ -94,7 +94,7 @@ def test_build_batch_uses_source_observed_at_and_all_vwap_tiers():
     assert snapshot.sample_time == sample_time
     assert snapshot.observed_at == observed_at
     assert snapshot.buy_1k_vwap == 101.0
-    assert snapshot.sell_10k_vwap is None
+    assert snapshot.sell_10k_vwap == 99.0
     assert snapshot.mark_price == 100.0
 ```
 
@@ -134,7 +134,9 @@ git commit -m "Add latest market data cache"
 **Files:**
 - Modify: `src/radar/state.py`
 - Modify: `src/radar/pipeline.py`
+- Modify: `src/radar/storage/parquet.py`
 - Modify: `tests/test_pipeline.py`
+- Modify: `tests/test_storage_parquet.py`
 - Modify: `tests/test_app.py` only for constructor/fixture seams
 
 **Interfaces:**
@@ -146,9 +148,15 @@ git commit -m "Add latest market data cache"
 - `MarketDataPipeline.collect_hourly_once(*, now: datetime | None = None) -> CollectorBatch | None` is the single hourly coordinator operation for one due hour.
 - `MarketDataPipeline.wait_for_market_feeds(canonical_symbol: str, *, required_venues: int = 2, timeout_seconds: float = 30.0) -> None` polls only in-process readiness and raises `TimeoutError` on expiry.
 
-- [ ] **Step 1: Write failing state-application tests.**
+- [ ] **Step 1: Write failing state-application and storage-handoff tests.**
 
 Add a market batch followed by a context-only batch and assert the market remains. Add a two-venue hourly test with one delayed collector and one immediate collector; assert the final state contains both context rows and the storage receives one merged batch rather than two partial batches.
+
+Add a deterministic Parquet regression test for an append concurrent with a
+worker-thread flush. Arrange for the flush to pause after it atomically hands
+the current pending rows to a local batch, append another row while it is
+paused, then release the flush. Assert that the concurrent row remains pending
+and is written by the next flush; no append may be cleared or lost.
 
 ```python
 class HourlyCollectorStub:
@@ -223,11 +231,24 @@ Implement `start`/`stop` so `stop` first prevents a new hourly cycle, cancels an
 
 Implement `wait_for_market_feeds` with `asyncio.timeout`/`asyncio.wait_for` around a small polling loop that reads `LatestMarketData.ready_venues`; it must not invoke `collect_once` or a collector network method.
 
+Make Parquet pending-buffer handoff thread-safe without adding a storage
+framework. Protect the pending rows with a small `threading.Lock`; `append`
+adds under the lock, while `flush` swaps the pending rows into a local batch
+under the lock and performs the existing temporary-file/atomic-replacement
+work outside the lock. Rows appended while that write is in progress must
+remain pending for the next flush. If the write fails, restore the handed-off
+rows without discarding rows appended during the failed write.
+
 - [ ] **Step 4: Run pipeline tests and verify GREEN.**
 
 Run: `uv run pytest tests/test_pipeline.py -q`
 
 Expected: aligned sample, stale/future omission, hourly +60-second grace, mid-hour startup, single merged context application, and no-network sampler tests pass.
+
+Run: `uv run pytest tests/test_storage_parquet.py -q`
+
+Expected: append-during-flush preservation passes, including the existing
+batching, atomic replacement, and retention tests.
 
 - [ ] **Step 5: Run state and application regression tests.**
 
@@ -252,7 +273,9 @@ git commit -m "Decouple sampling from hourly collection"
 
 **Interfaces:**
 - `LighterOrderBookFeed(ws_url: str, market_ids: Sequence[int], *, on_book: Callable[[int, LighterOrderBookSnapshot], None] | None = None, on_invalidate: Callable[[int], None] | None = None, connect=websockets.connect, clock: Callable[[], datetime], venue: str, reconnect_delay_seconds: float = 1.0)` publishes complete local books and invalidates cache state on clear/reconnect.
-- `async LighterCollector.start() -> None` performs initial market-ID discovery, starts the metadata refresh task and the persistent feed.
+- `async LighterCollector.start() -> None` starts the metadata discovery/
+  refresh task. It starts the persistent feed only after a successful
+  `orderBookDetails` discovery has produced the configured market IDs.
 - `async LighterCollector.stop() -> None` cancels/awaits metadata and feed tasks.
 - `async LighterCollector.collect_hourly(*, sample_time: datetime) -> CollectorBatch` retains current funding and hourly-context semantics without order-book REST calls.
 
@@ -284,7 +307,7 @@ Define `connect_snapshot_only_fixture` as the injected async context-manager
 fixture that sends the `connected` message, the subscription acknowledgement,
 and one valid `subscribed/order_book` snapshot before ending the test stream.
 
-Add a collector test where `orderBookDetails` fails after the feed has a valid book; assert the latest market cache still emits that feed with its source observation time. If initial discovery fails, the collector remains running with no subscribed IDs and the next low-frequency discovery can recover; it does not publish a synthetic book.
+Add a collector test where `orderBookDetails` fails after the feed has a valid book; assert the latest market cache still emits that feed with its source observation time. Add an initial-discovery recovery test: when startup discovery fails, no feed is started and no IDs are subscribed; when a later metadata refresh succeeds, the collector explicitly starts the feed with the discovered IDs and can publish the resulting book. It does not publish a synthetic book while discovery is unavailable.
 
 - [ ] **Step 2: Run focused tests and verify RED.**
 
@@ -296,7 +319,7 @@ Expected: the snapshot-only readiness and callback/metadata-isolation tests fail
 
 Keep `LighterOrderBookState` nonce validation and VWAP behavior. Mark a state ready immediately after `apply_snapshot`; retain the snapshot nonce for later `begin_nonce == previous_nonce` validation. On every feed clear, call `on_invalidate` for configured IDs. On each valid snapshot or delta, call `on_book` with the complete sorted `LighterOrderBookSnapshot`.
 
-Have `LighterCollector` map market IDs to configured markets and publish books/metadata into the shared `LatestMarketData`. Move `orderBookDetails` out of `collect_once`/the sampler into startup plus a sequential low-frequency metadata task. On refresh failure, keep the last parsed details and the WS cache. Keep the existing funding parser and hourly model construction unchanged.
+Have `LighterCollector` map market IDs to configured markets and publish books/metadata into the shared `LatestMarketData`. Move `orderBookDetails` out of `collect_once`/the sampler into startup plus a sequential low-frequency metadata task. Keep the feed absent until the first successful discovery; each later successful refresh must call one small `_ensure_order_book_feed` path that starts or restarts the feed when IDs become available or change. On refresh failure, keep the last parsed details and the WS cache. Keep the existing funding parser and hourly model construction unchanged. Do not add a generic dynamic-subscription framework.
 
 - [ ] **Step 4: Run Lighter and funding regression tests.**
 
@@ -484,11 +507,11 @@ git commit -m "Move Arcus REST refresh off market sampler"
 
 **Interfaces:**
 - `RadarApplication.run()` stops scheduling before entering shutdown, awaits `pipeline.stop()`, flushes Parquet, then cancels/awaits `AlertWorker`, then closes `SQLiteRuntimeStore`.
-- `run_telegram_smoke(application, *, symbol="BTC", now=None, readiness_timeout_seconds=30.0)` starts the pipeline, waits for at least two ready/fresh `$10k` feeds for the symbol, samples once, stops the pipeline, performs the final flush, processes the synthetic alert, and closes runtime resources after cleanup.
+- `run_telegram_smoke(application, *, symbol="BTC", now=None, readiness_timeout_seconds=30.0)` starts the pipeline, waits for at least two ready/fresh `$10k` feeds for the symbol, takes the cache-only sample, builds the synthetic alert, stops the pipeline, performs the final flush, processes the alert, and closes runtime resources after cleanup.
 
 - [ ] **Step 1: Write failing lifecycle tests.**
 
-Extend `RecordingPipeline` and `FakeWorker` to record lifecycle events. Assert the application order is `pipeline.stop`, `flush`, `worker.stop`, `runtime.close`, and assert no pipeline append event occurs after the flush event. Add a smoke fake that records `start`, `wait_for_market_feeds`, `collect_once`, `flush`, and `stop`.
+Extend `RecordingPipeline` and `FakeWorker` to record lifecycle events. Assert the application order is `pipeline.stop`, `flush`, `worker.stop`, `runtime.close`, and assert no pipeline append event occurs after the flush event. Add a smoke fake that records `start`, `wait_for_market_feeds`, `collect_once`, `build_alert`, `stop`, `flush`, `process`, and `runtime.close`.
 
 ```python
 async def test_telegram_smoke_starts_waits_samples_and_stops_pipeline():
@@ -499,8 +522,11 @@ async def test_telegram_smoke_starts_waits_samples_and_stops_pipeline():
         "start",
         "wait_for_market_feeds:BTC",
         "collect_once",
+        "build_alert",
         "stop",
         "flush",
+        "process",
+        "runtime.close",
     ]
 ```
 
@@ -520,7 +546,7 @@ Expected: current shutdown and smoke paths have the old order and call cache-onl
 
 Make the application loop exit before invoking `pipeline.stop`. Do not start a new scheduler task during cleanup. Await the pipeline barrier before `flush_now`. Stop the alert worker after the flush and await it before closing SQLite. Keep exception logging and `CancelledError` propagation intact.
 
-Update `run_telegram_smoke` to call `pipeline.start`, `wait_for_market_feeds`, `collect_once`, and processing inside a `try`; in `finally`, await pipeline stop, perform the final flush after the barrier, and close the runtime store. Do not add network calls to `collect_once`.
+Update `run_telegram_smoke` to call `pipeline.start`, `wait_for_market_feeds`, `collect_once`, and `build_telegram_smoke_alert` first; then await pipeline stop before the final flush, process the synthetic alert only after that flush barrier, and close runtime resources last. Keep cleanup exception-safe if startup or readiness fails. Do not add network calls to `collect_once`.
 
 - [ ] **Step 4: Run app and full smoke-path tests.**
 
