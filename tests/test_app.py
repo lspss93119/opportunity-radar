@@ -97,7 +97,12 @@ class RecordingPipeline:
         self.events = events
         self.flush_calls: list[datetime] = []
 
-    async def collect_once(self, *, now: datetime) -> CollectorBatch:
+    async def collect_once(
+        self,
+        *,
+        now: datetime,
+        sample_time: datetime | None = None,
+    ) -> CollectorBatch:
         self.events.append("pipeline.append")
         shutdown_event = getattr(self, "shutdown_event", None)
         if shutdown_event is not None:
@@ -314,6 +319,123 @@ async def test_application_cycle_updates_state_appends_storage_and_runs_monitor(
     assert state.get_market("lighter", "BTC") is not None
     assert storage.pending_count == 1
     assert runner.calls == [(NOW, state)]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_forwards_authoritative_sample_time_to_pipeline():
+    from radar.app import RadarApplication
+
+    actual_now = datetime(2026, 9, 15, 15, 7, 49, 999000, tzinfo=UTC)
+    scheduled_sample_time = datetime(2026, 9, 15, 15, 7, 50, tzinfo=UTC)
+
+    class ScheduledPipeline(RecordingPipeline):
+        def __init__(self, events: list[str]) -> None:
+            super().__init__(events)
+            self.collect_calls: list[tuple[datetime, datetime | None]] = []
+
+        async def collect_once(
+            self,
+            *,
+            now: datetime,
+            sample_time: datetime | None = None,
+        ) -> CollectorBatch:
+            self.collect_calls.append((now, sample_time))
+            return await super().collect_once(now=now)
+
+    class OneCycleApplication(RadarApplication):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.boundary_calls = 0
+
+        async def _wait_until_next_boundary(self, stop_event: asyncio.Event) -> bool:
+            self.boundary_calls += 1
+            if self.boundary_calls == 1:
+                self._next_scheduled_sample_time = scheduled_sample_time
+                return False
+            stop_event.set()
+            return True
+
+    events: list[str] = []
+    pipeline = ScheduledPipeline(events)
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    app = OneCycleApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=FakeRuntimeStore(events),  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: actual_now,
+    )
+
+    await app.run(stop_event=asyncio.Event())
+
+    assert pipeline.collect_calls == [(actual_now, scheduled_sample_time)]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_skips_missed_slots_without_backfilling():
+    from radar.app import RadarApplication
+
+    actual_now = datetime(2026, 9, 15, 15, 7, 49, 999000, tzinfo=UTC)
+    after_cycle = datetime(2026, 9, 15, 15, 8, 1, tzinfo=UTC)
+    scheduled_sample_time = datetime(2026, 9, 15, 15, 7, 50, tzinfo=UTC)
+    expected_next_slot = datetime(2026, 9, 15, 15, 8, 10, tzinfo=UTC)
+    clock_values = [actual_now, after_cycle, after_cycle]
+
+    class ScheduledPipeline(RecordingPipeline):
+        def __init__(self, events: list[str]) -> None:
+            super().__init__(events)
+            self.collect_calls: list[tuple[datetime, datetime | None]] = []
+
+        async def collect_once(
+            self,
+            *,
+            now: datetime,
+            sample_time: datetime | None = None,
+        ) -> CollectorBatch:
+            self.collect_calls.append((now, sample_time))
+            return await super().collect_once(now=now)
+
+    class SkipApplication(RadarApplication):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.boundary_calls = 0
+            self.next_slot_seen: datetime | None = None
+
+        async def _wait_until_next_boundary(self, stop_event: asyncio.Event) -> bool:
+            self.boundary_calls += 1
+            if self.boundary_calls == 1:
+                self._next_scheduled_sample_time = scheduled_sample_time
+                return False
+            self.next_slot_seen = self._next_scheduled_sample_time
+            stop_event.set()
+            return True
+
+    def clock() -> datetime:
+        return clock_values.pop(0) if clock_values else after_cycle
+
+    events: list[str] = []
+    pipeline = ScheduledPipeline(events)
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    app = SkipApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=FakeRuntimeStore(events),  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=clock,
+    )
+
+    await app.run(stop_event=asyncio.Event())
+
+    assert pipeline.collect_calls == [(actual_now, scheduled_sample_time)]
+    assert app.next_slot_seen == expected_next_slot
 
 
 @pytest.mark.asyncio

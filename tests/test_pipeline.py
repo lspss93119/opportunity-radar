@@ -401,6 +401,142 @@ async def test_collect_once_reads_latest_cache_without_invoking_collectors():
 
 
 @pytest.mark.asyncio
+async def test_collect_once_uses_scheduler_sample_time_at_boundary():
+    actual_now = datetime(2026, 9, 15, 15, 7, 49, 999000, tzinfo=UTC)
+    scheduled_sample_time = datetime(2026, 9, 15, 15, 7, 50, tzinfo=UTC)
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="BTC",
+        bids=(BookLevel(price=99.0, base_size=200.0),),
+        asks=(BookLevel(price=101.0, base_size=200.0),),
+        observed_at=actual_now,
+    )
+    state = RadarState()
+    pipeline = MarketDataPipeline(
+        [],
+        state,
+        markets=(
+            MarketConfig(
+                venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+            ),
+        ),
+        latest_market_data=latest,
+    )
+
+    batch = await pipeline.collect_once(
+        now=actual_now,
+        sample_time=scheduled_sample_time,
+    )
+
+    assert batch.market_snapshots[0].sample_time == scheduled_sample_time
+    assert batch.market_snapshots[0].observed_at == actual_now
+
+
+@pytest.mark.asyncio
+async def test_collect_once_uses_actual_now_for_freshness_with_explicit_slot():
+    actual_now = datetime(2026, 9, 15, 15, 7, 49, 999000, tzinfo=UTC)
+    scheduled_sample_time = datetime(2026, 9, 15, 15, 7, 50, tzinfo=UTC)
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="BTC",
+        bids=(BookLevel(price=99.0, base_size=200.0),),
+        asks=(BookLevel(price=101.0, base_size=200.0),),
+        observed_at=actual_now - timedelta(seconds=30, microseconds=500),
+    )
+    pipeline = MarketDataPipeline(
+        [],
+        RadarState(),
+        markets=(
+            MarketConfig(
+                venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+            ),
+        ),
+        latest_market_data=latest,
+        stale_after_seconds=30,
+    )
+
+    batch = await pipeline.collect_once(
+        now=actual_now,
+        sample_time=scheduled_sample_time,
+    )
+
+    assert batch.market_snapshots == ()
+
+
+@pytest.mark.asyncio
+async def test_collect_once_without_explicit_sample_time_keeps_alignment():
+    actual_now = datetime(2026, 9, 15, 15, 7, 49, 999000, tzinfo=UTC)
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="BTC",
+        bids=(BookLevel(price=99.0, base_size=200.0),),
+        asks=(BookLevel(price=101.0, base_size=200.0),),
+        observed_at=actual_now,
+    )
+    pipeline = MarketDataPipeline(
+        [],
+        RadarState(),
+        markets=(
+            MarketConfig(
+                venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+            ),
+        ),
+        latest_market_data=latest,
+    )
+
+    batch = await pipeline.collect_once(now=actual_now)
+
+    assert batch.market_snapshots[0].sample_time == datetime(
+        2026, 9, 15, 15, 7, 40, tzinfo=UTC
+    )
+
+
+@pytest.mark.asyncio
+async def test_consecutive_explicit_scheduler_slots_remain_distinct():
+    first_now = datetime(2026, 9, 15, 15, 7, 40, 1000, tzinfo=UTC)
+    first_slot = datetime(2026, 9, 15, 15, 7, 40, tzinfo=UTC)
+    second_now = datetime(2026, 9, 15, 15, 7, 49, 999000, tzinfo=UTC)
+    second_slot = datetime(2026, 9, 15, 15, 7, 50, tzinfo=UTC)
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="BTC",
+        bids=(BookLevel(price=99.0, base_size=200.0),),
+        asks=(BookLevel(price=101.0, base_size=200.0),),
+        observed_at=first_now,
+    )
+    pipeline = MarketDataPipeline(
+        [],
+        RadarState(),
+        markets=(
+            MarketConfig(
+                venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+            ),
+        ),
+        latest_market_data=latest,
+    )
+
+    first_batch = await pipeline.collect_once(now=first_now, sample_time=first_slot)
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="BTC",
+        bids=(BookLevel(price=99.0, base_size=200.0),),
+        asks=(BookLevel(price=101.0, base_size=200.0),),
+        observed_at=second_now,
+    )
+    second_batch = await pipeline.collect_once(
+        now=second_now,
+        sample_time=second_slot,
+    )
+
+    assert first_batch.market_snapshots[0].sample_time == first_slot
+    assert second_batch.market_snapshots[0].sample_time == second_slot
+
+
+@pytest.mark.asyncio
 async def test_variational_background_task_does_not_enter_market_state_and_stops_cleanly():
     collector = BlockingQuotedCollector(make_quoted_snapshot())
     pipeline = MarketDataPipeline(

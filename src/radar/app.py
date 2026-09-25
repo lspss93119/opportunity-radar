@@ -112,10 +112,21 @@ class RadarApplication:
         self._next_scheduled_sample_time: datetime | None = None
         self._last_cycle_timing: _CycleTiming | None = None
 
-    async def collect_and_evaluate_once(self, now: datetime) -> CollectorBatch:
+    async def collect_and_evaluate_once(
+        self,
+        now: datetime,
+        *,
+        sample_time: datetime | None = None,
+    ) -> CollectorBatch:
         current_time = _as_utc(now, "now")
         collect_started = time.perf_counter()
-        batch = await self.pipeline.collect_once(now=current_time)
+        if sample_time is None:
+            batch = await self.pipeline.collect_once(now=current_time)
+        else:
+            batch = await self.pipeline.collect_once(
+                now=current_time,
+                sample_time=sample_time,
+            )
         cache_collect_ms = _elapsed_ms(collect_started)
         self.stats.collection_cycles += 1
         if batch.market_snapshots:
@@ -245,7 +256,10 @@ class RadarApplication:
                 )
                 critical_started = time.perf_counter()
                 try:
-                    batch = await self.collect_and_evaluate_once(cycle_time)
+                    batch = await self.collect_and_evaluate_once(
+                        cycle_time,
+                        sample_time=scheduled_sample_time,
+                    )
                     self.maybe_flush(cycle_time)
                     scheduler_critical_ms = _elapsed_ms(critical_started)
                     timing = self._last_cycle_timing

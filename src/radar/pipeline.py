@@ -313,12 +313,28 @@ class MarketDataPipeline:
         """Flush the optional storage buffer at an application-owned boundary."""
         return 0 if self.storage is None else self.storage.flush(now=now)
 
-    async def collect_once(self, *, now: datetime | None = None) -> CollectorBatch:
+    async def collect_once(
+        self,
+        *,
+        now: datetime | None = None,
+        sample_time: datetime | None = None,
+    ) -> CollectorBatch:
         current_time = self._clock() if now is None else now
-        sample_time = aligned_sample_time(current_time, self.sampling_seconds)
+        if sample_time is None:
+            resolved_sample_time = aligned_sample_time(
+                current_time, self.sampling_seconds
+            )
+        else:
+            if sample_time.tzinfo is None or sample_time.utcoffset() is None:
+                raise ValueError("sample_time must be timezone-aware")
+            resolved_sample_time = sample_time.astimezone(UTC)
+            if aligned_sample_time(
+                resolved_sample_time, self.sampling_seconds
+            ) != resolved_sample_time:
+                raise ValueError("sample_time must be aligned to a 10-second boundary")
         batch = self._latest_market_data.build_batch(
             self._markets,
-            sample_time=sample_time,
+            sample_time=resolved_sample_time,
             now=current_time,
             stale_after_seconds=self._stale_after_seconds,
         )
