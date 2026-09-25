@@ -20,6 +20,7 @@ from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
+ARCUS_L2_CONCURRENCY = 4
 
 
 @dataclass(frozen=True)
@@ -215,9 +216,10 @@ class ArcusCollector:
             self._details = details
             self._metadata_observed_at = metadata_observed_at
             self._refresh_cache_metadata(details)
+            l2_semaphore = asyncio.Semaphore(ARCUS_L2_CONCURRENCY)
             await asyncio.gather(
                 *(
-                    self._refresh_market(market, details)
+                    self._refresh_market(market, details, l2_semaphore)
                     for market in self._markets
                 )
             )
@@ -256,14 +258,16 @@ class ArcusCollector:
         self,
         market: MarketConfig,
         details: dict[str, ArcusMarketDetail],
+        l2_semaphore: asyncio.Semaphore,
     ) -> None:
         if market.venue_symbol not in details:
             return
         try:
-            payload = await self._request_json(
-                f"{self.L2_ORDER_BOOK_URL}/{market.venue_symbol}",
-                method="GET",
-            )
+            async with l2_semaphore:
+                payload = await self._request_json(
+                    f"{self.L2_ORDER_BOOK_URL}/{market.venue_symbol}",
+                    method="GET",
+                )
             observed_at = self._clock()
             bids, asks = parse_arcus_l2_order_book(payload)
             if self._latest_market_data is not None:
@@ -277,7 +281,14 @@ class ArcusCollector:
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001
-            report_collector_error(self._error_handler, self.venue, error)
+            contextual_error = RuntimeError(
+                f"{self.venue} {market.venue_symbol} L2 request failed: {error}"
+            )
+            report_collector_error(
+                self._error_handler,
+                self.venue,
+                contextual_error,
+            )
 
     async def collect(
         self, *, sample_time: datetime, include_hourly_context: bool

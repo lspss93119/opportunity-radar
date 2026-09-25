@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from radar.collectors.arcus import (
+    ARCUS_L2_CONCURRENCY,
     ArcusCollector,
     parse_arcus_funding_rates,
     parse_arcus_l2_order_book,
@@ -132,6 +133,70 @@ class MetadataFailureTransport(FixtureTransport):
         )
 
 
+def many_configured_markets() -> list[MarketConfig]:
+    return [
+        MarketConfig(
+            venue="arcus",
+            venue_symbol=f"TEST-{index}-USD",
+            canonical_symbol=f"TEST-{index}",
+        )
+        for index in range(27)
+    ]
+
+
+def many_markets_payload(markets: list[MarketConfig]) -> dict[str, list[dict]]:
+    template = load_fixture("markets.json")["markets"][0]
+    return {
+        "markets": [
+            {
+                **template,
+                "marketDisplayName": market.venue_symbol,
+                "marketId": index + 100,
+            }
+            for index, market in enumerate(markets)
+        ]
+    }
+
+
+class ConcurrencyTrackingTransport:
+    def __init__(self, markets: list[MarketConfig]) -> None:
+        self.markets_payload = many_markets_payload(markets)
+        self.started_symbols: set[str] = set()
+        self.active_requests = 0
+        self.max_active_requests = 0
+        self.fourth_request_started = asyncio.Event()
+        self.release_requests = asyncio.Event()
+
+    async def __call__(self, url: str, *, method: str, json_body=None, params=None):
+        if url == ArcusCollector.MARKETS_URL:
+            return self.markets_payload
+        if not url.startswith(ArcusCollector.L2_ORDER_BOOK_URL):
+            raise AssertionError(f"unexpected request: {url} {params}")
+
+        symbol = url.rsplit("/", 1)[-1]
+        self.started_symbols.add(symbol)
+        self.active_requests += 1
+        self.max_active_requests = max(self.max_active_requests, self.active_requests)
+        if len(self.started_symbols) >= ARCUS_L2_CONCURRENCY:
+            self.fourth_request_started.set()
+        try:
+            await self.release_requests.wait()
+            return load_fixture("l2_sndk_usd.json")
+        finally:
+            self.active_requests -= 1
+
+
+class IndividualFailureTransport(FixtureTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_symbol: str | None = None
+
+    async def __call__(self, url: str, *, method: str, json_body=None, params=None):
+        if self.fail_symbol is not None and url.endswith(self.fail_symbol):
+            raise OSError("HTTP Error 429: Too Many Requests")
+        return await super().__call__(url, method=method, json_body=json_body, params=params)
+
+
 async def wait_for_ready_cache(
     latest: LatestMarketData, markets: list[MarketConfig]
 ) -> None:
@@ -195,6 +260,77 @@ async def test_arcus_background_refresh_does_not_block_cache_sampler():
     finally:
         transport.release_metadata.set()
         await collector.stop()
+
+
+@pytest.mark.asyncio
+async def test_arcus_refresh_limits_l2_concurrency_and_attempts_every_configured_market():
+    assert ARCUS_L2_CONCURRENCY == 4
+    markets = many_configured_markets()
+    transport = ConcurrencyTrackingTransport(markets)
+    latest = LatestMarketData()
+    collector = ArcusCollector(
+        markets,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        latest_market_data=latest,
+    )
+
+    refresh_task = asyncio.create_task(collector.refresh_once())
+    try:
+        await asyncio.wait_for(transport.fourth_request_started.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        assert transport.max_active_requests == ARCUS_L2_CONCURRENCY
+        assert len(transport.started_symbols) == ARCUS_L2_CONCURRENCY
+
+        transport.release_requests.set()
+        await refresh_task
+    finally:
+        transport.release_requests.set()
+        if not refresh_task.done():
+            await refresh_task
+
+    assert transport.started_symbols == {
+        market.venue_symbol for market in markets
+    }
+    assert all(
+        latest._views[(market.venue, market.venue_symbol)].ready
+        for market in markets
+    )
+
+
+@pytest.mark.asyncio
+async def test_arcus_individual_l2_failure_keeps_prior_cache_and_identifies_symbol():
+    transport = IndividualFailureTransport()
+    latest = LatestMarketData()
+    markets = configured_markets()
+    failures: list[tuple[str, Exception]] = []
+    collector = ArcusCollector(
+        markets,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        error_handler=lambda venue, error: failures.append((venue, error)),
+        latest_market_data=latest,
+    )
+    pipeline = cache_pipeline(collector, markets, latest)
+
+    await collector.refresh_once()
+    before = await pipeline.collect_once(now=OBSERVED_AT)
+    transport.fail_symbol = "NVDA-USD"
+    await collector.refresh_once()
+    after = await pipeline.collect_once(now=OBSERVED_AT)
+
+    assert [snapshot.canonical_symbol for snapshot in before.market_snapshots] == [
+        "SNDK",
+        "NVDA",
+    ]
+    assert [snapshot.canonical_symbol for snapshot in after.market_snapshots] == [
+        "SNDK",
+        "NVDA",
+    ]
+    assert after.market_snapshots[1].observed_at == before.market_snapshots[1].observed_at
+    assert [(venue, str(error)) for venue, error in failures] == [
+        ("arcus", "arcus NVDA-USD L2 request failed: HTTP Error 429: Too Many Requests")
+    ]
 
 
 @pytest.mark.asyncio
@@ -285,7 +421,7 @@ async def test_arcus_refresh_omits_only_failed_market():
         "SNDK"
     ]
     assert [(venue, str(error)) for venue, error in failures] == [
-        ("arcus", "Arcus book unavailable")
+        ("arcus", "arcus NVDA-USD L2 request failed: Arcus book unavailable")
     ]
 
 
@@ -416,7 +552,7 @@ async def test_arcus_collector_omits_only_symbol_when_its_book_request_fails():
 
     assert [snapshot.canonical_symbol for snapshot in batch.market_snapshots] == ["SNDK"]
     assert [(venue, str(error)) for venue, error in failures] == [
-        ("arcus", "Arcus book unavailable")
+        ("arcus", "arcus NVDA-USD L2 request failed: Arcus book unavailable")
     ]
 
 
