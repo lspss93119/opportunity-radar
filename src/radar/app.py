@@ -587,6 +587,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     opportunities_parser.add_argument("--symbol")
     opportunities_parser.add_argument("--min-net-bps", type=float)
+    variational_parser = subparsers.add_parser(
+        "variational-opportunities",
+        help="report read-only Variational $1k discovery opportunities",
+    )
+    variational_parser.add_argument("--config", type=Path, required=True)
+    variational_parser.add_argument("--hours", type=float, default=24.0)
+    variational_parser.add_argument("--top", type=int, default=30)
+    variational_parser.add_argument("--symbol")
+    variational_parser.add_argument("--min-net-bps", type=float)
+    variational_parser.add_argument("--other-venue")
     return parser
 
 
@@ -612,6 +622,27 @@ def main(argv: list[str] | None = None) -> int:
                 min_net_bps=args.min_net_bps,
             )
             print(format_opportunity_report(report, top=args.top))
+        elif args.command == "variational-opportunities":
+            from radar.history.variational_opportunities import (
+                build_variational_opportunity_report,
+                format_variational_opportunity_report,
+            )
+
+            variational_report = build_variational_opportunity_report(
+                DEFAULT_DATA_ROOT,
+                config,
+                hours=args.hours,
+                top=args.top,
+                symbol=args.symbol,
+                min_net_bps=args.min_net_bps,
+                other_venue=args.other_venue,
+            )
+            print(
+                format_variational_opportunity_report(
+                    variational_report,
+                    top=args.top,
+                )
+            )
         elif args.command == "run":
             application = build_application(config)
             asyncio.run(application.run())
