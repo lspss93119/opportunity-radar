@@ -112,7 +112,7 @@ def fixture_websocket(
         if coin in included
     )
     websocket = FixtureWebSocket(messages)
-    return websocket, lambda _url: websocket
+    return websocket, lambda _url, **_kwargs: websocket
 
 
 async def wait_for_books(collector: HyperliquidCollector, coins: tuple[str, ...]) -> None:
@@ -349,7 +349,7 @@ async def test_hyperliquid_invalid_cache_publication_clears_local_book():
         [market],
         request_json=transport,
         clock=lambda: OBSERVED_AT,
-        websocket_connect=lambda _url: websocket,
+        websocket_connect=lambda _url, **_kwargs: websocket,
         latest_market_data=latest,
         error_handler=lambda venue, error: failures.append((venue, error)),
     )

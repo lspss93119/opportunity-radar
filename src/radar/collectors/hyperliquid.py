@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Sequence
+import logging
+import time
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -27,6 +29,10 @@ from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
 HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
+HYPERLIQUID_HEARTBEAT_INTERVAL_SECONDS = 50.0
+HYPERLIQUID_RECONNECT_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+L2_SILENCE_TIMEOUT_SECONDS = 20.0
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,25 @@ class HyperliquidOrderBookSnapshot:
     bids: tuple[BookLevel, ...]
     asks: tuple[BookLevel, ...]
     observed_at: datetime
+
+
+@dataclass
+class _HyperliquidSession:
+    generation: int
+    websocket: Any | None
+    started_at: datetime
+    started_at_monotonic: float = 0.0
+    last_l2_activity_monotonic: float = 0.0
+    l2_activity_event: asyncio.Event | None = None
+    last_message_at: datetime | None = None
+    last_l2book_at: datetime | None = None
+    first_l2book_at: datetime | None = None
+    all_l2books_at: datetime | None = None
+    last_pong_at: datetime | None = None
+    pings_sent: int = 0
+    pongs_received: int = 0
+    healthy: bool = False
+    disconnect_reason: str = "unknown"
 
 
 def parse_hyperliquid_meta_and_asset_ctxs(
@@ -136,16 +161,30 @@ class HyperliquidOrderBookFeed:
         ws_url: str,
         coins: Sequence[str],
         *,
-        connect: Callable[[str], Any] = websockets.connect,
+        connect: Callable[..., Any] = websockets.connect,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         venue: str = "hyperliquid",
         on_book: Callable[[str, HyperliquidOrderBookSnapshot], None] | None = None,
         on_invalidate: Callable[[str], None] | None = None,
-        reconnect_delay_seconds: float = 1.0,
+        reconnect_delay_seconds: float | None = None,
         error_handler: CollectorErrorHandler | None = None,
+        heartbeat_interval_seconds: float = HYPERLIQUID_HEARTBEAT_INTERVAL_SECONDS,
+        reconnect_delays: Sequence[float] = HYPERLIQUID_RECONNECT_DELAYS_SECONDS,
+        reconnect_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+        l2_silence_timeout_seconds: float = L2_SILENCE_TIMEOUT_SECONDS,
     ) -> None:
-        if reconnect_delay_seconds < 0:
+        if reconnect_delay_seconds is not None and reconnect_delay_seconds < 0:
             raise ValueError("reconnect_delay_seconds must be non-negative")
+        if heartbeat_interval_seconds <= 0:
+            raise ValueError("heartbeat_interval_seconds must be positive")
+        if l2_silence_timeout_seconds <= 0:
+            raise ValueError("l2_silence_timeout_seconds must be positive")
+        normalized_reconnect_delays = tuple(reconnect_delays)
+        if not normalized_reconnect_delays or any(
+            delay < 0 for delay in normalized_reconnect_delays
+        ):
+            raise ValueError("reconnect_delays must contain non-negative values")
         normalized_coins = tuple(coins)
         if any(not isinstance(coin, str) or not coin for coin in normalized_coins):
             raise ValueError("coins must contain non-empty strings")
@@ -157,12 +196,21 @@ class HyperliquidOrderBookFeed:
         self._venue = venue
         self._on_book = on_book
         self._on_invalidate = on_invalidate
-        self._reconnect_delay_seconds = reconnect_delay_seconds
+        self._reconnect_delays = (
+            (reconnect_delay_seconds,)
+            if reconnect_delay_seconds is not None
+            else normalized_reconnect_delays
+        )
+        self._reconnect_sleep = reconnect_sleep
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._monotonic = monotonic
+        self._l2_silence_timeout_seconds = l2_silence_timeout_seconds
         self._error_handler = error_handler
         self._snapshots: dict[str, HyperliquidOrderBookSnapshot] = {}
         self._task: asyncio.Task[None] | None = None
         self._websocket: Any | None = None
         self._stopping = False
+        self._session_generation = 0
         self.reconnect_count = 0
 
     @property
@@ -215,36 +263,222 @@ class HyperliquidOrderBookFeed:
         self._notify_invalidate(coin)
 
     async def _run(self) -> None:
+        backoff_index = 0
         while not self._stopping:
             self._clear_snapshots()
-            try:
-                async with self._connect(self.ws_url) as websocket:
-                    self._websocket = websocket
-                    for coin in self._coins:
-                        await websocket.send(
-                            json.dumps(
-                                {
-                                    "method": "subscribe",
-                                    "subscription": {"type": "l2Book", "coin": coin},
-                                }
-                            )
-                        )
-                    async for raw_message in websocket:
-                        await self._handle_message(websocket, raw_message)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001
-                report_collector_error(self._error_handler, self._venue, error)
-            finally:
-                self._websocket = None
-                self._clear_snapshots()
+            session_healthy = await self._run_connection()
+            self._clear_snapshots()
             if self._stopping:
                 return
+            delay = self._reconnect_delays[
+                min(backoff_index, len(self._reconnect_delays) - 1)
+            ]
             self.reconnect_count += 1
-            await asyncio.sleep(self._reconnect_delay_seconds)
+            LOGGER.info(
+                "hyperliquid websocket reconnect scheduled venue=%s "
+                "reconnect_count=%d delay_seconds=%.1f healthy=%s",
+                self._venue,
+                self.reconnect_count,
+                delay,
+                session_healthy,
+            )
+            await self._reconnect_sleep(delay)
+            if session_healthy:
+                backoff_index = 0
+            else:
+                backoff_index = min(backoff_index + 1, len(self._reconnect_delays) - 1)
 
-    async def _handle_message(self, websocket: Any, raw_message: object) -> None:
-        received_at = self._clock()
+    async def _run_connection(self) -> bool:
+        self._session_generation += 1
+        session = _HyperliquidSession(
+            generation=self._session_generation,
+            websocket=None,
+            started_at=self._clock(),
+        )
+        receiver_task: asyncio.Task[None] | None = None
+        heartbeat_task: asyncio.Task[None] | None = None
+        l2_watchdog_task: asyncio.Task[None] | None = None
+        try:
+            async with self._connect(self.ws_url, ping_interval=None) as websocket:
+                session.websocket = websocket
+                session.started_at_monotonic = self._monotonic()
+                session.last_l2_activity_monotonic = session.started_at_monotonic
+                session.l2_activity_event = asyncio.Event()
+                self._websocket = websocket
+                LOGGER.info(
+                    "hyperliquid websocket connected venue=%s session=%d",
+                    self._venue,
+                    session.generation,
+                )
+                for coin in self._coins:
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "method": "subscribe",
+                                "subscription": {"type": "l2Book", "coin": coin},
+                            }
+                        )
+                    )
+
+                receiver_task = asyncio.create_task(
+                    self._receive_messages(session),
+                    name=f"{self._venue}-order-book-receiver",
+                )
+                heartbeat_task = asyncio.create_task(
+                    self._send_heartbeats(session),
+                    name=f"{self._venue}-websocket-heartbeat",
+                )
+                l2_watchdog_task = asyncio.create_task(
+                    self._watch_l2_silence(session),
+                    name=f"{self._venue}-l2-silence-watchdog",
+                )
+                done, _ = await asyncio.wait(
+                    (receiver_task, heartbeat_task, l2_watchdog_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if receiver_task in done:
+                    session.disconnect_reason = "receive_loop_ended"
+                if heartbeat_task in done:
+                    session.disconnect_reason = "heartbeat_task_ended"
+                if l2_watchdog_task in done:
+                    session.disconnect_reason = "l2_silence_timeout"
+                for task in done:
+                    task.result()
+        except asyncio.CancelledError:
+            session.disconnect_reason = "shutdown"
+            raise
+        except Exception as error:  # noqa: BLE001
+            session.disconnect_reason = f"{type(error).__name__}: {error}"
+            report_collector_error(self._error_handler, self._venue, error)
+        finally:
+            tasks = tuple(
+                task
+                for task in (receiver_task, heartbeat_task, l2_watchdog_task)
+                if task is not None
+            )
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if self._websocket is session.websocket:
+                self._websocket = None
+            now = self._clock()
+            session_seconds = max(
+                0.0, (now - session.started_at).total_seconds()
+            )
+            last_message_age = None
+            if session.last_message_at is not None:
+                last_message_age = max(
+                    0.0, (now - session.last_message_at).total_seconds()
+                )
+            last_l2book_age = None
+            if session.last_l2book_at is not None:
+                last_l2book_age = max(
+                    0.0, (now - session.last_l2book_at).total_seconds()
+                )
+            LOGGER.info(
+                "hyperliquid websocket disconnected venue=%s session=%d "
+                "reason=%s session_seconds=%.3f last_message_age_seconds=%s "
+                "last_l2book_age_seconds=%s pings_sent=%d pongs_received=%d "
+                "healthy=%s",
+                self._venue,
+                session.generation,
+                session.disconnect_reason,
+                session_seconds,
+                last_message_age,
+                last_l2book_age,
+                session.pings_sent,
+                session.pongs_received,
+                session.healthy,
+            )
+        return session.healthy
+
+    async def _receive_messages(self, session: _HyperliquidSession) -> None:
+        websocket = session.websocket
+        if websocket is None:
+            raise RuntimeError("Hyperliquid websocket session is not connected")
+        async for raw_message in websocket:
+            received_at = self._clock()
+            session.last_message_at = received_at
+            await self._handle_message(session, raw_message, received_at)
+
+    async def _send_heartbeats(self, session: _HyperliquidSession) -> None:
+        websocket = session.websocket
+        if websocket is None:
+            raise RuntimeError("Hyperliquid websocket session is not connected")
+        while not self._stopping:
+            await asyncio.sleep(self._heartbeat_interval_seconds)
+            if self._stopping:
+                return
+            await websocket.send(json.dumps({"method": "ping"}))
+            session.pings_sent += 1
+            LOGGER.debug(
+                "hyperliquid websocket heartbeat sent venue=%s session=%d",
+                self._venue,
+                session.generation,
+            )
+
+    async def _watch_l2_silence(self, session: _HyperliquidSession) -> None:
+        websocket = session.websocket
+        activity_event = session.l2_activity_event
+        if websocket is None:
+            raise RuntimeError("Hyperliquid l2 watchdog session is not initialized")
+        if activity_event is None:
+            raise RuntimeError("Hyperliquid l2 watchdog event is not initialized")
+        while not self._stopping:
+            remaining = self._l2_silence_timeout_seconds - (
+                self._monotonic() - session.last_l2_activity_monotonic
+            )
+            if remaining <= 0:
+                if (
+                    self._websocket is not websocket
+                    or self._session_generation != session.generation
+                ):
+                    return
+                LOGGER.warning(
+                    "hyperliquid websocket l2 silence timeout venue=%s "
+                    "session=%d elapsed_seconds=%.3f",
+                    self._venue,
+                    session.generation,
+                    self._monotonic() - session.last_l2_activity_monotonic,
+                )
+                assert websocket is not None
+                await websocket.close()
+                return
+            activity_event.clear()
+            remaining = self._l2_silence_timeout_seconds - (
+                self._monotonic() - session.last_l2_activity_monotonic
+            )
+            if remaining <= 0:
+                continue
+            try:
+                await asyncio.wait_for(activity_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                continue
+
+    def _mark_session_healthy(
+        self, session: _HyperliquidSession, *, source: str
+    ) -> None:
+        if session.healthy:
+            return
+        session.healthy = True
+        LOGGER.info(
+            "hyperliquid websocket session healthy venue=%s session=%d source=%s",
+            self._venue,
+            session.generation,
+            source,
+        )
+
+    async def _handle_message(
+        self,
+        session: _HyperliquidSession,
+        raw_message: object,
+        received_at: datetime,
+    ) -> None:
+        websocket = session.websocket
+        if websocket is None:
+            raise RuntimeError("Hyperliquid websocket session is not connected")
         if isinstance(raw_message, bytes):
             raw_message = raw_message.decode()
         if not isinstance(raw_message, str):
@@ -262,7 +496,17 @@ class HyperliquidOrderBookFeed:
         if message.get("method") == "ping":
             await websocket.send(json.dumps({"method": "pong"}))
             return
-        if channel in {"pong", "heartbeat"}:
+        if channel == "pong":
+            session.pongs_received += 1
+            session.last_pong_at = received_at
+            self._mark_session_healthy(session, source="pong")
+            LOGGER.debug(
+                "hyperliquid websocket heartbeat pong received venue=%s session=%d",
+                self._venue,
+                session.generation,
+            )
+            return
+        if channel == "heartbeat":
             return
         if channel != "l2Book":
             return
@@ -291,6 +535,39 @@ class HyperliquidOrderBookFeed:
             observed_at=received_at,
         )
         self._snapshots[coin] = snapshot
+        session.last_l2_activity_monotonic = self._monotonic()
+        if session.l2_activity_event is not None:
+            session.l2_activity_event.set()
+        session.last_l2book_at = received_at
+        if session.first_l2book_at is None:
+            session.first_l2book_at = received_at
+            first_l2book_seconds = max(
+                0.0, (received_at - session.started_at).total_seconds()
+            )
+            LOGGER.info(
+                "hyperliquid websocket first l2Book venue=%s session=%d "
+                "after_seconds=%.3f",
+                self._venue,
+                session.generation,
+                first_l2book_seconds,
+            )
+        if session.all_l2books_at is None and all(
+            configured_coin in self._snapshots
+            for configured_coin in self._coins
+        ):
+            session.all_l2books_at = received_at
+            all_l2books_seconds = max(
+                0.0, (received_at - session.started_at).total_seconds()
+            )
+            LOGGER.info(
+                "hyperliquid websocket all l2Books fresh venue=%s session=%d "
+                "after_seconds=%.3f count=%d",
+                self._venue,
+                session.generation,
+                all_l2books_seconds,
+                len(self._coins),
+            )
+        self._mark_session_healthy(session, source="l2Book")
         if self._on_book is None:
             return
         try:
@@ -315,7 +592,7 @@ class HyperliquidCollector:
         request_json=default_request_json,
         clock=lambda: datetime.now(UTC),
         error_handler: CollectorErrorHandler | None = None,
-        websocket_connect: Callable[[str], Any] = websockets.connect,
+        websocket_connect: Callable[..., Any] = websockets.connect,
         ws_url: str | None = None,
         latest_market_data: LatestMarketData | None = None,
         metadata_refresh_seconds: float = METADATA_REFRESH_SECONDS,
