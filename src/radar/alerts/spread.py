@@ -169,23 +169,39 @@ def _format_funding(
     funding: FundingContext | None,
 ) -> str:
     if funding is None:
-        return f"{venue.title()}: 不可用"
-    next_time = (
-        funding.next_funding_time.isoformat()
-        if funding.next_funding_time is not None
-        else "不可用"
-    )
+        return f"{_display_venue(venue)} 不可用"
     return (
-        f"{venue.title()}: {funding.funding_rate * 100:.4f}%"
-        f"（有效 {funding.effective_time.isoformat()}，下次 {next_time}）"
+        f"{_display_venue(venue)} {funding.funding_rate * 100:+.4f}%"
+        f" @ {_format_timestamp(funding.effective_time)}"
     )
+
+
+def _display_venue(venue: str) -> str:
+    return " ".join(part.capitalize() for part in venue.split("_"))
+
+
+def _format_price(value: float) -> str:
+    magnitude = abs(value)
+    if magnitude >= 100:
+        precision = 2
+    elif magnitude >= 1:
+        precision = 4
+    elif magnitude >= 0.01:
+        precision = 6
+    else:
+        precision = 8
+    return f"{value:.{precision}f}"
+
+
+def _format_timestamp(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _format_stats(label: str, stats: WindowStats) -> str:
     if stats.median_raw_spread_bps is None:
-        return f"{label}: 不可用（樣本數 {stats.sample_count}）"
+        return f"{label} 不可用（樣本數 {stats.sample_count}）"
     return (
-        f"{label}: 中位數 {stats.median_raw_spread_bps:.2f} bps"
+        f"{label} {stats.median_raw_spread_bps:.2f} bps"
         f"（樣本數 {stats.sample_count}）"
     )
 
@@ -193,36 +209,54 @@ def _format_stats(label: str, stats: WindowStats) -> str:
 def format_spread_alert(
     details: SpreadAlertDetails,
     context: HistoricalSpreadContext,
+    *,
+    candidate_net_bps: float = 10.0,
+    alert_net_bps: float = 20.0,
 ) -> str:
-    return "\n".join(
+    long_venue = _display_venue(details.long_venue)
+    short_venue = _display_venue(details.short_venue)
+    return "\n\n".join(
         (
-            f"價差警報 {details.canonical_symbol} ${details.primary_size_usd:,}",
-            (
-                f"做多 {details.long_venue.title()} ({details.long_venue_symbol}) "
-                f"買入 VWAP {details.long_buy_vwap:.2f}"
+            "\n".join(
+                (
+                    f"價差警報 | {details.canonical_symbol} | ${details.primary_size_usd:,}",
+                    f"做多: {long_venue} ({details.long_venue_symbol})",
+                    f"做空: {short_venue} ({details.short_venue_symbol})",
+                    (
+                        f"淨價差: {details.net_spread_bps:.2f} bps | "
+                        f"原始價差: {details.raw_spread_bps:.2f} bps | "
+                        f"手續費: {long_venue} {details.long_fee_bps:.2f} + "
+                        f"{short_venue} {details.short_fee_bps:.2f} = "
+                        f"{details.long_fee_bps + details.short_fee_bps:.2f} bps"
+                    ),
+                )
+            ),
+            "\n".join(
+                (
+                    f"買入 VWAP: {_format_price(details.long_buy_vwap)} | "
+                    f"賣出 VWAP: {_format_price(details.short_sell_vwap)}",
+                    f"樣本時間: {_format_timestamp(details.sample_time)}",
+                )
+            ),
+            "\n".join(
+                (
+                    f"候選規則: >= {candidate_net_bps:.2f} bps / "
+                    f"{details.candidate_duration_seconds}s | "
+                    f"警報規則: >= {alert_net_bps:.2f} bps / "
+                    f"{details.alert_duration_seconds}s",
+                    (
+                        "資金費率: "
+                        f"{_format_funding(details.long_venue, details.long_funding)} | "
+                        f"{_format_funding(details.short_venue, details.short_funding)}"
+                    ),
+                )
             ),
             (
-                f"做空 {details.short_venue.title()} ({details.short_venue_symbol}) "
-                f"賣出 VWAP {details.short_sell_vwap:.2f}"
+                "歷史原始價差中位數: "
+                f"{_format_stats('7日', context.stats_7d)} | "
+                f"{_format_stats('30日', context.stats_30d)} | "
+                f"{_format_stats('90日', context.stats_90d)}"
             ),
-            f"樣本時間 {details.sample_time.isoformat()}",
-            f"原始價差 {details.raw_spread_bps:.2f} bps",
-            (
-                f"手續費 {details.long_venue.title()} {details.long_fee_bps:.2f} bps"
-                f" + {details.short_venue.title()} {details.short_fee_bps:.2f} bps"
-            ),
-            f"淨價差 {details.net_spread_bps:.2f} bps",
-            (
-                f"候選持續 {details.candidate_duration_seconds}s，"
-                f"警報持續 {details.alert_duration_seconds}s"
-            ),
-            "資金費率",
-            _format_funding(details.long_venue, details.long_funding),
-            _format_funding(details.short_venue, details.short_funding),
-            "歷史原始價差",
-            _format_stats("7日", context.stats_7d),
-            _format_stats("30日", context.stats_30d),
-            _format_stats("90日", context.stats_90d),
         )
     )
 
@@ -235,11 +269,23 @@ class SpreadAlertProcessor:
         *,
         chart_renderer: Callable[
             [SpreadAlertDetails, HistoricalSpreadContext], bytes | None
-        ] = render_spread_chart,
+        ] | None = None,
+        candidate_net_bps: float = 10.0,
+        alert_net_bps: float = 20.0,
     ) -> None:
         self._history = history
         self._telegram = telegram
-        self._chart_renderer = chart_renderer
+        self._candidate_net_bps = candidate_net_bps
+        self._alert_net_bps = alert_net_bps
+        if chart_renderer is None:
+            self._chart_renderer = lambda details, context: render_spread_chart(
+                details,
+                context,
+                candidate_net_bps=candidate_net_bps,
+                alert_net_bps=alert_net_bps,
+            )
+        else:
+            self._chart_renderer = chart_renderer
 
     async def process(self, alert: AlertRequest) -> None:
         details = parse_spread_alert(alert)
@@ -258,7 +304,12 @@ class SpreadAlertProcessor:
             LOGGER.error("history query failed for alert_id=%s", alert.event_id)
             context = HistoricalSpreadContext.empty()
 
-        message = format_spread_alert(details, context)
+        message = format_spread_alert(
+            details,
+            context,
+            candidate_net_bps=self._candidate_net_bps,
+            alert_net_bps=self._alert_net_bps,
+        )
         chart_png: bytes | None = None
         try:
             chart_png = await asyncio.to_thread(

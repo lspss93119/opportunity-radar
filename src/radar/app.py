@@ -556,7 +556,12 @@ def build_application(
     )
     history = SpreadHistory(Path(data_root))
     telegram = TelegramTransport(token, chat_id)
-    processor = SpreadAlertProcessor(history, telegram)
+    processor = SpreadAlertProcessor(
+        history,
+        telegram,
+        candidate_net_bps=config.monitors.spread.candidate_net_bps,
+        alert_net_bps=config.monitors.spread.alert_net_bps,
+    )
     alert_worker = AlertWorker(
         queue,
         processor,

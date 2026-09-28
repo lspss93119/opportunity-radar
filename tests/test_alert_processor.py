@@ -247,7 +247,9 @@ async def test_processor_sends_chart_for_message_at_caption_limit():
     import radar.alerts.spread as spread_module
 
     original_formatter = spread_module.format_spread_alert
-    spread_module.format_spread_alert = lambda details, context: message  # type: ignore[assignment]
+    spread_module.format_spread_alert = (  # type: ignore[assignment]
+        lambda details, context, **kwargs: message
+    )
     try:
         await processor.process(make_alert())
     finally:

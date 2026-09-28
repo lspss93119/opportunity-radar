@@ -98,7 +98,12 @@ def test_parse_and_format_spread_alert_preserves_current_and_history_values():
     )
     assert details.short_funding is None
 
-    message = format_spread_alert(details, make_context())
+    message = format_spread_alert(
+        details,
+        make_context(),
+        candidate_net_bps=12.5,
+        alert_net_bps=25.0,
+    )
 
     assert "BTC" in message
     assert "$10,000" in message
@@ -107,7 +112,34 @@ def test_parse_and_format_spread_alert_preserves_current_and_history_values():
     assert "100.00" in message and "101.00" in message
     assert "100.00 bps" in message and "92.00 bps" in message
     assert "不可用" in message
+    assert "7日 90.00 bps" in message
+    assert "30日 85.00 bps" in message
+    assert "90日 75.00 bps" in message
+    assert "候選規則: >= 12.50 bps / 30s" in message
+    assert "警報規則: >= 25.00 bps / 120s" in message
     assert "80.00" not in message
+
+
+def test_format_spread_alert_is_grouped_into_compact_sections():
+    from radar.alerts.spread import format_spread_alert, parse_spread_alert
+
+    details = parse_spread_alert(make_alert())
+    message = format_spread_alert(details, make_context())
+
+    sections = message.split("\n\n")
+
+    assert len(sections) == 4
+    assert sections[0].splitlines()[0] == "價差警報 | BTC | $10,000"
+    assert "做多: Lighter (BTC)" in sections[0]
+    assert "做空: Hyperliquid (BTC)" in sections[0]
+    assert "淨價差: 92.00 bps" in sections[0]
+    assert "原始價差: 100.00 bps" in sections[0]
+    assert "手續費: Lighter 4.50 + Hyperliquid 3.50 = 8.00 bps" in sections[0]
+    assert "買入 VWAP: 100.00 | 賣出 VWAP: 101.00" in sections[1]
+    assert "樣本時間: 2026-09-16 12:00:00 UTC" in sections[1]
+    assert "候選規則: >= 10.00 bps / 30s" in sections[2]
+    assert "警報規則: >= 20.00 bps / 120s" in sections[2]
+    assert sections[3].startswith("歷史原始價差中位數:")
 
 
 def test_format_spread_alert_uses_traditional_chinese_wording():
@@ -124,8 +156,8 @@ def test_format_spread_alert_uses_traditional_chinese_wording():
         "原始價差",
         "手續費",
         "淨價差",
-        "候選持續",
-        "警報持續",
+        "候選規則",
+        "警報規則",
         "資金費率",
         "歷史原始價差",
         "樣本數",
@@ -158,9 +190,9 @@ def test_format_missing_history_and_funding_is_deterministically_unavailable():
     message = format_spread_alert(details, HistoricalSpreadContext.empty())
 
     assert message.count("不可用") >= 5
-    assert "7日: 不可用" in message
-    assert "30日: 不可用" in message
-    assert "90日: 不可用" in message
+    assert "7日 不可用" in message
+    assert "30日 不可用" in message
+    assert "90日 不可用" in message
 
 
 @pytest.mark.parametrize(
