@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import sqlite3
+import subprocess
 import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -390,3 +395,253 @@ def test_status_json_is_finite_and_http_routes_work(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@contextmanager
+def dashboard_http(service):
+    server = create_dashboard_server(service, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def http_json(base, path, expected_status=200):
+    try:
+        response = urlopen(base + path, timeout=15)
+    except HTTPError as error:
+        response = error
+    with response:
+        assert response.code == expected_status
+        assert response.headers["Content-Type"] == "application/json; charset=utf-8"
+        assert response.headers["Cache-Control"] == "no-store"
+        # Reject non-standard JSON tokens even when Python's decoder accepts them.
+        def reject_constant(value):
+            raise AssertionError(f"non-finite JSON: {value}")
+        return json.loads(response.read(), parse_constant=reject_constant)
+
+
+@pytest.fixture(scope="module")
+def scanner_service(tmp_path_factory):
+    root = tmp_path_factory.mktemp("dashboard-http")
+    markets, snapshots, episodes = [], [], {}
+    for symbol, current_spread, duration in [("BTC", 500, 75), ("ETH", 300, 20)]:
+        long_symbol, short_symbol = f"{symbol}-USD", f"xyz:{symbol}"
+        for venue, venue_symbol in [("lighter", long_symbol), ("hyperliquid", short_symbol)]:
+            markets.append(MarketConfig(venue=venue, venue_symbol=venue_symbol, canonical_symbol=symbol))
+        prior_times = [NOW - timedelta(days=1) + timedelta(seconds=10 * i)
+                       for i in range(8640) if i % 5 != 1]
+        for index, sample_time in enumerate([*prior_times, NOW]):
+            spread = current_spread if sample_time == NOW else (100 if index % 2 == 0 else 300)
+            snapshots.extend([
+                make_market(venue="lighter", venue_symbol=long_symbol, canonical_symbol=symbol,
+                            sample_time=sample_time, observed_at=sample_time),
+                make_market(venue="hyperliquid", venue_symbol=short_symbol, canonical_symbol=symbol,
+                            sample_time=sample_time, observed_at=sample_time, sell_10k_vwap=100 * (1 + spread / 10000)),
+            ])
+        episode = make_episode(symbol=symbol, net_spread_bps=current_spread - 3, confirmed=True)
+        episode["key"]["long_venue_symbol"] = long_symbol
+        episode["key"]["short_venue_symbol"] = short_symbol
+        episode["alert_condition_since"] = (NOW - timedelta(seconds=duration)).isoformat()
+        episodes[symbol] = episode
+    write_markets(root / "data", snapshots)
+    write_heartbeat(root / "runtime.sqlite3", episodes=episodes)
+    return DashboardStatusService(
+        RadarConfig(markets=markets, fees_bps={"lighter": 1, "hyperliquid": 2}),
+        data_root=root / "data", runtime_db=root / "runtime.sqlite3", clock=lambda: NOW,
+    )
+
+
+@pytest.fixture(scope="module")
+def scanner_http(scanner_service):
+    with dashboard_http(scanner_service) as base:
+        yield base
+
+
+def test_opportunities_http_orders_by_deviation_and_has_finite_required_fields(scanner_http):
+    payload = http_json(scanner_http, "/api/opportunities")
+    assert payload["data_as_of"] == NOW.isoformat()
+    assert payload["generated_at"] == NOW.isoformat()
+    rows = payload["rows"]
+    assert len(rows) == 4
+    assert rows[0]["canonical_symbol"] == "BTC"
+    assert rows[0]["deviation_bps"] == pytest.approx(300)
+    assert rows[1]["deviation_bps"] == pytest.approx(100)
+    assert [row["deviation_bps"] for row in rows] == sorted(
+        [row["deviation_bps"] for row in rows], reverse=True)
+    assert {"canonical_symbol", "long_venue", "long_venue_symbol", "short_venue",
+            "short_venue_symbol", "current_raw_spread_bps", "rolling_mean_bps",
+            "rolling_std_bps", "deviation_bps", "signal_duration_seconds",
+            "round_trip_fee_bps", "theoretical_edge_bps", "observed_at_skew_seconds",
+            "sample_time", "freshness_seconds", "active", "alerted"} <= rows[0].keys()
+
+
+@pytest.mark.parametrize(("query", "count", "first_symbol"), [
+    ("symbol=%20eth%20", 2, "ETH"), ("long_venue=%20LIGHTER%20", 2, "BTC"),
+    ("short_venue=HYPERLIQUID", 2, "BTC"), ("max_std=99", 2, "BTC"),
+    ("max_std=100.01", 4, "BTC"), ("min_deviation=200", 1, "BTC"),
+    ("min_duration=60", 1, "BTC"), ("active_only=true", 2, "BTC"),
+    ("active_only=false", 4, "BTC"), ("limit=1", 1, "BTC"),
+    ("symbol=BTC&long_venue=lighter&short_venue=hyperliquid&max_std=101&min_deviation=250&min_duration=70&active_only=true", 1, "BTC"),
+])
+def test_opportunities_http_filters(scanner_http, query, count, first_symbol):
+    rows = http_json(scanner_http, "/api/opportunities?" + query)["rows"]
+    assert len(rows) == count
+    if count:
+        assert rows[0]["canonical_symbol"] == first_symbol
+    if query == "max_std=99":
+        # Reverse pairs use constant buy/sell prices in this fixture (std=0).
+        assert all(row["long_venue"] == "hyperliquid" for row in rows)
+        assert all(row["rolling_std_bps"] == pytest.approx(0) for row in rows)
+
+
+@pytest.mark.parametrize("query", [
+    "max_std=nope", "max_std=-1", "max_std=NaN", "max_std=inf", "max_std=",
+    "min_deviation=nope", "min_deviation=-1", "min_deviation=-inf", "min_deviation=1e999",
+    "min_duration=-1", "min_duration=1.5", "min_duration=nan",
+    "active_only=1", "active_only=yes", "active_only=", "active_only=TRUE",
+    "limit=0", "limit=-1", "limit=201", "limit=1.5", "limit=NaN", "limit=",
+    "score=1", "symbol=", "long_venue=", "short_venue=", "symbol=BTC&symbol=ETH",
+    "limit=1&limit=1", "long_venue_symbol=BTC", "canonical_symbol=BTC", "symbol=%FF",
+])
+def test_opportunities_http_rejects_bad_unknown_and_duplicate_filters(scanner_http, query):
+    payload = http_json(scanner_http, "/api/opportunities?" + query, 400)
+    assert payload["errors"]
+    assert payload["rows"] == []
+
+
+@pytest.mark.parametrize(("heartbeat_age", "feed_age", "primary", "heartbeat", "feed", "overall"), [
+    (30, 90, True, "healthy", "healthy", "healthy"),
+    (30.1, 90, True, "degraded", "healthy", "degraded"),
+    (60, 90, True, "degraded", "healthy", "degraded"),
+    (60.1, 90, True, "down", "healthy", "down"),
+    (None, 90, True, "down", "healthy", "down"),
+    (0, 90.1, True, "healthy", "degraded", "degraded"),
+    (0, 180, True, "healthy", "degraded", "degraded"),
+    (0, 180.1, True, "healthy", "down", "degraded"),
+    (0, None, True, "healthy", "down", "degraded"),
+    (0, 0, False, "healthy", "degraded", "degraded"),
+])
+def test_status_http_preserves_evidence_boundaries(tmp_path, heartbeat_age, feed_age, primary, heartbeat, feed, overall):
+    config = make_config(MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"))
+    if heartbeat_age is not None:
+        write_heartbeat(tmp_path / "runtime.sqlite3", updated_at=NOW - timedelta(seconds=heartbeat_age))
+    if feed_age is not None:
+        write_markets(tmp_path / "data", [make_market(observed_at=NOW - timedelta(seconds=feed_age),
+            buy_10k_vwap=100 if primary else None)])
+    service = DashboardStatusService(config, data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3", clock=lambda: NOW)
+    with dashboard_http(service) as base:
+        payload = http_json(base, "/api/status")
+    assert payload["heartbeat"]["status"] == heartbeat
+    assert payload["feeds"][0]["status"] == feed
+    assert payload["overall"]["status"] == overall
+    assert {"radar_heartbeat", "data_as_of", "sample_age_seconds", "venues", "parquet", "sqlite", "episodes", "recent_events"} <= payload.keys()
+
+
+def test_status_http_partial_cycle_and_storage_errors_are_degraded(tmp_path):
+    config = make_config(*[MarketConfig(venue="lighter", venue_symbol=s, canonical_symbol=s) for s in ("BTC", "ETH")])
+    write_markets(tmp_path / "data", [make_market()])
+    write_heartbeat(tmp_path / "runtime.sqlite3")
+    service = DashboardStatusService(config, data_root=tmp_path / "data", runtime_db=tmp_path / "runtime.sqlite3", clock=lambda: NOW)
+    with dashboard_http(service) as base:
+        payload = http_json(base, "/api/status")
+        assert payload["overall"]["status"] == "degraded"
+        assert payload["overall"]["latest_feeds"] == 1
+        assert payload["venues"]["lighter"]["missing"] == 1
+        # A corrupt Parquet file cannot be represented as a healthy empty dataset.
+        (tmp_path / "data" / "market" / "date=2026-09-23" / "part-broken.parquet").write_bytes(b"broken")
+        broken = http_json(base, "/api/status")
+        assert broken["overall"]["status"] == "degraded"
+        assert broken["errors"]
+
+
+def test_storage_failure_json_and_http_reads_never_create_sources(tmp_path, monkeypatch):
+    service = DashboardStatusService(make_config(), data_root=tmp_path / "missing-data", runtime_db=tmp_path / "missing-runtime" / "radar.sqlite3", clock=lambda: NOW)
+    with dashboard_http(service) as base:
+        for path in ("/api/opportunities", "/api/status"):
+            payload = http_json(base, path)
+            assert payload["errors"] and payload["data_as_of"] is None
+        assert not service.data_root.exists()
+        assert not service.runtime_db.parent.exists()
+
+        def fail(**kwargs):
+            raise OSError("fixture storage unavailable")
+        monkeypatch.setattr(service, "get_status", fail)
+        payload = http_json(base, "/api/status")
+        assert payload["overall"]["status"] == "degraded"
+        assert payload["data_as_of"] is None
+
+
+@pytest.mark.parametrize("path", ["/", "/opportunities", "/status"])
+def test_dashboard_html_navigation_and_view_anchors(scanner_http, path):
+    with urlopen(scanner_http + path) as response:
+        assert response.headers["Content-Type"] == "text/html; charset=utf-8"
+        html = response.read().decode()
+    assert 'href="/opportunities"' in html and 'href="/status"' in html
+    if path == "/status":
+        for anchor in ("heartbeat", "venues", "parquet", "sqlite", "episode-rows", "event-rows", "unavailable"):
+            assert f'id="{anchor}"' in html
+    else:
+        for anchor in ("filters", "opportunity-rows", "data-as-of"):
+            assert f'id="{anchor}"' in html
+        for column in ("Symbol", "Long", "Short", "Spread", "24h Mean", "24h Std", "Deviation", "Duration", "RT Fee", "Theo Edge", "Skew", "Freshness"):
+            assert f">{column}<" in html
+
+
+def run_ui_script(html, expression):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is optional and only needed to execute vanilla UI behavior tests")
+    script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    harness = """
+const elements = new Map();
+const document = {getElementById(id) { if (!elements.has(id)) elements.set(id, {textContent:'', innerHTML:'', value:'', checked:false, hidden:false, addEventListener(){}}); return elements.get(id); }};
+const location = {pathname:'/', search:'?symbol=ETH&active_only=true'};
+const history = {replaceState(state, title, url){this.url=url;}};
+const window = {addEventListener(){}};
+const setInterval = () => {};
+const fetch = () => new Promise(() => {});
+"""
+    result = subprocess.run([node, "-e", harness + script + "\n" + expression], text=True, capture_output=True, check=True)
+    return json.loads(result.stdout)
+
+
+def test_scanner_exact_pair_links_and_missing_identity_never_guessed(scanner_http):
+    with urlopen(scanner_http + "/") as response:
+        html = response.read().decode()
+    links = run_ui_script(html, """
+const exact = {canonical_symbol:'BRK B', long_venue:'arcus', long_venue_symbol:'BRK/B-USD', short_venue:'trade_xyz', short_venue_symbol:'xyz:BRK B'};
+console.log(JSON.stringify([pairLink(exact), pairLink({...exact, long_venue_symbol:null}), pairLink({...exact, short_venue_symbol:''})]));
+""")
+    assert parse_qs(urlparse(links[0]).query) == {
+        "symbol": ["BRK B"], "long_venue": ["arcus"], "long_venue_symbol": ["BRK/B-USD"],
+        "short_venue": ["trade_xyz"], "short_venue_symbol": ["xyz:BRK B"],
+    }
+    assert urlparse(links[0]).path == "/pair"
+    assert links[1:] == [None, None]
+
+
+def test_scanner_restores_and_preserves_filters_without_navigation(scanner_http):
+    with urlopen(scanner_http + "/") as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+document.getElementById('min_deviation').value = '200';
+const query = filterQuery();
+console.log(JSON.stringify({symbol:document.getElementById('symbol').value, active:document.getElementById('active_only').checked, query:query.toString()}));
+""")
+    assert result["symbol"] == "ETH" and result["active"] is True
+    assert parse_qs(result["query"]) == {"symbol": ["ETH"], "active_only": ["true"], "min_deviation": ["200"]}
+
+
+def test_pair_routes_remain_deferred_and_unknown_api_is_json(scanner_http):
+    for path in ("/api/pair?symbol=BTC", "/api/unknown"):
+        assert http_json(scanner_http, path, 404)["errors"]
+    with pytest.raises(HTTPError) as error:
+        urlopen(scanner_http + "/pair?symbol=BTC")
+    assert error.value.code == 404
