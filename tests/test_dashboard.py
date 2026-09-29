@@ -28,6 +28,7 @@ def make_market(
     venue: str = "lighter",
     venue_symbol: str = "BTC",
     canonical_symbol: str = "BTC",
+    sample_time: datetime | None = None,
     observed_at: datetime = NOW,
     buy_1k_vwap: float | None = 100.0,
     sell_1k_vwap: float | None = 101.0,
@@ -37,7 +38,7 @@ def make_market(
     sell_10k_vwap: float | None = 101.0,
 ) -> MarketSnapshot:
     return MarketSnapshot(
-        sample_time=observed_at,
+        sample_time=observed_at if sample_time is None else sample_time,
         observed_at=observed_at,
         venue=venue,
         venue_symbol=venue_symbol,
@@ -191,6 +192,7 @@ def test_missing_primary_vwap_degrades_overall_but_missing_lower_sizes_does_not(
         MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC")
     )
     lower_sizes_missing = make_market(
+        observed_at=NOW - timedelta(seconds=2),
         buy_1k_vwap=None,
         sell_1k_vwap=None,
         buy_5k_vwap=None,
@@ -214,7 +216,8 @@ def test_missing_primary_vwap_degrades_overall_but_missing_lower_sizes_does_not(
         tmp_path / "data",
         [
             make_market(
-                observed_at=NOW + timedelta(seconds=1),
+                observed_at=NOW - timedelta(seconds=1),
+                sample_time=NOW,
                 buy_10k_vwap=None,
                 sell_10k_vwap=None,
             )

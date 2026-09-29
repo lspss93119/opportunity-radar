@@ -2,74 +2,31 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import sqlite3
-from collections.abc import Callable, Iterable
-from datetime import UTC, datetime, timedelta
+import sqlite3  # noqa: F401 - preserved module attribute for compatibility tests
+from collections.abc import Callable
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-import duckdb  # type: ignore[import-untyped]
-
 from radar.config import RadarConfig, load_config
+from radar.dashboard_data import (
+    DashboardQueryService,
+    classify_heartbeat as _classify_heartbeat,
+    utc_now,
+)
 
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_DB = Path("runtime/radar.sqlite3")
-HEARTBEAT_HEALTHY_SECONDS = 30.0
-HEARTBEAT_DEGRADED_SECONDS = 60.0
-FEED_HEALTHY_SECONDS = 90.0
-FEED_DEGRADED_SECONDS = 180.0
-VWAP_FIELDS = (
-    ("buy_1k_vwap", "sell_1k_vwap"),
-    ("buy_5k_vwap", "sell_5k_vwap"),
-    ("buy_10k_vwap", "sell_10k_vwap"),
-)
-
-
-def utc_now() -> datetime:
-    return datetime.now(UTC)
-
-
-def _as_utc(value: datetime, field_name: str) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError(f"{field_name} must be timezone-aware")
-    return value.astimezone(UTC)
 
 
 def classify_heartbeat(age_seconds: float | None) -> str:
-    if age_seconds is None or age_seconds > HEARTBEAT_DEGRADED_SECONDS:
-        return "down"
-    if age_seconds > HEARTBEAT_HEALTHY_SECONDS:
-        return "degraded"
-    return "healthy"
-
-
-def _classify_feed(age_seconds: float | None, primary_vwap_ready: bool) -> str:
-    if age_seconds is None or age_seconds > FEED_DEGRADED_SECONDS:
-        return "down"
-    if age_seconds > FEED_HEALTHY_SECONDS or not primary_vwap_ready:
-        return "degraded"
-    return "healthy"
-
-
-def _iso(value: datetime | None) -> str | None:
-    return None if value is None else _as_utc(value, "timestamp").isoformat()
-
-
-def _finite_float(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    result = float(value)
-    return result if math.isfinite(result) else None
-
-
-def _text(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
+    """Preserve the original dashboard health helper import path."""
+    return _classify_heartbeat(age_seconds)
 
 
 class DashboardStatusService:
-    """Read-only view of persisted Radar health and monitor state."""
+    """Compatibility facade over the read-only dashboard query service."""
 
     def __init__(
         self,
@@ -83,346 +40,16 @@ class DashboardStatusService:
         self.data_root = Path(data_root)
         self.runtime_db = Path(runtime_db)
         self._clock = clock
+        self._query_service = DashboardQueryService(
+            config,
+            data_root=self.data_root,
+            runtime_db=self.runtime_db,
+            clock=clock,
+            cache_ttl_seconds=0.0,
+        )
 
     def get_status(self, *, now: datetime | None = None) -> dict[str, object]:
-        current_time = _as_utc(self._clock() if now is None else now, "now")
-        errors: list[str] = []
-        feeds, market_errors = self._read_feeds(current_time)
-        errors.extend(market_errors)
-        heartbeat, episodes, runtime_errors = self._read_runtime(current_time)
-        errors.extend(runtime_errors)
-        recent_events, event_errors = self._read_recent_events()
-        errors.extend(event_errors)
-
-        heartbeat_age = heartbeat.get("age_seconds")
-        heartbeat_status = classify_heartbeat(
-            heartbeat_age if isinstance(heartbeat_age, (int, float)) else None
-        )
-        healthy_feeds = sum(1 for feed in feeds if feed.get("status") == "healthy")
-        primary_vwap_ready = sum(
-            1 for feed in feeds if feed.get("primary_vwap_ready") is True
-        )
-        if heartbeat_status == "down":
-            overall_status = "down"
-        elif heartbeat_status == "degraded":
-            overall_status = "degraded"
-        elif errors or any(feed.get("status") != "healthy" for feed in feeds):
-            overall_status = "degraded"
-        else:
-            overall_status = "healthy"
-
-        return {
-            "generated_at": current_time.isoformat(),
-            "heartbeat": heartbeat,
-            "overall": {
-                "status": overall_status,
-                "heartbeat_age_seconds": heartbeat["age_seconds"],
-                "configured_feeds": len(feeds),
-                "healthy_feeds": healthy_feeds,
-                "primary_vwap_ready": primary_vwap_ready,
-                "active_episodes": len(episodes),
-                "confirmed_candidates": sum(
-                    1 for episode in episodes if episode.get("candidate_confirmed") is True
-                ),
-                "active_alerted_episodes": sum(
-                    1 for episode in episodes if episode.get("alerted") is True
-                ),
-            },
-            "feeds": feeds,
-            "episodes": episodes,
-            "recent_events": recent_events,
-            "errors": errors,
-        }
-
-    def _expected_feeds(self) -> list[tuple[str, str, str]]:
-        return [
-            (market.venue, market.venue_symbol, market.canonical_symbol)
-            for market in self.config.markets
-            if market.enabled
-        ]
-
-    def _read_feeds(
-        self, now: datetime
-    ) -> tuple[list[dict[str, object]], list[str]]:
-        expected = self._expected_feeds()
-        rows, errors = self._read_latest_market_rows(expected, now)
-        feeds: list[dict[str, object]] = []
-        for venue, venue_symbol, canonical_symbol in expected:
-            row = rows.get((venue, venue_symbol, canonical_symbol))
-            observed_at = row.get("observed_at") if row is not None else None
-            age_seconds = None
-            observed_timestamp = (
-                observed_at if isinstance(observed_at, datetime) else None
-            )
-            if observed_timestamp is not None:
-                age_seconds = max(
-                    0.0,
-                    (now - _as_utc(observed_timestamp, "observed_at")).total_seconds(),
-                )
-            vwap_available = 0
-            if row is not None:
-                vwap_available = sum(
-                    row.get(buy_field) is not None and row.get(sell_field) is not None
-                    for buy_field, sell_field in VWAP_FIELDS
-                )
-            primary_vwap_ready = row is not None and (
-                row.get("buy_10k_vwap") is not None
-                and row.get("sell_10k_vwap") is not None
-            )
-            feeds.append(
-                {
-                    "venue": venue,
-                    "venue_symbol": venue_symbol,
-                    "canonical_symbol": canonical_symbol,
-                    "status": _classify_feed(age_seconds, primary_vwap_ready),
-                    "age_seconds": age_seconds,
-                    "observed_at": _iso(observed_timestamp),
-                    "vwap_available": vwap_available,
-                    "vwap_total": len(VWAP_FIELDS),
-                    "primary_vwap_ready": primary_vwap_ready,
-                    "buy_1k_vwap": row.get("buy_1k_vwap") if row else None,
-                    "sell_1k_vwap": row.get("sell_1k_vwap") if row else None,
-                    "buy_5k_vwap": row.get("buy_5k_vwap") if row else None,
-                    "sell_5k_vwap": row.get("sell_5k_vwap") if row else None,
-                    "buy_10k_vwap": row.get("buy_10k_vwap") if row else None,
-                    "sell_10k_vwap": row.get("sell_10k_vwap") if row else None,
-                }
-            )
-        return feeds, errors
-
-    def _read_latest_market_rows(
-        self,
-        expected: Iterable[tuple[str, str, str]],
-        now: datetime,
-    ) -> tuple[dict[tuple[str, str, str], dict[str, object]], list[str]]:
-        expected = tuple(expected)
-        if not expected:
-            return {}, []
-        dates = (now.date(), now.date() - timedelta(days=1))
-        files = tuple(
-            path
-            for partition_date in dates
-            for path in sorted(
-                (self.data_root / "market" / f"date={partition_date.isoformat()}").glob(
-                    "part-*.parquet"
-                )
-            )
-            if path.is_file()
-        )
-        if not files:
-            return {}, []
-
-        path_list = ", ".join(
-            "'" + str(path).replace("'", "''") + "'" for path in files
-        )
-        predicates = " OR ".join(
-            "(venue = ? AND venue_symbol = ? AND canonical_symbol = ?)"
-            for _ in expected
-        )
-        query = f"""
-            WITH ranked AS (
-                SELECT
-                    venue,
-                    venue_symbol,
-                    canonical_symbol,
-                    observed_at,
-                    buy_1k_vwap,
-                    sell_1k_vwap,
-                    buy_5k_vwap,
-                    sell_5k_vwap,
-                    buy_10k_vwap,
-                    sell_10k_vwap,
-                    row_number() OVER (
-                        PARTITION BY venue, venue_symbol, canonical_symbol
-                        ORDER BY observed_at DESC
-                    ) AS row_number
-                FROM read_parquet([{path_list}])
-                WHERE {predicates}
-            )
-            SELECT
-                venue,
-                venue_symbol,
-                canonical_symbol,
-                observed_at,
-                buy_1k_vwap,
-                sell_1k_vwap,
-                buy_5k_vwap,
-                sell_5k_vwap,
-                buy_10k_vwap,
-                sell_10k_vwap
-            FROM ranked
-            WHERE row_number = 1
-        """
-        parameters = [value for identity in expected for value in identity]
-        try:
-            with duckdb.connect() as connection:
-                result = connection.execute(query, parameters).fetchall()
-        except Exception as error:  # noqa: BLE001
-            return {}, [f"market data read failed: {type(error).__name__}: {error}"]
-
-        rows = {
-            (row[0], row[1], row[2]): {
-                "observed_at": row[3],
-                "buy_1k_vwap": row[4],
-                "sell_1k_vwap": row[5],
-                "buy_5k_vwap": row[6],
-                "sell_5k_vwap": row[7],
-                "buy_10k_vwap": row[8],
-                "sell_10k_vwap": row[9],
-            }
-            for row in result
-        }
-        return rows, []
-
-    def _read_runtime(
-        self, now: datetime
-    ) -> tuple[dict[str, object], list[dict[str, object]], list[str]]:
-        heartbeat: dict[str, object] = {
-            "status": "down",
-            "updated_at": None,
-            "age_seconds": None,
-        }
-        errors: list[str] = []
-        try:
-            connection = sqlite3.connect(
-                self.runtime_db.resolve().as_uri() + "?mode=ro",
-                uri=True,
-                timeout=0.2,
-            )
-        except sqlite3.Error as error:
-            return heartbeat, [], [
-                f"runtime state read failed: {type(error).__name__}: {error}"
-            ]
-
-        try:
-            row = connection.execute(
-                """
-                SELECT state_json, updated_at
-                FROM monitor_state
-                WHERE monitor_name = 'spread' AND state_key = 'episodes'
-                """
-            ).fetchone()
-            raw_episodes: object = {}
-            if row is not None:
-                try:
-                    updated_at = datetime.fromisoformat(row[1]).astimezone(UTC)
-                    age_seconds = max(0.0, (now - updated_at).total_seconds())
-                    heartbeat = {
-                        "status": classify_heartbeat(age_seconds),
-                        "updated_at": updated_at.isoformat(),
-                        "age_seconds": age_seconds,
-                    }
-                    raw_episodes = json.loads(row[0])
-                except (TypeError, ValueError, json.JSONDecodeError) as error:
-                    errors.append(f"monitor state read failed: {type(error).__name__}: {error}")
-            episodes = self._summarize_episodes(raw_episodes, errors)
-            return heartbeat, episodes, errors
-        except sqlite3.Error as error:
-            return heartbeat, [], [
-                f"runtime state read failed: {type(error).__name__}: {error}"
-            ]
-        finally:
-            connection.close()
-
-    @staticmethod
-    def _summarize_episodes(
-        raw_episodes: object,
-        errors: list[str],
-    ) -> list[dict[str, object]]:
-        if not isinstance(raw_episodes, dict):
-            return []
-        episodes: list[dict[str, object]] = []
-        for raw_episode in raw_episodes.values():
-            if not isinstance(raw_episode, dict):
-                errors.append("invalid episode state ignored")
-                continue
-            key = raw_episode.get("key")
-            candidate = raw_episode.get("candidate")
-            if not isinstance(key, dict) or not isinstance(candidate, dict):
-                errors.append("invalid episode state ignored")
-                continue
-            net_spread_bps = _finite_float(candidate.get("net_spread_bps"))
-            episodes.append(
-                {
-                    "symbol": _text(key.get("canonical_symbol")),
-                    "long_venue": _text(key.get("long_venue")),
-                    "long_venue_symbol": _text(key.get("long_venue_symbol")),
-                    "short_venue": _text(key.get("short_venue")),
-                    "short_venue_symbol": _text(key.get("short_venue_symbol")),
-                    "net_spread_bps": net_spread_bps,
-                    "first_seen_at": raw_episode.get("first_seen_at"),
-                    "last_seen_at": raw_episode.get("last_seen_at"),
-                    "candidate_confirmed": raw_episode.get("candidate_confirmed") is True,
-                    "alerted": raw_episode.get("alerted") is True,
-                }
-            )
-        def sort_key(episode: dict[str, object]) -> tuple[float, str, str, str]:
-            net_spread_bps = episode.get("net_spread_bps")
-            symbol = episode.get("symbol")
-            long_venue = episode.get("long_venue")
-            short_venue = episode.get("short_venue")
-            return (
-                -float(net_spread_bps)
-                if isinstance(net_spread_bps, (int, float))
-                else math.inf,
-                symbol if isinstance(symbol, str) else "",
-                long_venue if isinstance(long_venue, str) else "",
-                short_venue if isinstance(short_venue, str) else "",
-            )
-
-        episodes.sort(key=sort_key)
-        return episodes
-
-    def _read_recent_events(
-        self,
-    ) -> tuple[list[dict[str, object]], list[str]]:
-        try:
-            connection = sqlite3.connect(
-                self.runtime_db.resolve().as_uri() + "?mode=ro",
-                uri=True,
-                timeout=0.2,
-            )
-        except sqlite3.Error:
-            return [], []
-
-        errors: list[str] = []
-        try:
-            rows = connection.execute(
-                """
-                SELECT event_id, event_type, event_json, occurred_at
-                FROM opportunity_log
-                WHERE monitor_name = 'spread'
-                ORDER BY occurred_at DESC, event_id DESC
-                LIMIT 20
-                """
-            ).fetchall()
-        except sqlite3.Error as error:
-            return [], [f"opportunity log read failed: {type(error).__name__}: {error}"]
-        finally:
-            connection.close()
-
-        events: list[dict[str, object]] = []
-        for event_id, event_type, event_json, occurred_at in rows:
-            try:
-                event = json.loads(event_json)
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
-                event = {}
-                errors.append(f"event JSON read failed: {type(error).__name__}: {error}")
-            if not isinstance(event, dict):
-                errors.append("event JSON object expected; using empty event")
-                event = {}
-            events.append(
-                {
-                    "event_id": event_id,
-                    "event_type": event_type,
-                    "occurred_at": occurred_at,
-                    "symbol": _text(event.get("canonical_symbol")),
-                    "long_venue": _text(event.get("long_venue")),
-                    "short_venue": _text(event.get("short_venue")),
-                    "net_spread_bps": _finite_float(event.get("net_spread_bps")),
-                }
-            )
-        return events, errors
+        return self._query_service.get_status(now=now)
 
 
 HTML = """<!doctype html>
