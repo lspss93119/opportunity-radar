@@ -7,6 +7,7 @@ import pytest
 
 from radar.history.spread import HistoricalSpreadContext, SpreadHistory
 from radar.models import MarketSnapshot
+from radar.monitors.spread.models import SpreadPairKey
 from radar.storage.parquet import ParquetStorage
 
 AS_OF = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
@@ -335,3 +336,35 @@ def test_repeated_query_has_no_current_fee_input(tmp_path):
     )
 
     assert first == second
+
+
+def test_load_recent_pair_points_hydrates_all_directional_pairs_and_excludes_asof(
+    tmp_path,
+):
+    sample_time = AS_OF - timedelta(seconds=10)
+    long_snapshot, short_snapshot = make_pair(
+        sample_time,
+        long_buy=100.0,
+        short_sell=101.0,
+    )
+    duplicate_long = long_snapshot.model_copy(
+        update={
+            "observed_at": sample_time + timedelta(seconds=1),
+            "buy_10k_vwap": 99.0,
+        }
+    )
+    current_long, current_short = make_pair(AS_OF, long_buy=50.0, short_sell=75.0)
+    write_markets(
+        tmp_path,
+        [long_snapshot, short_snapshot, duplicate_long, current_long, current_short],
+    )
+
+    points = SpreadHistory(tmp_path / "data").load_recent_pair_points(
+        primary_size_usd=10_000,
+        as_of=AS_OF,
+    )
+
+    key = SpreadPairKey("BTC", "lighter", "BTC", "hyperliquid", "BTC")
+    assert points[key][0][0] == sample_time
+    assert points[key][0][1] == pytest.approx((101.0 / 99.0 - 1.0) * 10_000)
+    assert all(point[0] < AS_OF for values in points.values() for point in values)

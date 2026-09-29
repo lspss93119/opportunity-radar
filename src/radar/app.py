@@ -429,6 +429,19 @@ def build_telegram_smoke_alert(
         "long_fee_bps": _configured_fee_bps(config, long_snapshot.venue),
         "short_fee_bps": _configured_fee_bps(config, short_snapshot.venue),
         "net_spread_bps": 0.0,
+        "rolling_mean_bps": 0.0,
+        "rolling_std_bps": 0.0,
+        "deviation_bps": 0.0,
+        "signal_duration_seconds": 0,
+        "observed_at_skew_seconds": abs(
+            (long_snapshot.observed_at - short_snapshot.observed_at).total_seconds()
+        ),
+        "round_trip_fee_bps": 2.0
+        * (
+            _configured_fee_bps(config, long_snapshot.venue)
+            + _configured_fee_bps(config, short_snapshot.venue)
+        ),
+        "theoretical_edge_bps": 0.0,
         "sample_time": sample_time.isoformat(),
         "candidate_duration_seconds": 0,
         "alert_duration_seconds": 0,
@@ -547,14 +560,22 @@ def build_application(
         storage=storage,
         collector_error_handler=collector_error_handler,
     )
+    history = SpreadHistory(Path(data_root))
     monitors = build_enabled_monitors(config, runtime_store=runtime_store)
+    history_points = history.load_recent_pair_points(
+        primary_size_usd=config.monitors.spread.primary_size_usd,
+        as_of=clock(),
+    )
+    for monitor in monitors:
+        hydrate_history = getattr(monitor, "hydrate_history", None)
+        if callable(hydrate_history):
+            hydrate_history(history_points)
     monitor_runner = MonitorRunner(
         monitors,
         state,
         queue,
         error_handler=monitor_error_handler,
     )
-    history = SpreadHistory(Path(data_root))
     telegram = TelegramTransport(token, chat_id)
     processor = SpreadAlertProcessor(
         history,

@@ -33,10 +33,11 @@ class SpreadCandidate:
     sample_time: datetime
     long_buy_vwap: float
     short_sell_vwap: float
-    long_fee_bps: float
-    short_fee_bps: float
+    long_fee_bps: float | None
+    short_fee_bps: float | None
     raw_spread_bps: float
-    net_spread_bps: float
+    net_spread_bps: float | None
+    observed_at_skew_seconds: float = 0.0
 
 
 def _finite_number(value: float, field_name: str) -> float:
@@ -125,11 +126,14 @@ def build_spread_candidates(
     stale_after_seconds: int,
     fees_bps: Mapping[str, float],
     top_n: int | None = None,
+    require_fees: bool = True,
 ) -> tuple[SpreadCandidate, ...]:
     """Build every valid directional cross-venue pair.
 
     ``top_n`` remains an accepted compatibility argument for callers that
     still pass the legacy monitor setting, but it no longer prunes pairs.
+    ``require_fees`` keeps the historical fail-closed helper behavior while
+    allowing the stable raw-basis monitor to treat fee data as display-only.
     """
     current_time = _as_utc(now, "now")
     if stale_after_seconds <= 0:
@@ -163,7 +167,7 @@ def build_spread_candidates(
 
         for long_snapshot, long_price in buys:
             long_fee = _fee_for(long_snapshot.venue, fees_bps)
-            if long_fee is None:
+            if require_fees and long_fee is None:
                 continue
             for short_snapshot, short_price in sells:
                 if long_snapshot.venue.lower() == short_snapshot.venue.lower():
@@ -178,14 +182,18 @@ def build_spread_candidates(
                 if long_sample_time != short_sample_time:
                     continue
                 short_fee = _fee_for(short_snapshot.venue, fees_bps)
-                if short_fee is None:
+                if require_fees and short_fee is None:
                     continue
                 try:
                     raw_spread = calculate_raw_spread_bps(long_price, short_price)
-                    net_spread = calculate_net_spread_bps(
-                        raw_spread,
-                        long_fee,
-                        short_fee,
+                    net_spread = (
+                        None
+                        if long_fee is None or short_fee is None
+                        else calculate_net_spread_bps(
+                            raw_spread,
+                            long_fee,
+                            short_fee,
+                        )
                     )
                 except (OverflowError, ValueError):
                     continue
@@ -205,6 +213,12 @@ def build_spread_candidates(
                         short_fee_bps=short_fee,
                         raw_spread_bps=raw_spread,
                         net_spread_bps=net_spread,
+                        observed_at_skew_seconds=abs(
+                            (
+                                _as_utc(long_snapshot.observed_at, "observed_at")
+                                - _as_utc(short_snapshot.observed_at, "observed_at")
+                            ).total_seconds()
+                        ),
                     )
                 )
     return tuple(candidates)

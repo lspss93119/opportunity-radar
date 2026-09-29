@@ -43,6 +43,21 @@ def _require_number(
     return result
 
 
+def _optional_number(
+    payload: Mapping[str, JSONValue],
+    field_name: str,
+    *,
+    non_negative: bool = False,
+) -> float | None:
+    if payload.get(field_name) is None:
+        return None
+    return _require_number(
+        payload,
+        field_name,
+        non_negative=non_negative,
+    )
+
+
 def _require_timestamp(payload: Mapping[str, JSONValue], field_name: str) -> datetime:
     value = payload.get(field_name)
     if not isinstance(value, str):
@@ -141,9 +156,30 @@ def parse_spread_alert(alert: AlertRequest) -> SpreadAlertDetails:
         long_buy_vwap=_require_number(payload, "long_buy_vwap", positive=True),
         short_sell_vwap=_require_number(payload, "short_sell_vwap", positive=True),
         raw_spread_bps=_require_number(payload, "raw_spread_bps"),
-        long_fee_bps=_require_number(payload, "long_fee_bps", non_negative=True),
-        short_fee_bps=_require_number(payload, "short_fee_bps", non_negative=True),
-        net_spread_bps=_require_number(payload, "net_spread_bps"),
+        long_fee_bps=_optional_number(payload, "long_fee_bps", non_negative=True),
+        short_fee_bps=_optional_number(payload, "short_fee_bps", non_negative=True),
+        net_spread_bps=_optional_number(payload, "net_spread_bps"),
+        rolling_mean_bps=_require_number(payload, "rolling_mean_bps"),
+        rolling_std_bps=_require_number(
+            payload,
+            "rolling_std_bps",
+            non_negative=True,
+        ),
+        deviation_bps=_require_number(payload, "deviation_bps"),
+        signal_duration_seconds=_require_duration(
+            payload, "signal_duration_seconds"
+        ),
+        observed_at_skew_seconds=_require_number(
+            payload,
+            "observed_at_skew_seconds",
+            non_negative=True,
+        ),
+        round_trip_fee_bps=_optional_number(
+            payload,
+            "round_trip_fee_bps",
+            non_negative=True,
+        ),
+        theoretical_edge_bps=_optional_number(payload, "theoretical_edge_bps"),
         sample_time=_require_timestamp(payload, "sample_time"),
         candidate_duration_seconds=_require_duration(
             payload, "candidate_duration_seconds"
@@ -193,6 +229,12 @@ def _format_price(value: float) -> str:
     return f"{value:.{precision}f}"
 
 
+def _format_bps(value: float | None, *, signed: bool = False) -> str:
+    if value is None:
+        return "不可用"
+    return f"{value:+.2f}" if signed else f"{value:.2f}"
+
+
 def _format_timestamp(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -223,11 +265,23 @@ def format_spread_alert(
                     f"做多: {long_venue} ({details.long_venue_symbol})",
                     f"做空: {short_venue} ({details.short_venue_symbol})",
                     (
-                        f"淨價差: {details.net_spread_bps:.2f} bps | "
                         f"原始價差: {details.raw_spread_bps:.2f} bps | "
-                        f"手續費: {long_venue} {details.long_fee_bps:.2f} + "
-                        f"{short_venue} {details.short_fee_bps:.2f} = "
-                        f"{details.long_fee_bps + details.short_fee_bps:.2f} bps"
+                        f"淨價差: {_format_bps(details.net_spread_bps)} bps"
+                    ),
+                    (
+                        f"24h 均值: {details.rolling_mean_bps:.2f} bps | "
+                        f"Std: {details.rolling_std_bps:.2f} bps | "
+                        f"偏離: {details.deviation_bps:+.2f} bps"
+                    ),
+                    (
+                        f"訊號持續: {details.signal_duration_seconds}s | "
+                        f"手續費: {long_venue} {_format_bps(details.long_fee_bps)} + "
+                        f"{short_venue} {_format_bps(details.short_fee_bps)} bps"
+                    ),
+                    (
+                        f"往返手續費: {_format_bps(details.round_trip_fee_bps)} bps | "
+                        f"理論均值回歸邊際: "
+                        f"{_format_bps(details.theoretical_edge_bps, signed=True)} bps"
                     ),
                 )
             ),
@@ -240,10 +294,7 @@ def format_spread_alert(
             ),
             "\n".join(
                 (
-                    f"候選規則: >= {candidate_net_bps:.2f} bps / "
-                    f"{details.candidate_duration_seconds}s | "
-                    f"警報規則: >= {alert_net_bps:.2f} bps / "
-                    f"{details.alert_duration_seconds}s",
+                    f"觀測偏差: {details.observed_at_skew_seconds:.2f}s",
                     (
                         "資金費率: "
                         f"{_format_funding(details.long_venue, details.long_funding)} | "

@@ -12,6 +12,13 @@ from radar.models import FundingSnapshot
 from radar.state import RadarState
 from radar.storage.sqlite import SQLiteRuntimeStore
 
+from radar.monitors.spread.basis import (
+    EXPECTED_INTERVAL_SECONDS,
+    MIN_HISTORY_OBSERVATIONS,
+    ROLLING_WINDOW_SECONDS,
+    RollingBasis,
+    RollingBasisStats,
+)
 from radar.monitors.spread.models import (
     SpreadCandidate,
     SpreadPairKey,
@@ -20,6 +27,10 @@ from radar.monitors.spread.models import (
 
 UTC = timezone.utc
 OpportunityEvent = tuple[str, str, object, datetime]
+
+BASIS_STD_MAX_BPS = 3.0
+BASIS_DEVIATION_MIN_BPS = 15.0
+BASIS_PERSISTENCE_SECONDS = 60
 
 
 def _pair_sort_key(key: SpreadPairKey) -> tuple[str, str, str, str, str]:
@@ -49,13 +60,15 @@ class SpreadEpisode:
     candidate_confirmed_at: datetime | None = None
     alert_condition_since: datetime | None = None
     alerted: bool = False
+    rolling_mean_bps: float | None = None
+    rolling_std_bps: float | None = None
 
     @property
     def last_raw_spread_bps(self) -> float:
         return self.candidate.raw_spread_bps
 
     @property
-    def last_net_spread_bps(self) -> float:
+    def last_net_spread_bps(self) -> float | None:
         return self.candidate.net_spread_bps
 
 
@@ -68,12 +81,19 @@ class SpreadMonitor:
         fees_bps: Mapping[str, float],
         *,
         runtime_store: SQLiteRuntimeStore | None = None,
+        basis_window_seconds: int = ROLLING_WINDOW_SECONDS,
+        basis_min_observations: int = MIN_HISTORY_OBSERVATIONS,
+        basis_expected_interval_seconds: int = EXPECTED_INTERVAL_SECONDS,
     ) -> None:
         self.interval_seconds = config.interval_seconds
         self.config = config
         self._fees_bps = dict(fees_bps)
         self._runtime_store = runtime_store
+        self._basis_window_seconds = basis_window_seconds
+        self._basis_min_observations = basis_min_observations
+        self._basis_expected_interval_seconds = basis_expected_interval_seconds
         self._episodes: dict[SpreadPairKey, SpreadEpisode] = {}
+        self._basis_by_key: dict[SpreadPairKey, RollingBasis] = {}
         if runtime_store is not None:
             self._episodes = self._load_episodes(
                 runtime_store.get_monitor_state(self.name, "episodes")
@@ -84,6 +104,33 @@ class SpreadMonitor:
         return tuple(
             self._episodes[key]
             for key in sorted(self._episodes, key=_pair_sort_key)
+        )
+
+    def hydrate_history(
+        self,
+        points_by_key: Mapping[SpreadPairKey, object],
+    ) -> None:
+        """Load bounded prior observations once before live sampling starts."""
+        for key, raw_points in points_by_key.items():
+            if not isinstance(raw_points, (tuple, list)):
+                raise TypeError("history points must be a sequence")
+            points: list[tuple[datetime, float]] = []
+            for point in raw_points:
+                if not isinstance(point, (tuple, list)) or len(point) != 2:
+                    raise TypeError("history points must contain (timestamp, value)")
+                timestamp, value = point
+                if not isinstance(timestamp, datetime):
+                    raise TypeError("history sample_time must be a datetime")
+                points.append((timestamp, float(value)))
+            basis = self._new_basis()
+            basis.hydrate(points)
+            self._basis_by_key[key] = basis
+
+    def _new_basis(self) -> RollingBasis:
+        return RollingBasis(
+            window_seconds=self._basis_window_seconds,
+            min_observations=self._basis_min_observations,
+            expected_interval_seconds=self._basis_expected_interval_seconds,
         )
 
     async def evaluate(
@@ -98,45 +145,97 @@ class SpreadMonitor:
             primary_size_usd=self.config.primary_size_usd,
             stale_after_seconds=self.config.stale_after_seconds,
             fees_bps=self._fees_bps,
+            require_fees=False,
         )
-        qualifying = {
-            candidate.key: candidate
-            for candidate in candidates
-            if candidate.net_spread_bps >= self.config.candidate_net_bps
-        }
         previous_episodes = (
             deepcopy(self._episodes) if self._runtime_store is not None else None
         )
+        previous_basis = (
+            deepcopy(self._basis_by_key) if self._runtime_store is not None else None
+        )
 
         events: list[OpportunityEvent] = []
+        alerts: list[AlertRequest] = []
+        current_candidates = {candidate.key: candidate for candidate in candidates}
+        basis_stats: dict[SpreadPairKey, RollingBasisStats] = {}
+        for candidate in candidates:
+            basis = self._basis_by_key.setdefault(candidate.key, self._new_basis())
+            basis_stats[candidate.key] = basis.observe(
+                candidate.sample_time,
+                candidate.raw_spread_bps,
+            )
+
         for key in tuple(self._episodes):
-            if key not in qualifying:
+            current_candidate = current_candidates.get(key)
+            stats = basis_stats.get(key)
+            if current_candidate is None:
+                if not self._episodes[key].alerted:
+                    self._resolve_episode(
+                        key,
+                        current_time,
+                        reason="missing_observation",
+                        events=events,
+                    )
+                continue
+            if stats is None or not stats.eligible:
+                if not self._episodes[key].alerted:
+                    self._resolve_episode(
+                        key,
+                        current_time,
+                        reason="insufficient_history",
+                        events=events,
+                    )
+                else:
+                    self._update_episode(
+                        self._episodes[key], current_candidate, current_time, stats
+                    )
+                continue
+            if stats.mean_bps is None or stats.std_bps is None:
+                continue
+            deviation = current_candidate.raw_spread_bps - stats.mean_bps
+            if deviation < BASIS_DEVIATION_MIN_BPS:
                 self._resolve_episode(
                     key,
                     current_time,
-                    reason="not_qualifying",
+                    reason="rearmed_below_deviation",
                     events=events,
                 )
 
-        alerts: list[AlertRequest] = []
-        for key in sorted(qualifying, key=_pair_sort_key):
-            candidate = qualifying[key]
+        for key in sorted(basis_stats, key=_pair_sort_key):
+            candidate = current_candidates[key]
+            stats = basis_stats[key]
+            if not stats.eligible or stats.mean_bps is None or stats.std_bps is None:
+                continue
+            deviation = candidate.raw_spread_bps - stats.mean_bps
+            stable_condition = (
+                stats.std_bps <= BASIS_STD_MAX_BPS
+                and deviation >= BASIS_DEVIATION_MIN_BPS
+            )
             episode = self._episodes.get(key)
             if episode is None:
-                episode = self._start_episode(candidate, current_time)
+                if not stable_condition:
+                    continue
+                episode = self._start_episode(
+                    candidate,
+                    current_time,
+                    stats=stats,
+                )
                 self._episodes[key] = episode
             elif not self._is_continuous(episode, current_time):
-                self._resolve_episode(
-                    key,
+                if episode.alerted:
+                    self._update_episode(episode, candidate, current_time, stats)
+                    continue
+                self._resolve_episode(key, current_time, reason="continuity_gap", events=events)
+                if not stable_condition:
+                    continue
+                episode = self._start_episode(
+                    candidate,
                     current_time,
-                    reason="continuity_gap",
-                    events=events,
+                    stats=stats,
                 )
-                episode = self._start_episode(candidate, current_time)
                 self._episodes[key] = episode
             else:
-                episode.last_seen_at = current_time
-                episode.candidate = candidate
+                self._update_episode(episode, candidate, current_time, stats)
 
             if (
                 not episode.candidate_confirmed
@@ -152,10 +251,10 @@ class SpreadMonitor:
                     events=events,
                 )
 
-            if candidate.net_spread_bps >= self.config.alert_net_bps:
+            if stable_condition:
                 if episode.alert_condition_since is None:
                     episode.alert_condition_since = current_time
-            else:
+            elif not episode.alerted:
                 episode.alert_condition_since = None
 
             if self._is_alert_eligible(episode, current_time):
@@ -175,6 +274,8 @@ class SpreadMonitor:
         except Exception:
             if previous_episodes is not None:
                 self._episodes = previous_episodes
+            if previous_basis is not None:
+                self._basis_by_key = previous_basis
             raise
         return alerts
 
@@ -182,6 +283,8 @@ class SpreadMonitor:
         self,
         candidate: SpreadCandidate,
         now: datetime,
+        *,
+        stats: RollingBasisStats,
     ) -> SpreadEpisode:
         episode = SpreadEpisode(
             key=candidate.key,
@@ -189,23 +292,37 @@ class SpreadMonitor:
             first_seen_at=now,
             last_seen_at=now,
             candidate=candidate,
+            rolling_mean_bps=stats.mean_bps,
+            rolling_std_bps=stats.std_bps,
         )
-        if candidate.net_spread_bps >= self.config.alert_net_bps:
-            episode.alert_condition_since = now
+        episode.alert_condition_since = now
         return episode
+
+    @staticmethod
+    def _update_episode(
+        episode: SpreadEpisode,
+        candidate: SpreadCandidate,
+        now: datetime,
+        stats: RollingBasisStats | None,
+    ) -> None:
+        episode.last_seen_at = now
+        episode.candidate = candidate
+        if stats is not None:
+            episode.rolling_mean_bps = stats.mean_bps
+            episode.rolling_std_bps = stats.std_bps
 
     def _is_continuous(self, episode: SpreadEpisode, now: datetime) -> bool:
         gap_seconds = (now - episode.last_seen_at).total_seconds()
         return 0 <= gap_seconds <= self.interval_seconds * 2
 
     def _is_alert_eligible(self, episode: SpreadEpisode, now: datetime) -> bool:
-        if episode.alerted or not episode.candidate_confirmed:
+        if episode.alerted:
             return False
         if episode.alert_condition_since is None:
             return False
         return (
             now - episode.alert_condition_since
-            >= timedelta(seconds=self.config.alert_duration_seconds)
+            >= timedelta(seconds=BASIS_PERSISTENCE_SECONDS)
         )
 
     @staticmethod
@@ -259,6 +376,33 @@ class SpreadMonitor:
             "long_fee_bps": candidate.long_fee_bps,
             "short_fee_bps": candidate.short_fee_bps,
             "net_spread_bps": candidate.net_spread_bps,
+            "rolling_mean_bps": episode.rolling_mean_bps,
+            "rolling_std_bps": episode.rolling_std_bps,
+            "deviation_bps": (
+                candidate.raw_spread_bps - episode.rolling_mean_bps
+                if episode.rolling_mean_bps is not None
+                else None
+            ),
+            "signal_duration_seconds": int(
+                (now - episode.alert_condition_since).total_seconds()
+            )
+            if episode.alert_condition_since is not None
+            else 0,
+            "observed_at_skew_seconds": candidate.observed_at_skew_seconds,
+            "round_trip_fee_bps": (
+                2.0 * (candidate.long_fee_bps + candidate.short_fee_bps)
+                if candidate.long_fee_bps is not None
+                and candidate.short_fee_bps is not None
+                else None
+            ),
+            "theoretical_edge_bps": (
+                candidate.raw_spread_bps - episode.rolling_mean_bps
+                - 2.0 * (candidate.long_fee_bps + candidate.short_fee_bps)
+                if episode.rolling_mean_bps is not None
+                and candidate.long_fee_bps is not None
+                and candidate.short_fee_bps is not None
+                else None
+            ),
             "sample_time": candidate.sample_time.isoformat(),
             "episode_started_at": episode.first_seen_at.isoformat(),
             "candidate_confirmed_at": episode.candidate_confirmed_at.isoformat()
@@ -287,7 +431,7 @@ class SpreadMonitor:
         events: list[OpportunityEvent],
     ) -> None:
         episode = self._episodes.pop(key)
-        if episode.candidate_confirmed:
+        if episode.candidate_confirmed or episode.alerted:
             self._log_event(
                 episode,
                 "resolved",
@@ -296,6 +440,8 @@ class SpreadMonitor:
                     "episode_id": episode.episode_id,
                     "reason": reason,
                     "net_spread_bps": episode.last_net_spread_bps,
+                    "rolling_mean_bps": episode.rolling_mean_bps,
+                    "rolling_std_bps": episode.rolling_std_bps,
                 },
                 events=events,
             )
@@ -373,6 +519,7 @@ class SpreadMonitor:
                 "short_fee_bps": candidate.short_fee_bps,
                 "raw_spread_bps": candidate.raw_spread_bps,
                 "net_spread_bps": candidate.net_spread_bps,
+                "observed_at_skew_seconds": candidate.observed_at_skew_seconds,
             },
             "candidate_confirmed": episode.candidate_confirmed,
             "candidate_confirmed_at": (
@@ -386,6 +533,8 @@ class SpreadMonitor:
                 else None
             ),
             "alerted": episode.alerted,
+            "rolling_mean_bps": episode.rolling_mean_bps,
+            "rolling_std_bps": episode.rolling_std_bps,
         }
 
     @classmethod
@@ -421,10 +570,13 @@ class SpreadMonitor:
             sample_time=cls._timestamp(candidate_raw["sample_time"]),
             long_buy_vwap=cls._positive(candidate_raw["long_buy_vwap"]),
             short_sell_vwap=cls._positive(candidate_raw["short_sell_vwap"]),
-            long_fee_bps=cls._non_negative(candidate_raw["long_fee_bps"]),
-            short_fee_bps=cls._non_negative(candidate_raw["short_fee_bps"]),
+            long_fee_bps=cls._optional_non_negative(candidate_raw.get("long_fee_bps")),
+            short_fee_bps=cls._optional_non_negative(candidate_raw.get("short_fee_bps")),
             raw_spread_bps=cls._finite(candidate_raw["raw_spread_bps"]),
-            net_spread_bps=cls._finite(candidate_raw["net_spread_bps"]),
+            net_spread_bps=cls._optional_finite(candidate_raw.get("net_spread_bps")),
+            observed_at_skew_seconds=cls._non_negative(
+                candidate_raw.get("observed_at_skew_seconds", 0.0)
+            ),
         )
         episode_id = cls._text(raw["episode_id"])
         first_seen_at = cls._timestamp(raw["first_seen_at"])
@@ -439,8 +591,10 @@ class SpreadMonitor:
         alert_condition_since = cls._optional_timestamp(raw["alert_condition_since"])
         if candidate_confirmed and candidate_confirmed_at is None:
             raise ValueError("confirmed episode must have a confirmation time")
-        if alerted and not candidate_confirmed:
-            raise ValueError("alerted episode must be confirmed")
+        if not alerted:
+            # Old runtime state used the legacy absolute alert timer.  It is
+            # not valid evidence for a new stable-basis episode.
+            alert_condition_since = None
         return SpreadEpisode(
             key=key,
             episode_id=episode_id,
@@ -451,6 +605,8 @@ class SpreadMonitor:
             candidate_confirmed_at=candidate_confirmed_at,
             alert_condition_since=alert_condition_since,
             alerted=alerted,
+            rolling_mean_bps=cls._optional_finite(raw.get("rolling_mean_bps")),
+            rolling_std_bps=cls._optional_finite(raw.get("rolling_std_bps")),
         )
 
     @staticmethod
@@ -491,6 +647,14 @@ class SpreadMonitor:
         if result < 0:
             raise ValueError("episode number must be non-negative")
         return result
+
+    @classmethod
+    def _optional_finite(cls, value: object) -> float | None:
+        return None if value is None else cls._finite(value)
+
+    @classmethod
+    def _optional_non_negative(cls, value: object) -> float | None:
+        return None if value is None else cls._non_negative(value)
 
     @staticmethod
     def _find_funding(

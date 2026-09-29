@@ -29,6 +29,13 @@ def make_alert(**payload_overrides: object) -> AlertRequest:
         "long_fee_bps": 4.5,
         "short_fee_bps": 3.5,
         "net_spread_bps": 92.0,
+        "rolling_mean_bps": 80.0,
+        "rolling_std_bps": 2.5,
+        "deviation_bps": 20.0,
+        "signal_duration_seconds": 120,
+        "observed_at_skew_seconds": 0.5,
+        "round_trip_fee_bps": 16.0,
+        "theoretical_edge_bps": 4.0,
         "sample_time": SAMPLE_TIME.isoformat(),
         "episode_started_at": (
             SAMPLE_TIME - timedelta(seconds=30)

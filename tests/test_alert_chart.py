@@ -29,6 +29,13 @@ def make_details():
         long_fee_bps=4.5,
         short_fee_bps=3.5,
         net_spread_bps=92.0,
+        rolling_mean_bps=80.0,
+        rolling_std_bps=2.5,
+        deviation_bps=20.0,
+        signal_duration_seconds=120,
+        observed_at_skew_seconds=0.5,
+        round_trip_fee_bps=16.0,
+        theoretical_edge_bps=4.0,
         sample_time=SAMPLE_TIME,
         candidate_duration_seconds=30,
         alert_duration_seconds=120,
@@ -148,10 +155,12 @@ def test_render_spread_chart_includes_all_reference_lines(monkeypatch):
         is not None
     )
 
-    assert lines == [100.0, 60.0, 70.0, 80.0, 20.5, 33.0]
-    assert {"Current", "Candidate", "Alert", "7d median", "30d median", "90d median"} <= set(
+    assert lines == [100.0, 80.0, 60.0, 70.0, 80.0]
+    assert {"Current", "24h mean", "7d median", "30d median", "90d median"} <= set(
         labels
     )
+    assert "Candidate" not in labels
+    assert "Alert" not in labels
 
 
 def test_chart_displays_only_the_most_recent_24_hours():
@@ -235,8 +244,8 @@ def test_chart_summary_prioritizes_baseline_and_deviation(monkeypatch):
         "\n".join(
             (
                 "Current raw: 100.00 bps",
-                "Baseline: 60.00 bps",
-                "Deviation: +40.00 bps",
+                "Baseline: 80.00 bps",
+                "Deviation: +20.00 bps",
                 "Net spread: 92.00 bps",
             )
         )

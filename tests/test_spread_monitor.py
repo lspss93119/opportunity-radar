@@ -75,7 +75,7 @@ def make_monitor(
         "alert_net_bps": 20.0,
         "alert_duration_seconds": 120,
         "interval_seconds": 10,
-        "stale_after_seconds": 30,
+        "stale_after_seconds": 300,
         "primary_size_usd": 10_000,
         "top_n": 3,
     }
@@ -84,6 +84,62 @@ def make_monitor(
         SpreadMonitorConfig.model_validate(values),
         {"long": 0.0, "short": 0.0} if fees_bps is None else fees_bps,
         runtime_store=runtime_store,
+        basis_window_seconds=12_000,
+        basis_min_observations=4,
+        basis_expected_interval_seconds=10,
+    )
+
+
+def prime_monitor(
+    monitor: SpreadMonitor,
+    state: RadarState,
+    *,
+    deviations: dict[SpreadPairKey, float] | None = None,
+    when: datetime = NOW,
+) -> None:
+    candidates = build_spread_candidates(
+        state.markets,
+        when,
+        primary_size_usd=monitor.config.primary_size_usd,
+        stale_after_seconds=monitor.config.stale_after_seconds,
+        fees_bps=monitor._fees_bps,
+    )
+    deviations = {} if deviations is None else deviations
+    history = {
+        candidate.key: tuple(
+            (
+                when - timedelta(seconds=12_000 - index * 10),
+                candidate.raw_spread_bps - deviations.get(candidate.key, 0.0),
+            )
+            for index in range(1_200)
+        )
+        for candidate in candidates
+    }
+    monitor.hydrate_history(history)
+
+
+def prime_triggering_monitor(
+    monitor: SpreadMonitor,
+    state: RadarState,
+    *,
+    when: datetime = NOW,
+) -> None:
+    candidates = build_spread_candidates(
+        state.markets,
+        when,
+        primary_size_usd=monitor.config.primary_size_usd,
+        stale_after_seconds=monitor.config.stale_after_seconds,
+        fees_bps=monitor._fees_bps,
+    )
+    prime_monitor(
+        monitor,
+        state,
+        deviations={
+            candidate.key: 20.0
+            for candidate in candidates
+            if candidate.raw_spread_bps >= 20.0
+        },
+        when=when,
     )
 
 
@@ -262,18 +318,19 @@ def test_same_venue_long_short_pairs_are_never_evaluated():
     )
 
 
-@pytest.mark.asyncio
-async def test_low_fee_venue_is_not_pruned_by_raw_price_top_n():
+def test_low_fee_venue_is_not_pruned_by_raw_price_top_n():
     state = make_state(
         make_market("raw-cheap-1", buy_10k_vwap=100.0, sell_10k_vwap=90.0),
         make_market("raw-cheap-2", buy_10k_vwap=100.5, sell_10k_vwap=91.0),
         make_market("low-fee", buy_10k_vwap=101.0, sell_10k_vwap=92.0),
         make_market("short", buy_10k_vwap=110.0, sell_10k_vwap=102.0),
     )
-    monitor = make_monitor(
+    candidates = build_spread_candidates(
+        state.markets,
+        NOW,
+        primary_size_usd=10_000,
         top_n=2,
-        candidate_duration_seconds=0,
-        alert_duration_seconds=0,
+        stale_after_seconds=30,
         fees_bps={
             "raw-cheap-1": 250.0,
             "raw-cheap-2": 250.0,
@@ -282,15 +339,13 @@ async def test_low_fee_venue_is_not_pruned_by_raw_price_top_n():
         },
     )
 
-    alerts = await monitor.evaluate(NOW, state)
-
-    assert {
-        (alert.payload["long_venue"], alert.payload["short_venue"])
-        for alert in alerts
-    } == {("low-fee", "short")}
-    assert alerts[0].payload["net_spread_bps"] == pytest.approx(
-        (102.0 / 101.0 - 1.0) * 10_000
+    target = next(
+        candidate
+        for candidate in candidates
+        if candidate.key.long_venue == "low-fee"
+        and candidate.key.short_venue == "short"
     )
+    assert target.net_spread_bps == pytest.approx((102.0 / 101.0 - 1.0) * 10_000)
 
 
 @pytest.mark.asyncio
@@ -305,6 +360,20 @@ async def test_multiple_directional_pair_episodes_coexist():
         alert_net_bps=1_000.0,
         fees_bps={"alpha": 0.0, "bravo": 0.0, "charlie": 0.0},
     )
+    candidates = build_spread_candidates(
+        state.markets,
+        NOW,
+        primary_size_usd=10_000,
+        stale_after_seconds=30,
+        fees_bps={"alpha": 0.0, "bravo": 0.0, "charlie": 0.0},
+    )
+    deviations = {
+        candidate.key: 20.0
+        for candidate in candidates
+        if candidate.key.long_venue == "alpha"
+        and candidate.key.short_venue in {"bravo", "charlie"}
+    }
+    prime_monitor(monitor, state, deviations=deviations)
 
     assert await monitor.evaluate(NOW, state) == []
 
@@ -511,6 +580,7 @@ async def test_active_episode_restores_from_sqlite_within_continuity_gap(tmp_pat
             candidate_duration_seconds=30,
             stale_after_seconds=60,
         )
+        prime_triggering_monitor(monitor, state)
         await monitor.evaluate(NOW, state)
         await monitor.evaluate(NOW + timedelta(seconds=10), state)
         episode_id = monitor.active_episodes[0].episode_id
@@ -521,6 +591,7 @@ async def test_active_episode_restores_from_sqlite_within_continuity_gap(tmp_pat
             candidate_duration_seconds=30,
             stale_after_seconds=60,
         )
+        prime_triggering_monitor(reopened, state)
         assert reopened.active_episodes[0].episode_id == episode_id
         await reopened.evaluate(NOW + timedelta(seconds=20), state)
         assert reopened.active_episodes[0].candidate_confirmed is False
@@ -539,6 +610,7 @@ async def test_large_restart_gap_starts_a_new_episode_without_fake_duration(tmp_
             candidate_duration_seconds=30,
             stale_after_seconds=60,
         )
+        prime_triggering_monitor(monitor, initial_state)
         await monitor.evaluate(NOW, initial_state)
         old_episode_id = monitor.active_episodes[0].episode_id
 
@@ -547,12 +619,14 @@ async def test_large_restart_gap_starts_a_new_episode_without_fake_duration(tmp_
             "long",
             buy_10k_vwap=100.0,
             sell_10k_vwap=99.0,
+            sample_time=NOW + timedelta(minutes=10),
             observed_at=NOW + timedelta(minutes=10),
         ),
         make_market(
             "short",
             buy_10k_vwap=102.0,
             sell_10k_vwap=101.0,
+            sample_time=NOW + timedelta(minutes=10),
             observed_at=NOW + timedelta(minutes=10),
         ),
     )
@@ -561,6 +635,11 @@ async def test_large_restart_gap_starts_a_new_episode_without_fake_duration(tmp_
             runtime_store=reopened_store,
             candidate_duration_seconds=30,
             stale_after_seconds=60,
+        )
+        prime_triggering_monitor(
+            reopened,
+            restarted_state,
+            when=NOW + timedelta(minutes=10),
         )
         await reopened.evaluate(NOW + timedelta(minutes=10), restarted_state)
         assert reopened.active_episodes[0].episode_id != old_episode_id
@@ -581,7 +660,10 @@ async def test_already_alerted_episode_restores_without_duplicate_alert(tmp_path
             alert_duration_seconds=0,
             stale_after_seconds=60,
         )
-        assert len(await monitor.evaluate(NOW, state)) == 1
+        prime_triggering_monitor(monitor, state)
+        for offset in range(0, 60, 10):
+            assert await monitor.evaluate(NOW + timedelta(seconds=offset), state) == []
+        assert len(await monitor.evaluate(NOW + timedelta(seconds=60), state)) == 1
 
     with SQLiteRuntimeStore(database) as reopened_store:
         reopened = make_monitor(
@@ -590,6 +672,7 @@ async def test_already_alerted_episode_restores_without_duplicate_alert(tmp_path
             alert_duration_seconds=0,
             stale_after_seconds=60,
         )
+        prime_triggering_monitor(reopened, state)
         assert await reopened.evaluate(NOW + timedelta(seconds=10), state) == []
         assert reopened.active_episodes[0].alerted is True
 
@@ -611,26 +694,29 @@ async def test_alert_persistence_failure_restores_unalerted_episode_for_retry(
             alert_duration_seconds=10,
             stale_after_seconds=60,
         )
+        prime_triggering_monitor(monitor, state)
         assert await monitor.evaluate(NOW, state) == []
+        for offset in range(10, 60, 10):
+            await monitor.evaluate(NOW + timedelta(seconds=offset), state)
         episode_id = monitor.active_episodes[0].episode_id
         episodes_before_failure = deepcopy(monitor.active_episodes)
         persisted_before_failure = store.get_monitor_state("spread", "episodes")
         fail_next_persistence(monkeypatch, store)
 
         with pytest.raises(RuntimeError, match="injected persistence failure"):
-            await monitor.evaluate(NOW + timedelta(seconds=10), state)
+            await monitor.evaluate(NOW + timedelta(seconds=60), state)
 
         episode = monitor.active_episodes[0]
         assert monitor.active_episodes == episodes_before_failure
         assert episode.episode_id == episode_id
         assert episode.alerted is False
-        assert episode.last_seen_at == NOW
+        assert episode.last_seen_at == NOW + timedelta(seconds=50)
         assert store.get_monitor_state("spread", "episodes") == persisted_before_failure
         assert [event["event_type"] for event in store.list_opportunities(monitor_name="spread")] == [
             "candidate_confirmed"
         ]
 
-        alerts = await monitor.evaluate(NOW + timedelta(seconds=10), state)
+        alerts = await monitor.evaluate(NOW + timedelta(seconds=60), state)
 
         assert len(alerts) == 1
         assert monitor.active_episodes[0].alerted is True
@@ -655,6 +741,7 @@ async def test_candidate_confirmation_persistence_failure_restores_unconfirmed_e
             alert_duration_seconds=120,
             stale_after_seconds=60,
         )
+        prime_triggering_monitor(monitor, state)
         await monitor.evaluate(NOW, state)
         episode_id = monitor.active_episodes[0].episode_id
         episodes_before_failure = deepcopy(monitor.active_episodes)
@@ -707,6 +794,7 @@ async def test_resolution_persistence_failure_restores_active_episode_for_retry(
             alert_duration_seconds=120,
             stale_after_seconds=60,
         )
+        prime_triggering_monitor(monitor, state)
         await monitor.evaluate(NOW, state)
         episode_id = monitor.active_episodes[0].episode_id
         episodes_before_failure = deepcopy(monitor.active_episodes)
@@ -756,9 +844,12 @@ async def test_lifecycle_logs_meaningful_events_with_distinct_ids(tmp_path):
             alert_duration_seconds=10,
             stale_after_seconds=60,
         )
+        prime_triggering_monitor(monitor, state)
         await monitor.evaluate(NOW, state)
         await monitor.evaluate(NOW + timedelta(seconds=10), state)
-        await monitor.evaluate(NOW + timedelta(seconds=20), below_state)
+        for offset in range(20, 70, 10):
+            await monitor.evaluate(NOW + timedelta(seconds=offset), state)
+        await monitor.evaluate(NOW + timedelta(seconds=70), below_state)
 
         events = store.list_opportunities(monitor_name="spread")
 
@@ -783,6 +874,7 @@ async def test_provisional_episode_that_disappears_is_not_logged(tmp_path):
     )
     with SQLiteRuntimeStore(database) as store:
         monitor = make_monitor(runtime_store=store, candidate_duration_seconds=30)
+        prime_triggering_monitor(monitor, state)
         await monitor.evaluate(NOW, state)
         await monitor.evaluate(NOW + timedelta(seconds=10), below_state)
         assert store.list_opportunities(monitor_name="spread") == []
@@ -812,13 +904,22 @@ async def test_alert_payload_contains_spread_and_available_funding_context():
         alert_duration_seconds=0,
         fees_bps={"long": 4.5, "short": 3.5},
     )
+    prime_triggering_monitor(monitor, state)
 
-    alerts = await monitor.evaluate(NOW, state)
+    for offset in range(0, 60, 10):
+        await monitor.evaluate(NOW + timedelta(seconds=offset), state)
+    alerts = await monitor.evaluate(NOW + timedelta(seconds=60), state)
 
     assert len(alerts) == 1
     payload = alerts[0].payload
     assert payload["raw_spread_bps"] == pytest.approx(100.0)
     assert payload["net_spread_bps"] == pytest.approx(92.0)
+    assert payload["rolling_mean_bps"] == pytest.approx(80.0)
+    assert payload["rolling_std_bps"] == pytest.approx(0.0)
+    assert payload["deviation_bps"] == pytest.approx(20.0)
+    assert payload["signal_duration_seconds"] == 60
+    assert payload["round_trip_fee_bps"] == pytest.approx(16.0)
+    assert payload["theoretical_edge_bps"] == pytest.approx(4.0)
     assert payload["sample_time"] == NOW.isoformat()
     assert payload["episode_started_at"] == NOW.isoformat()
     assert payload["candidate_confirmed_at"] == NOW.isoformat()
@@ -835,8 +936,11 @@ async def test_missing_funding_context_does_not_suppress_valid_alert():
         make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
     )
     monitor = make_monitor(candidate_duration_seconds=0, alert_duration_seconds=0)
+    prime_triggering_monitor(monitor, state)
 
-    alerts = await monitor.evaluate(NOW, state)
+    for offset in range(0, 60, 10):
+        await monitor.evaluate(NOW + timedelta(seconds=offset), state)
+    alerts = await monitor.evaluate(NOW + timedelta(seconds=60), state)
 
     assert len(alerts) == 1
     assert alerts[0].payload["funding_context"] == {"long": None, "short": None}
@@ -860,8 +964,11 @@ async def test_funding_context_matches_canonical_symbol_as_well_as_venue_symbol(
         funding=wrong_symbol_funding,
     )
     monitor = make_monitor(candidate_duration_seconds=0, alert_duration_seconds=0)
+    prime_triggering_monitor(monitor, state)
 
-    alerts = await monitor.evaluate(NOW, state)
+    for offset in range(0, 60, 10):
+        await monitor.evaluate(NOW + timedelta(seconds=offset), state)
+    alerts = await monitor.evaluate(NOW + timedelta(seconds=60), state)
 
     assert len(alerts) == 1
     assert alerts[0].payload["funding_context"] == {"long": None, "short": None}
@@ -890,6 +997,7 @@ async def test_disappeared_pair_resolves_and_clears_persisted_active_state(tmp_p
             candidate_duration_seconds=0,
             stale_after_seconds=60,
         )
+        prime_triggering_monitor(monitor, state)
         await monitor.evaluate(NOW, state)
         await monitor.evaluate(NOW + timedelta(seconds=10), missing_short_state)
 
@@ -908,6 +1016,7 @@ async def test_candidate_is_confirmed_only_after_continuous_candidate_duration()
         make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
         make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
     )
+    prime_triggering_monitor(monitor, state)
 
     for seconds in (0, 10, 20):
         assert await monitor.evaluate(NOW + timedelta(seconds=seconds), state) == []
@@ -925,6 +1034,7 @@ async def test_below_candidate_resolves_episode_and_reentry_starts_a_new_one():
         make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
         make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
     )
+    prime_triggering_monitor(monitor, qualifying_state)
     await monitor.evaluate(NOW, qualifying_state)
     first_episode_id = monitor.active_episodes[0].episode_id
 
@@ -938,51 +1048,39 @@ async def test_below_candidate_resolves_episode_and_reentry_starts_a_new_one():
         ),
     )
     await monitor.evaluate(NOW + timedelta(seconds=10), below_candidate_state)
-    assert monitor.active_episodes == ()
+    target_key = SpreadPairKey("BTC", "long", "BTC", "short", "BTC")
+    assert all(episode.key != target_key for episode in monitor.active_episodes)
 
     await monitor.evaluate(NOW + timedelta(seconds=20), qualifying_state)
     assert monitor.active_episodes[0].episode_id != first_episode_id
 
 
 @pytest.mark.asyncio
-async def test_alert_threshold_timer_resets_without_resolving_candidate_episode():
-    monitor = make_monitor(
-        candidate_duration_seconds=0,
-        alert_duration_seconds=20,
-        alert_net_bps=20.0,
-        stale_after_seconds=60,
-    )
+async def test_high_std_after_alert_does_not_rearm_episode():
+    monitor = make_monitor(candidate_duration_seconds=0, alert_duration_seconds=20)
     high_state = make_state(
         make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
         make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
     )
-    await monitor.evaluate(NOW, high_state)
-    episode_id = monitor.active_episodes[0].episode_id
+    prime_triggering_monitor(monitor, high_state)
+    for offset in range(0, 60, 10):
+        assert await monitor.evaluate(NOW + timedelta(seconds=offset), high_state) == []
+    alerts = await monitor.evaluate(NOW + timedelta(seconds=60), high_state)
+    assert len(alerts) == 1
+    assert monitor.active_episodes[0].alerted is True
 
-    candidate_only_state = make_state(
-        make_market(
-            "long",
-            buy_10k_vwap=100.0,
-            sell_10k_vwap=99.0,
-            observed_at=NOW + timedelta(seconds=10),
-        ),
+    noisy_state = make_state(
+        make_market("long", buy_10k_vwap=100.0, observed_at=NOW + timedelta(seconds=70)),
         make_market(
             "short",
             buy_10k_vwap=102.0,
-            sell_10k_vwap=100.12,
-            observed_at=NOW + timedelta(seconds=10),
+            sell_10k_vwap=103.0,
+            observed_at=NOW + timedelta(seconds=70),
         ),
     )
-    await monitor.evaluate(NOW + timedelta(seconds=10), candidate_only_state)
-    assert monitor.active_episodes[0].episode_id == episode_id
-    assert monitor.active_episodes[0].alert_condition_since is None
-
-    await monitor.evaluate(NOW + timedelta(seconds=20), high_state)
-    assert monitor.active_episodes[0].alert_condition_since == NOW + timedelta(seconds=20)
-    assert await monitor.evaluate(NOW + timedelta(seconds=30), high_state) == []
-    alerts = await monitor.evaluate(NOW + timedelta(seconds=40), high_state)
-    assert len(alerts) == 1
+    await monitor.evaluate(NOW + timedelta(seconds=70), noisy_state)
     assert monitor.active_episodes[0].alerted is True
+    assert await monitor.evaluate(NOW + timedelta(seconds=80), high_state) == []
 
 
 @pytest.mark.asyncio
@@ -992,10 +1090,13 @@ async def test_one_alert_per_episode_and_reentry_can_alert_again():
         make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
         make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
     )
+    prime_triggering_monitor(monitor, qualifying_state)
 
-    first_alerts = await monitor.evaluate(NOW, qualifying_state)
+    for offset in range(0, 60, 10):
+        assert await monitor.evaluate(NOW + timedelta(seconds=offset), qualifying_state) == []
+    first_alerts = await monitor.evaluate(NOW + timedelta(seconds=60), qualifying_state)
     assert len(first_alerts) == 1
-    assert await monitor.evaluate(NOW + timedelta(seconds=10), qualifying_state) == []
+    assert await monitor.evaluate(NOW + timedelta(seconds=70), qualifying_state) == []
 
     below_state = make_state(
         make_market(
@@ -1011,7 +1112,9 @@ async def test_one_alert_per_episode_and_reentry_can_alert_again():
             observed_at=NOW + timedelta(seconds=20),
         ),
     )
-    await monitor.evaluate(NOW + timedelta(seconds=20), below_state)
-    second_alerts = await monitor.evaluate(NOW + timedelta(seconds=30), qualifying_state)
+    await monitor.evaluate(NOW + timedelta(seconds=80), below_state)
+    for offset in range(90, 150, 10):
+        assert await monitor.evaluate(NOW + timedelta(seconds=offset), qualifying_state) == []
+    second_alerts = await monitor.evaluate(NOW + timedelta(seconds=150), qualifying_state)
     assert len(second_alerts) == 1
     assert second_alerts[0].event_id != first_alerts[0].event_id

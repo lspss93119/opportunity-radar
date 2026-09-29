@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from io import BytesIO
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import matplotlib
 
@@ -130,6 +131,27 @@ def _historical_median_lines(
     return [(f"{label} median", value) for label, value in available]
 
 
+def _rolling_mean_series(
+    points: tuple[HistoricalSpreadPoint, ...],
+    *,
+    window: timedelta = DISPLAY_WINDOW,
+) -> dict[datetime, float]:
+    """Return prior-only 24-hour means for display without look-ahead."""
+    ordered = tuple(sorted(points, key=lambda point: point.sample_time))
+    history: deque[HistoricalSpreadPoint] = deque()
+    total = 0.0
+    means: dict[datetime, float] = {}
+    for point in ordered:
+        cutoff = point.sample_time - window
+        while history and history[0].sample_time < cutoff:
+            total -= history.popleft().raw_spread_bps
+        if history:
+            means[point.sample_time] = total / len(history)
+        history.append(point)
+        total += point.raw_spread_bps
+    return means
+
+
 def _label_reference_line(axis, value: float, label: str, color: str) -> None:
     axis.text(
         0.995,
@@ -170,7 +192,9 @@ def render_spread_chart(
 
     figure, axis = plt.subplots(figsize=(9, 4.5))
     try:
-        display_points = _recent_points(context.points_7d)
+        all_points = tuple(sorted(context.points_7d, key=lambda point: point.sample_time))
+        rolling_means = _rolling_mean_series(all_points)
+        display_points = _recent_points(all_points)
         display_points = _downsample_points(display_points)
         timestamps = [point.sample_time for point in display_points]
         spreads = [point.raw_spread_bps for point in display_points]
@@ -180,6 +204,16 @@ def render_spread_chart(
             color="tab:blue",
             linewidth=1.2,
         )
+        mean_points = [
+            point for point in display_points if point.sample_time in rolling_means
+        ]
+        if mean_points:
+            axis.plot(
+                mdates.date2num([point.sample_time for point in mean_points]),
+                [rolling_means[point.sample_time] for point in mean_points],
+                color="tab:orange",
+                linewidth=1.0,
+            )
         latest_point = display_points[-1]
         axis.scatter(
             [mdates.date2num(latest_point.sample_time)],
@@ -188,10 +222,24 @@ def render_spread_chart(
             s=34,
             zorder=5,
         )
+        axis.scatter(
+            [mdates.date2num(details.sample_time)],
+            [details.raw_spread_bps],
+            color="tab:red",
+            marker="D",
+            s=28,
+            zorder=6,
+        )
         reference_lines: list[tuple[str, float, str]] = [
             ("Current", details.raw_spread_bps, "black")
         ]
         axis.axhline(details.raw_spread_bps, color="black", linestyle="--")
+        axis.axhline(
+            details.rolling_mean_bps,
+            color="tab:orange",
+            linestyle="-.",
+        )
+        reference_lines.append(("24h mean", details.rolling_mean_bps, "tab:orange"))
         median_colors = ("tab:blue", "tab:orange", "tab:purple")
         for (label, median), color in zip(
             _historical_median_lines(context), median_colors, strict=False
@@ -202,28 +250,15 @@ def render_spread_chart(
                 linestyle=":",
             )
             reference_lines.append((label, median, color))
-        fee_bps = details.long_fee_bps + details.short_fee_bps
-        candidate_raw_threshold = candidate_net_bps + fee_bps
-        alert_raw_threshold = alert_net_bps + fee_bps
-        axis.axhline(
-            candidate_raw_threshold,
-            color="tab:green",
-            linestyle="-.",
-        )
-        reference_lines.append(("Candidate", candidate_raw_threshold, "tab:green"))
-        axis.axhline(
-            alert_raw_threshold,
-            color="tab:red",
-            linestyle="-.",
-        )
-        reference_lines.append(("Alert", alert_raw_threshold, "tab:red"))
         label_positions = _reference_label_positions(reference_lines)
         for label, value, color in reference_lines:
             _label_reference_line(axis, label_positions[label], label, color)
-        baseline = _baseline_median(context)
-        deviation = (
-            None if baseline is None else details.raw_spread_bps - baseline
+        baseline = (
+            details.rolling_mean_bps
+            if details.rolling_mean_bps is not None
+            else _baseline_median(context)
         )
+        deviation = details.deviation_bps if baseline is not None else None
         axis.text(
             0.01,
             0.99,
@@ -240,7 +275,7 @@ def render_spread_chart(
                         if deviation is not None
                         else "Deviation: unavailable"
                     ),
-                    f"Net spread: {details.net_spread_bps:.2f} bps",
+                    f"Net spread: {_format_median(details.net_spread_bps)} bps",
                 )
             ),
             transform=axis.transAxes,

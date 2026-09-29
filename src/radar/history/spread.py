@@ -8,6 +8,8 @@ from statistics import median
 
 import duckdb  # type: ignore[import-untyped]
 
+from radar.monitors.spread.models import SpreadPairKey
+
 VWAP_COLUMNS = {
     1_000: ("buy_1k_vwap", "sell_1k_vwap"),
     5_000: ("buy_5k_vwap", "sell_5k_vwap"),
@@ -223,3 +225,109 @@ class SpreadHistory:
             stats_30d=stats_30d,
             stats_90d=stats_90d,
         )
+
+    def load_recent_pair_points(
+        self,
+        *,
+        primary_size_usd: int,
+        as_of: datetime,
+        window: timedelta = timedelta(days=1),
+    ) -> dict[SpreadPairKey, tuple[tuple[datetime, float], ...]]:
+        """Load one bounded prior window for stable-basis monitor hydration."""
+        try:
+            buy_column, sell_column = VWAP_COLUMNS[primary_size_usd]
+        except KeyError as exc:
+            raise ValueError("primary_size_usd must be 1000, 5000, or 10000") from exc
+
+        as_of_utc = _as_utc(as_of, "as_of")
+        market_files = tuple(
+            path
+            for path in self.data_root.glob("market/date=*/part-*.parquet")
+            if path.is_file()
+        )
+        if not market_files:
+            return {}
+
+        market_glob = str(
+            self.data_root / "market" / "date=*" / "part-*.parquet"
+        ).replace("'", "''")
+        query = f"""
+            SELECT
+                sample_time,
+                observed_at,
+                venue,
+                venue_symbol,
+                canonical_symbol,
+                {buy_column} AS buy_vwap,
+                {sell_column} AS sell_vwap
+            FROM read_parquet('{market_glob}')
+            WHERE sample_time >= ?
+              AND sample_time < ?
+        """
+        with duckdb.connect() as connection:
+            rows = connection.execute(
+                query,
+                [as_of_utc - window, as_of_utc],
+            ).fetchall()
+
+        latest: dict[tuple[str, str, str, datetime], tuple[datetime, object, object]] = {}
+        for (
+            sample_time,
+            observed_at,
+            venue,
+            venue_symbol,
+            canonical_symbol,
+            buy_vwap,
+            sell_vwap,
+        ) in rows:
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (venue, venue_symbol, canonical_symbol)
+            ):
+                continue
+            try:
+                sample_time_utc = _as_utc(sample_time, "sample_time")
+                observed_at_utc = _as_utc(observed_at, "observed_at")
+            except (AttributeError, TypeError, ValueError):
+                continue
+            feed_key = (venue, venue_symbol, canonical_symbol, sample_time_utc)
+            previous = latest.get(feed_key)
+            if previous is None or observed_at_utc > previous[0]:
+                latest[feed_key] = (observed_at_utc, buy_vwap, sell_vwap)
+
+        by_sample: dict[tuple[str, datetime], dict[tuple[str, str], tuple[object, object]]] = {}
+        for (venue, venue_symbol, canonical_symbol, sample_time), (
+            _observed_at,
+            buy_vwap,
+            sell_vwap,
+        ) in latest.items():
+            by_sample.setdefault((canonical_symbol, sample_time), {})[
+                (venue, venue_symbol)
+            ] = (buy_vwap, sell_vwap)
+
+        hydrated: dict[SpreadPairKey, list[tuple[datetime, float]]] = {}
+        for (canonical_symbol, sample_time), feeds in by_sample.items():
+            for (long_venue, long_symbol), (long_buy, _long_sell) in feeds.items():
+                if not isinstance(long_buy, (int, float)) or not math.isfinite(float(long_buy)) or float(long_buy) <= 0:
+                    continue
+                for (short_venue, short_symbol), (_short_buy, short_sell) in feeds.items():
+                    if long_venue.lower() == short_venue.lower():
+                        continue
+                    if not isinstance(short_sell, (int, float)) or not math.isfinite(float(short_sell)) or float(short_sell) <= 0:
+                        continue
+                    raw_spread_bps = (float(short_sell) / float(long_buy) - 1.0) * 10_000.0
+                    if not math.isfinite(raw_spread_bps):
+                        continue
+                    pair_key = SpreadPairKey(
+                        canonical_symbol=canonical_symbol,
+                        long_venue=long_venue,
+                        long_venue_symbol=long_symbol,
+                        short_venue=short_venue,
+                        short_venue_symbol=short_symbol,
+                    )
+                    hydrated.setdefault(pair_key, []).append((sample_time, raw_spread_bps))
+
+        return {
+            key: tuple(sorted(points, key=lambda point: point[0]))
+            for key, points in hydrated.items()
+        }

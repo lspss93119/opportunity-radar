@@ -28,6 +28,13 @@ def make_alert(**payload_overrides: object) -> AlertRequest:
         "long_fee_bps": 4.5,
         "short_fee_bps": 3.5,
         "net_spread_bps": 92.0,
+        "rolling_mean_bps": 80.0,
+        "rolling_std_bps": 2.5,
+        "deviation_bps": 20.0,
+        "signal_duration_seconds": 120,
+        "observed_at_skew_seconds": 0.5,
+        "round_trip_fee_bps": 16.0,
+        "theoretical_edge_bps": 4.0,
         "sample_time": SAMPLE_TIME.isoformat(),
         "episode_started_at": (
             SAMPLE_TIME - timedelta(seconds=30)
@@ -115,9 +122,10 @@ def test_parse_and_format_spread_alert_preserves_current_and_history_values():
     assert "7日 90.00 bps" in message
     assert "30日 85.00 bps" in message
     assert "90日 75.00 bps" in message
-    assert "候選規則: >= 12.50 bps / 30s" in message
-    assert "警報規則: >= 25.00 bps / 120s" in message
-    assert "80.00" not in message
+    assert "24h 均值: 80.00 bps" in message
+    assert "Std: 2.50 bps" in message
+    assert "偏離: +20.00 bps" in message
+    assert "訊號持續: 120s" in message
 
 
 def test_format_spread_alert_is_grouped_into_compact_sections():
@@ -134,11 +142,11 @@ def test_format_spread_alert_is_grouped_into_compact_sections():
     assert "做空: Hyperliquid (BTC)" in sections[0]
     assert "淨價差: 92.00 bps" in sections[0]
     assert "原始價差: 100.00 bps" in sections[0]
-    assert "手續費: Lighter 4.50 + Hyperliquid 3.50 = 8.00 bps" in sections[0]
+    assert "往返手續費: 16.00 bps" in sections[0]
+    assert "理論均值回歸邊際: +4.00 bps" in sections[0]
     assert "買入 VWAP: 100.00 | 賣出 VWAP: 101.00" in sections[1]
     assert "樣本時間: 2026-09-16 12:00:00 UTC" in sections[1]
-    assert "候選規則: >= 10.00 bps / 30s" in sections[2]
-    assert "警報規則: >= 20.00 bps / 120s" in sections[2]
+    assert "觀測偏差: 0.50s" in sections[2]
     assert sections[3].startswith("歷史原始價差中位數:")
 
 
@@ -156,8 +164,10 @@ def test_format_spread_alert_uses_traditional_chinese_wording():
         "原始價差",
         "手續費",
         "淨價差",
-        "候選規則",
-        "警報規則",
+        "24h 均值",
+        "Std",
+        "偏離",
+        "訊號持續",
         "資金費率",
         "歷史原始價差",
         "樣本數",
@@ -193,6 +203,26 @@ def test_format_missing_history_and_funding_is_deterministically_unavailable():
     assert "7日 不可用" in message
     assert "30日 不可用" in message
     assert "90日 不可用" in message
+
+
+def test_format_alert_with_unknown_fees_keeps_raw_trigger_context():
+    from radar.alerts.spread import format_spread_alert, parse_spread_alert
+
+    details = parse_spread_alert(
+        make_alert(
+            long_fee_bps=None,
+            short_fee_bps=None,
+            net_spread_bps=None,
+            round_trip_fee_bps=None,
+            theoretical_edge_bps=None,
+        )
+    )
+    message = format_spread_alert(details, HistoricalSpreadContext.empty())
+
+    assert "原始價差: 100.00 bps" in message
+    assert "淨價差: 不可用 bps" in message
+    assert "往返手續費: 不可用 bps" in message
+    assert "理論均值回歸邊際: 不可用 bps" in message
 
 
 @pytest.mark.parametrize(

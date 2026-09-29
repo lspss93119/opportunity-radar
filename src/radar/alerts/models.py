@@ -23,9 +23,16 @@ class SpreadAlertDetails:
     long_buy_vwap: float
     short_sell_vwap: float
     raw_spread_bps: float
-    long_fee_bps: float
-    short_fee_bps: float
-    net_spread_bps: float
+    long_fee_bps: float | None
+    short_fee_bps: float | None
+    net_spread_bps: float | None
+    rolling_mean_bps: float
+    rolling_std_bps: float
+    deviation_bps: float
+    signal_duration_seconds: int
+    observed_at_skew_seconds: float
+    round_trip_fee_bps: float | None
+    theoretical_edge_bps: float | None
     sample_time: datetime
     candidate_duration_seconds: int
     alert_duration_seconds: int
