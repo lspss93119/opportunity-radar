@@ -7,7 +7,7 @@ A 24/7, read-only personal market opportunity radar. It identifies opportunities
 Perp ↔ Perp cross-exchange executable-spread monitoring only.
 
 ## Explicit non-goals
-No order placement, wallet signing, private-key handling, automatic execution, position management, HFT, sub-second strategies, MEV, ML scoring, dashboard, or microservices.
+No order placement, wallet signing, private-key handling, automatic execution, position management, HFT, sub-second strategies, MEV, ML scoring, or microservices in the Radar core. The original v1 product scope excluded a dashboard; the separately approved read-only presentation/query layer is now defined by `docs/superpowers/specs/2026-09-29-opportunity-radar-dashboard-design.md` and does not change collector, monitor, storage, or alert semantics.
 
 ## Universe
 Manually configured `venue + venue_symbol -> canonical_symbol`. v1 pilot: Lighter + Hyperliquid, BTC / ETH / SOL.
