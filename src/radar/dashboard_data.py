@@ -518,8 +518,6 @@ class DashboardQueryService:
             for observation in self._downsample_points(display_points)
         ]
         rolling_mean_series = self._rolling_mean_series(observations, display_points)
-        for point, mean in zip(history, rolling_mean_series, strict=True):
-            mean["segment"] = point["segment"]
         lifecycle = self._lifecycle_for(key, runtime.episodes_by_key, now)
         current_payload = (
             self._current_payload(current_observation, basis, lifecycle)
@@ -1477,10 +1475,24 @@ class DashboardQueryService:
                 latest_prior_observed_at = max(
                     point.observed_at, latest_prior_observed_at or point.observed_at
                 )
+        # Mean availability can break even when raw observations are continuous.
+        # Mark those breaks before a null point can be omitted by downsampling.
+        segments: dict[datetime, int] = {}
+        segment = 0
+        for index, point in enumerate(display_points):
+            if index:
+                previous = display_points[index - 1]
+                if (
+                    (point.sample_time - previous.sample_time).total_seconds() > EXPECTED_INTERVAL_SECONDS
+                    or (means.get(point.sample_time) is None) != (means.get(previous.sample_time) is None)
+                ):
+                    segment += 1
+            segments[point.sample_time] = segment
         return [
             {
                 "sample_time": point.sample_time.isoformat(),
                 "rolling_mean_bps": means.get(point.sample_time),
+                "segment": segments[point.sample_time],
             }
             for point in self._downsample_points(display_points)
         ]

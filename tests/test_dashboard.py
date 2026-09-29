@@ -881,3 +881,65 @@ console.log(JSON.stringify({chart:byId('pair-chart').innerHTML,summary:byId('pai
     raw_paths = re.findall(r'<path[^>]*data-series="raw"[^>]*d="([^"]*)"', result["chart"])
     assert raw_paths and all("L" not in path for path in raw_paths)
     assert "Unavailable" in result["summary"]
+
+
+@pytest.mark.parametrize("check", ["payload", "svg"])
+def test_pair_downsampling_preserves_unavailable_mean_break(tmp_path, monkeypatch, check):
+    start = NOW - timedelta(hours=6)
+    gap = NOW - timedelta(hours=3)
+    snapshots = []
+    # A missing 24h boundary makes only the mean at `gap` unavailable.
+    # All 2161 raw samples in the displayed six hours remain continuous.
+    for index in range(10801):
+        sample = start - timedelta(days=1) + timedelta(seconds=10 * index)
+        if sample == gap - timedelta(days=1):
+            continue
+        snapshots.extend([
+            make_market(venue="lighter", sample_time=sample, observed_at=sample),
+            make_market(venue="hyperliquid", sample_time=sample, observed_at=sample,
+                        sell_10k_vwap=102.0),
+        ])
+    write_markets(tmp_path / "data", snapshots)
+    service = DashboardStatusService(
+        RadarConfig(markets=[MarketConfig(venue=v, venue_symbol="BTC", canonical_symbol="BTC")
+                             for v in ("lighter", "hyperliquid")],
+                    fees_bps={"lighter": 1, "hyperliquid": 2}),
+        data_root=tmp_path / "data", runtime_db=tmp_path / "runtime.sqlite3",
+        clock=lambda: NOW,
+    )
+    query = dict(canonical_symbol="BTC", long_venue="lighter", long_venue_symbol="BTC",
+                 short_venue="hyperliquid", short_venue_symbol="BTC", range_name="6h")
+    with monkeypatch.context() as uncapped:
+        uncapped.setattr("radar.dashboard_data.MAX_DISPLAY_POINTS", 3000)
+        full = service.get_pair(**query)
+    assert len(full["history"]) == 2161
+    assert {p["segment"] for p in full["history"]} == {0}
+    assert [p["sample_time"] for p in full["rolling_mean_series"]
+            if p["rolling_mean_bps"] is None] == [gap.isoformat()]
+    for point in full["rolling_mean_series"]:
+        if point["sample_time"] != gap.isoformat():
+            assert point["rolling_mean_bps"] == pytest.approx(200)
+
+    payload = service.get_pair(**query)
+    assert len(payload["history"]) <= 500
+    assert {p["segment"] for p in payload["history"]} == {0}
+    means = payload["rolling_mean_series"]
+    assert gap.isoformat() not in {p["sample_time"] for p in means}
+    assert all(p["rolling_mean_bps"] == pytest.approx(200) for p in means)
+    if check == "payload":
+        before = [p for p in means if p["sample_time"] < gap.isoformat()][-1]
+        after = [p for p in means if p["sample_time"] > gap.isoformat()][0]
+        assert before["segment"] != after["segment"]
+    else:
+        with dashboard_http(service) as base:
+            with urlopen(base + "/pair") as response:
+                html = response.read().decode()
+        chart = run_ui_script(html, """
+renderPair(payload);
+console.log(JSON.stringify(byId('pair-chart').innerHTML));
+""", setup="location.pathname='/pair'; const payload=" + json.dumps(payload) + ";\n")
+        raw = re.search(r'<path data-series="raw" d="([^"]*)"', chart).group(1)
+        mean = re.search(r'<path data-series="mean" d="([^"]*)"', chart).group(1)
+        assert raw.count("M") == 1
+        assert mean.count("M") == 2
+        assert "L" in mean
