@@ -5,6 +5,7 @@ import json
 import math
 import sqlite3
 import threading
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -131,6 +132,7 @@ class _MarketRow:
 class _PairObservation:
     key: SpreadPairKey
     sample_time: datetime
+    observed_at: datetime
     long_buy_vwap: float
     short_sell_vwap: float
     long_fee_bps: float
@@ -138,7 +140,7 @@ class _PairObservation:
     raw_spread_bps: float
     observed_at_skew_seconds: float
     freshness_seconds: float | None
-    valid_at_sample: bool
+    valid_for_history: bool
 
 
 @dataclass
@@ -393,7 +395,7 @@ class DashboardQueryService:
         query_start = now - timedelta(seconds=ROLLING_WINDOW_SECONDS)
         rows, market_errors, data_as_of = self._read_market_rows(query_start, now)
         runtime = self._read_runtime(now)
-        observations = self._build_pair_observations(rows)
+        observations = self._build_pair_observations(rows, now)
         current_by_key = self._current_observations(observations, rows, now)
         # Basis windows belong to the matched sample, which can precede the
         # request time. Read only the small missing prefix of those windows.
@@ -407,7 +409,7 @@ class DashboardQueryService:
                     prior_start, query_start - timedelta(microseconds=1)
                 )
                 market_errors.extend(prior_errors)
-                observations = self._build_pair_observations([*prior_rows, *rows])
+                observations = self._build_pair_observations([*prior_rows, *rows], now)
         output_rows: list[dict[str, object]] = []
         basis_unavailable = False
         for key, observation in current_by_key.items():
@@ -471,7 +473,7 @@ class DashboardQueryService:
         errors.extend(market_errors)
         observations = [
             observation
-            for observation in self._build_pair_observations(rows)
+            for observation in self._build_pair_observations(rows, now)
             if observation.key == key
         ]
         current_observation = self._current_observations(
@@ -490,7 +492,7 @@ class DashboardQueryService:
             for observation in observations
             if display_start <= observation.sample_time <= now
             and (
-                observation.valid_at_sample
+                observation.valid_for_history
                 or (
                     current_observation is not None
                     and observation.sample_time == current_observation.sample_time
@@ -761,6 +763,7 @@ class DashboardQueryService:
     def _build_pair_observations(
         self,
         rows: Iterable[_MarketRow],
+        now: datetime,
     ) -> list[_PairObservation]:
         grouped: dict[tuple[str, datetime], list[_MarketRow]] = {}
         enabled = self._enabled_identities()
@@ -802,6 +805,7 @@ class DashboardQueryService:
                                 short_venue_symbol=short_row.venue_symbol,
                             ),
                             sample_time=sample_time,
+                            observed_at=max(long_row.observed_at, short_row.observed_at),
                             long_buy_vwap=long_buy,
                             short_sell_vwap=short_sell,
                             long_fee_bps=long_fee,
@@ -809,9 +813,15 @@ class DashboardQueryService:
                             raw_spread_bps=raw_spread,
                             observed_at_skew_seconds=observed_skew,
                             freshness_seconds=None,
-                            valid_at_sample=(
-                                self._is_current_row(long_row, sample_time)
-                                and self._is_current_row(short_row, sample_time)
+                            valid_for_history=(
+                                # The slot identifies the sample, not when it
+                                # became available. Bound both age and delay.
+                                all(
+                                    row.observed_at <= now
+                                    and abs((sample_time - row.observed_at).total_seconds())
+                                    <= self.config.monitors.spread.stale_after_seconds
+                                    for row in (long_row, short_row)
+                                )
                             ),
                         )
                     )
@@ -1001,7 +1011,8 @@ class DashboardQueryService:
             observation
             for observation in observations
             if observation.key == current.key
-            and observation.valid_at_sample
+            and observation.valid_for_history
+            and observation.observed_at < current.observed_at
             and observation.sample_time < current.sample_time
             and observation.sample_time >= current.sample_time - timedelta(seconds=ROLLING_WINDOW_SECONDS)
         ]
@@ -1080,6 +1091,10 @@ class DashboardQueryService:
 
         errors: list[str] = []
         try:
+            # Set before any database access: WAL must not map/write a shared
+            # wal-index. If read-only exclusive access is impossible, fail
+            # explicitly instead of ignoring WAL via immutable=1.
+            connection.execute("PRAGMA locking_mode=EXCLUSIVE")
             state_row = connection.execute(
                 """
                 SELECT state_json, updated_at
@@ -1420,15 +1435,33 @@ class DashboardQueryService:
             expected_interval_seconds=EXPECTED_INTERVAL_SECONDS,
         )
         display_times = {point.sample_time for point in display_points}
+        prior_points: deque[_PairObservation] = deque()
+        latest_prior_observed_at: datetime | None = None
         for point in all_points:
+            cutoff = point.sample_time - timedelta(seconds=ROLLING_WINDOW_SECONDS)
+            while prior_points and prior_points[0].sample_time < cutoff:
+                prior_points.popleft()
+            valid = point.valid_for_history and math.isfinite(point.raw_spread_bps * point.raw_spread_bps)
             stats = (
                 basis.observe(point.sample_time, point.raw_spread_bps)
-                if point.valid_at_sample and math.isfinite(point.raw_spread_bps * point.raw_spread_bps)
+                if valid
                 else basis.stats_before(point.sample_time)
             )
-            if point.sample_time not in display_times:
-                continue
-            means[point.sample_time] = self._basis_stats_payload(stats)["mean_bps"]
+            if point.sample_time in display_times:
+                # A delayed prior slot can arrive after this observation.
+                # Recheck only that bounded window when availability overlaps.
+                payload = (
+                    self._basis_payload_for(prior_points, point)
+                    if latest_prior_observed_at is not None
+                    and latest_prior_observed_at >= point.observed_at
+                    else self._basis_stats_payload(stats)
+                )
+                means[point.sample_time] = payload["mean_bps"]
+            if valid:
+                prior_points.append(point)
+                latest_prior_observed_at = max(
+                    point.observed_at, latest_prior_observed_at or point.observed_at
+                )
         return [
             {
                 "sample_time": point.sample_time.isoformat(),

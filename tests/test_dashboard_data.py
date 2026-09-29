@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -157,7 +159,9 @@ def write_prior_pair_history(
     short_symbol: str | None = None,
     current_raw_spread_bps: float = 500.0,
     current_sample_time: datetime = NOW,
+    current_observed_at: datetime = NOW - timedelta(seconds=2),
     prior_raw_spreads: tuple[float, float] = (100.0, 300.0),
+    prior_observation_delay_seconds: float = 0.0,
 ) -> None:
     snapshots: list[MarketSnapshot] = []
     for index, sample_time in enumerate(prior_times):
@@ -165,7 +169,7 @@ def write_prior_pair_history(
         snapshots.extend(
             pair_markets(
                 sample_time=sample_time,
-                observed_at=sample_time,
+                observed_at=sample_time + timedelta(seconds=prior_observation_delay_seconds),
                 symbol=symbol,
                 long_venue=long_venue,
                 short_venue=short_venue,
@@ -178,7 +182,7 @@ def write_prior_pair_history(
     snapshots.extend(
         pair_markets(
             sample_time=current_sample_time,
-            observed_at=NOW - timedelta(seconds=2),
+            observed_at=current_observed_at,
             symbol=symbol,
             long_venue=long_venue,
             short_venue=short_venue,
@@ -635,6 +639,62 @@ def test_sqlite_missing_or_unreadable_database_does_not_create_file(tmp_path):
     assert unreadable_db.read_bytes() == b"not a sqlite database"
 
 
+@pytest.mark.parametrize("wal_state", ["checkpointed", "active", "wal-only"])
+def test_runtime_wal_reads_do_not_create_or_modify_sidecars(tmp_path, wal_state):
+    source_db = tmp_path / "source.sqlite3"
+    write_episodes(source_db, {"old": make_episode()}, updated_at=NOW - timedelta(hours=1))
+    writer = sqlite3.connect(source_db)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        if wal_state == "checkpointed":
+            writer.close()
+            runtime_db = source_db
+            assert not Path(str(runtime_db) + "-wal").exists()
+            assert not Path(str(runtime_db) + "-shm").exists()
+        else:
+            writer.execute(
+                "UPDATE monitor_state SET state_json = ?, updated_at = ?",
+                (json.dumps({"fresh": make_episode(alerted=False)}), NOW.isoformat()),
+            )
+            writer.commit()
+            runtime_db = source_db
+            if wal_state == "wal-only":
+                runtime_db = tmp_path / "copy" / "runtime.sqlite3"
+                runtime_db.parent.mkdir()
+                shutil.copyfile(source_db, runtime_db)
+                shutil.copyfile(str(source_db) + "-wal", str(runtime_db) + "-wal")
+                assert not Path(str(runtime_db) + "-shm").exists()
+
+        def runtime_files():
+            return {
+                path.name: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns)
+                for path in runtime_db.parent.glob(runtime_db.name + "*")
+            }
+
+        before = runtime_files()
+        write_markets(tmp_path / "data", pair_markets())
+        service = DashboardQueryService(
+            pair_config(), data_root=tmp_path / "data", runtime_db=runtime_db,
+            clock=lambda: NOW, cache_ttl_seconds=0,
+        )
+        status = service.get_status()
+        scanner = service.get_opportunities(OpportunitiesFilters(long_venue=LONG_VENUE))
+        pair = query_pair(service)
+        assert runtime_files() == before
+        # WAL state cannot be exposed via a read that needs shared-memory writes.
+        # In particular, never silently expose the old checkpointed episode.
+        assert status["sqlite"]["status"] == "unavailable"
+        assert status["heartbeat"]["status"] == "down"
+        assert status["episodes"] == []
+        assert status["recent_events"] == []
+        assert scanner["rows"][0]["active"] is False
+        assert pair["lifecycle"]["available"] is False
+        for payload in (status, scanner, pair):
+            assert any("runtime state read failed" in error for error in payload["errors"])
+    finally:
+        writer.close()
+
+
 def test_empty_parquet_and_temporary_partition_are_degraded_without_being_read_as_data(
     tmp_path,
 ):
@@ -779,6 +839,70 @@ def test_scanner_basis_window_is_anchored_to_current_sample_not_request_time(tmp
     result = service.get_opportunities(OpportunitiesFilters(long_venue=LONG_VENUE))
     assert result["rows"][0]["basis_eligible"] is True
     assert result["rows"][0]["rolling_mean_bps"] == pytest.approx(200.0)
+
+
+def test_delayed_historical_observations_qualify_basis_and_history(tmp_path):
+    times = full_window_times()
+    write_prior_pair_history(
+        tmp_path / "data", prior_times=times, prior_observation_delay_seconds=1,
+    )
+    service = DashboardQueryService(
+        pair_config(), data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3", clock=lambda: NOW,
+    )
+    pair = query_pair(service, "24h")
+    assert pair["basis"]["sample_count"] == 6912
+    assert pair["basis"]["eligible"] is True
+    assert pair["basis"]["mean_bps"] == pytest.approx(200.0)
+    assert pair["basis"]["std_bps"] == pytest.approx(100.0)
+    assert pair["history"][0]["sample_time"] == times[0].isoformat()
+    assert pair["rolling_mean_series"][-1]["rolling_mean_bps"] == pytest.approx(200.0)
+    row = service.get_opportunities(OpportunitiesFilters(long_venue=LONG_VENUE))["rows"][0]
+    assert row["basis_eligible"] is True
+    assert row["rolling_mean_bps"] == pytest.approx(200.0)
+
+
+@pytest.mark.parametrize("observed_offset", [-2, -1, 1])
+def test_historical_observation_not_prior_to_current_is_excluded(tmp_path, observed_offset):
+    times = full_window_times()
+    write_prior_pair_history(tmp_path / "data", prior_times=times)
+    write_markets(tmp_path / "data", pair_markets(
+        sample_time=times[-1], observed_at=NOW + timedelta(seconds=observed_offset),
+    ))
+    pair = query_pair(DashboardQueryService(
+        pair_config(), data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3", clock=lambda: NOW,
+    ))
+    assert pair["basis"]["sample_count"] == 6911
+    assert pair["basis"]["eligible"] is False
+    assert pair["rolling_mean_series"][-1]["rolling_mean_bps"] is None
+    if observed_offset > 0:
+        assert times[-1].isoformat() not in {p["sample_time"] for p in pair["history"]}
+
+
+def test_rolling_history_excludes_delayed_observation_until_available(tmp_path):
+    earlier_sample = NOW - timedelta(seconds=10)
+    times = [time - timedelta(seconds=10) for time in full_window_times()]
+    # Both queried windows must have an observation at their own 24h boundary.
+    times[1] = NOW - timedelta(days=1)
+    write_prior_pair_history(
+        tmp_path / "data", prior_times=times,
+        current_sample_time=earlier_sample, current_observed_at=NOW - timedelta(seconds=9),
+        prior_observation_delay_seconds=1,
+    )
+    write_markets(tmp_path / "data", [
+        *pair_markets(sample_time=times[-1], observed_at=NOW - timedelta(seconds=8)),
+        *pair_markets(sample_time=earlier_sample, observed_at=NOW - timedelta(seconds=9)),
+        *pair_markets(observed_at=NOW - timedelta(seconds=2)),
+    ])
+    pair = query_pair(DashboardQueryService(
+        pair_config(), data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3", clock=lambda: NOW,
+    ))
+    means = {p["sample_time"]: p["rolling_mean_bps"] for p in pair["rolling_mean_series"]}
+    assert means[earlier_sample.isoformat()] is None
+    assert pair["basis"]["eligible"] is True
+    assert means[NOW.isoformat()] == pytest.approx(pair["basis"]["mean_bps"])
 
 
 @pytest.mark.parametrize("bad_input", ["stale", "future-observed"])
