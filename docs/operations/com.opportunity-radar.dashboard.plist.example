@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.opportunity-radar.dashboard</string>
+    <key>UserName</key>
+    <string>REPLACE_WITH_NORMAL_USERNAME</string>
+    <key>WorkingDirectory</key>
+    <string>/REPLACE_WITH_ABSOLUTE_REPO_PATH</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/REPLACE_WITH_ABSOLUTE_PYTHON_EXECUTABLE</string>
+        <string>-m</string>
+        <string>radar.dashboard</string>
+        <string>--host</string>
+        <string>REPLACE_WITH_TAILSCALE_IPV4</string>
+        <string>--port</string>
+        <string>8787</string>
+        <string>--config</string>
+        <string>/REPLACE_WITH_ABSOLUTE_CONFIG_PATH</string>
+        <string>--data-root</string>
+        <string>/REPLACE_WITH_ABSOLUTE_DATA_ROOT</string>
+        <string>--runtime-db</string>
+        <string>/REPLACE_WITH_ABSOLUTE_RUNTIME_DB_PATH</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/REPLACE_WITH_ABSOLUTE_DASHBOARD_STDOUT_LOG_PATH</string>
+    <key>StandardErrorPath</key>
+    <string>/REPLACE_WITH_ABSOLUTE_DASHBOARD_STDERR_LOG_PATH</string>
+</dict>
+</plist>

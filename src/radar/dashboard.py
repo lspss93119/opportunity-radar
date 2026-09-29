@@ -534,21 +534,28 @@ def create_dashboard_server(
     service: DashboardStatusService | DashboardQueryService,
     *,
     port: int,
+    host: str = "127.0.0.1",
 ) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer(("127.0.0.1", port), _handler_for(service))
+    return ThreadingHTTPServer((host, port), _handler_for(service))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read-only Opportunity Radar dashboard")
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = load_config(args.config)
-    server = create_dashboard_server(DashboardStatusService(config), port=args.port)
+    service = DashboardStatusService(
+        config, data_root=args.data_root, runtime_db=args.runtime_db,
+    )
+    server = create_dashboard_server(service, host=args.host, port=args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

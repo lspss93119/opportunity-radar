@@ -22,7 +22,23 @@ Read these before implementation:
 - `docs/superpowers/specs/2026-09-15-opportunity-radar-architecture.md`
 - `docs/superpowers/plans/2026-09-15-opportunity-radar-macbook-v1.md`
 
-Current checkpoint: **Task 1 Foundation**.
+## Read-only dashboard
+
+Run the dashboard as a separate process from Radar using the existing config:
+
+```sh
+uv run python -m radar.dashboard --config /absolute/path/to/existing-config.yaml
+```
+
+Open `http://127.0.0.1:8787/` for opportunities, pair history, and status. Defaults
+read `data/` and `runtime/radar.sqlite3` relative to the working directory; use
+`--host`, `--port`, `--data-root`, and `--runtime-db` for explicit overrides.
+The dashboard reads existing sources without trading, monitor evaluation, or
+changes to Radar's launch process. Missing sources display down/degraded state.
+
+See the [dashboard deployment guide](docs/operations/opportunity-radar-dashboard.md)
+and its LaunchDaemon example for install-time path/user discovery, Tailscale-only
+binding, separate logs, and the production benchmark required before deployment.
 
 ## Dependency lock note
 
