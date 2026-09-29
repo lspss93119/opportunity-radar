@@ -271,8 +271,10 @@ function renderStatus(data) {
     emptyRow(4, data.sqlite?.status === 'healthy' ? 'No recent events' : 'Events unavailable');
 }
 let requestSequence = 0;
+let requestInFlight = false;
 async function refresh(query = new URLSearchParams(location.search)) {
   const sequence = ++requestSequence;
+  requestInFlight = true;
   try {
     const response = await fetch(isStatus ? '/api/status' : '/api/opportunities?' + query.toString(), {cache:'no-store'});
     const data = await response.json();
@@ -292,6 +294,8 @@ async function refresh(query = new URLSearchParams(location.search)) {
     text('refreshed', 'Request failed at ' + new Date().toLocaleTimeString());
     byId('errors').innerHTML = '<div class="error">' + esc(error) + '</div>';
     if (isStatus) renderStatus({}); else byId('opportunity-rows').innerHTML = emptyRow(12, 'Data unavailable');
+  } finally {
+    if (sequence === requestSequence) requestInFlight = false;
   }
 }
 restoreFilters();
@@ -309,7 +313,7 @@ byId('reset').addEventListener('click', () => {
 });
 window.addEventListener('popstate', () => { restoreFilters(); refresh(); });
 refresh();
-setInterval(() => refresh(), 10000);
+setInterval(() => { if (!requestInFlight) refresh(); }, 10000);
 </script>
 </body>
 </html>"""

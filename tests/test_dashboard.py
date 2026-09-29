@@ -594,22 +594,126 @@ def test_dashboard_html_navigation_and_view_anchors(scanner_http, path):
             assert f">{column}<" in html
 
 
-def run_ui_script(html, expression):
+def run_ui_script(html, expression, setup=""):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node is optional and only needed to execute vanilla UI behavior tests")
     script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
     harness = """
 const elements = new Map();
-const document = {getElementById(id) { if (!elements.has(id)) elements.set(id, {textContent:'', innerHTML:'', value:'', checked:false, hidden:false, addEventListener(){}}); return elements.get(id); }};
+const document = {getElementById(id) { if (!elements.has(id)) elements.set(id, {textContent:'', innerHTML:'', value:'', checked:false, hidden:false, listeners:{}, addEventListener(type, callback){this.listeners[type]=callback;}}); return elements.get(id); }};
 const location = {pathname:'/', search:'?symbol=ETH&active_only=true'};
-const history = {replaceState(state, title, url){this.url=url;}};
-const window = {addEventListener(){}};
-const setInterval = () => {};
-const fetch = () => new Promise(() => {});
+const history = {replaceState(state, title, url){this.url=url; location.search = new URL(url, 'http://localhost').search;}};
+const window = {listeners:{}, addEventListener(type, callback){this.listeners[type]=callback;}};
+let setInterval = () => {};
+let fetch = () => new Promise(() => {});
 """
-    result = subprocess.run([node, "-e", harness + script + "\n" + expression], text=True, capture_output=True, check=True)
+    result = subprocess.run([node, "-e", harness + setup + script + "\n" + expression], text=True, capture_output=True, check=True, timeout=10)
     return json.loads(result.stdout)
+
+
+POLLING_SETUP = """
+const requests = [];
+let tick, interval;
+setInterval = (callback, milliseconds) => { tick = callback; interval = milliseconds; };
+fetch = url => new Promise((resolve, reject) => requests.push({url, resolve, reject}));
+document.getElementById('overall').textContent = 'Loading';
+const settle = () => new Promise(resolve => setImmediate(resolve));
+function succeed(request, marker) {
+  request.resolve({json: async () => ({
+    status:'healthy', overall:{status:'healthy'}, data_as_of:marker,
+    heartbeat:{status:'healthy', updated_at:marker, age_seconds:0},
+    rows:[{canonical_symbol:marker}], errors:[]
+  })});
+}
+"""
+
+
+@pytest.mark.parametrize("path", ["/", "/status"])
+def test_dashboard_polling_renders_delayed_successes_without_overlap(scanner_http, path):
+    with urlopen(scanner_http + path) as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+(async () => {
+  const rendered = [];
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const request = requests.at(-1);
+    tick(); tick(); // Two 10-second ticks before this successful response arrives.
+    succeed(request, 'sample-' + cycle);
+    await settle();
+    rendered.push({overall:byId('overall').textContent, sample:byId('data-as-of').textContent,
+      view:isStatus ? byId('heartbeat').textContent : byId('opportunity-rows').innerHTML});
+    if (cycle < 2) tick();
+  }
+  console.log(JSON.stringify({rendered, requests:requests.length, interval}));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""", setup=POLLING_SETUP + f"location.pathname = {json.dumps(path)};\n")
+    assert [view["overall"] for view in result["rendered"]] == ["HEALTHY"] * 3
+    for cycle, view in enumerate(result["rendered"]):
+        assert view["sample"] == f"Data as of: sample-{cycle}"
+        assert f"sample-{cycle}" in view["view"]
+    assert result["requests"] == 3
+    assert result["interval"] == 10_000
+
+
+@pytest.mark.parametrize("action", ["submit", "reset", "popstate"])
+@pytest.mark.parametrize("old_first", [True, False])
+def test_dashboard_filter_refresh_invalidates_pending_response(scanner_http, action, old_first):
+    with urlopen(scanner_http + "/") as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+(async () => {
+  const old = requests[0];
+  if (action === 'submit') {
+    byId('symbol').value = 'BTC';
+    byId('filters').listeners.submit({preventDefault(){}});
+  } else if (action === 'reset') {
+    byId('reset').listeners.click();
+  } else {
+    location.search = '?symbol=SOL';
+    window.listeners.popstate();
+  }
+  const current = requests.at(-1);
+  if (oldFirst) { succeed(old, 'obsolete'); await settle(); }
+  tick(); // An obsolete completion must not unlock polling of the current request.
+  succeed(current, 'current');
+  await settle();
+  if (!oldFirst) { succeed(old, 'obsolete'); await settle(); }
+  const rendered = {overall:byId('overall').textContent, sample:byId('data-as-of').textContent,
+    rows:byId('opportunity-rows').innerHTML};
+  tick(); // Polling resumes after the current request has completed.
+  console.log(JSON.stringify({rendered, urls:requests.map(request => request.url)}));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""", setup=POLLING_SETUP + f"const action = {json.dumps(action)}, oldFirst = {json.dumps(old_first)};\n")
+    assert result["rendered"]["overall"] == "HEALTHY"
+    assert result["rendered"]["sample"] == "Data as of: current"
+    assert "current" in result["rendered"]["rows"]
+    assert "obsolete" not in result["rendered"]["rows"]
+    expected_query = {"submit": {"symbol": ["BTC"], "active_only": ["true"]},
+                      "reset": {}, "popstate": {"symbol": ["SOL"]}}[action]
+    assert len(result["urls"]) == 3
+    for url in result["urls"][1:]:
+        assert parse_qs(urlparse(url).query) == expected_query
+
+
+@pytest.mark.parametrize("path", ["/", "/status"])
+def test_dashboard_polling_resumes_after_request_failure(scanner_http, path):
+    with urlopen(scanner_http + path) as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+(async () => {
+  requests[0].reject(new Error('temporary failure'));
+  await settle();
+  const failed = byId('overall').textContent;
+  tick();
+  succeed(requests.at(-1), 'recovered');
+  await settle();
+  console.log(JSON.stringify({failed, overall:byId('overall').textContent,
+    sample:byId('data-as-of').textContent, requests:requests.length}));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""", setup=POLLING_SETUP + f"location.pathname = {json.dumps(path)};\n")
+    assert result == {"failed": "DEGRADED — dashboard request failed", "overall": "HEALTHY",
+                      "sample": "Data as of: recovered", "requests": 2}
 
 
 def test_scanner_exact_pair_links_and_missing_identity_never_guessed(scanner_http):
