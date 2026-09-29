@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 
 import duckdb  # type: ignore[import-untyped]
@@ -32,6 +33,9 @@ FEED_HEALTHY_SECONDS = 90.0
 FEED_DEGRADED_SECONDS = 180.0
 MAX_OPPORTUNITY_LIMIT = 200
 MAX_DISPLAY_POINTS = 500
+SCANNER_REFRESH_SECONDS = 10.0
+SCANNER_OVERLAP_SECONDS = EXPECTED_INTERVAL_SECONDS * 2
+SCANNER_BATCH_ROWS = 8_192
 PAIR_RANGES = ("1h", "6h", "24h", "3d", "7d", "all")
 PairRange = Literal["1h", "6h", "24h", "3d", "7d", "all"]
 VWAP_FIELDS = (
@@ -159,6 +163,115 @@ class _CacheEntry:
     value: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class _RollingPoint:
+    sample_epoch: int
+    raw_spread_bps: float
+
+
+@dataclass(slots=True)
+class _PairScannerState:
+    points: deque[_RollingPoint]
+    total: float = 0.0
+    total_squares: float = 0.0
+    latest: _PairObservation | None = None
+
+    def upsert_point(
+        self,
+        sample_epoch: int,
+        raw_spread_bps: float,
+        *,
+        valid_for_history: bool,
+    ) -> None:
+        for index in range(len(self.points) - 1, -1, -1):
+            point = self.points[index]
+            if point.sample_epoch == sample_epoch:
+                self.total -= point.raw_spread_bps
+                self.total_squares -= point.raw_spread_bps * point.raw_spread_bps
+                del self.points[index]
+                break
+            if point.sample_epoch < sample_epoch:
+                break
+        if valid_for_history:
+            point = _RollingPoint(sample_epoch, raw_spread_bps)
+            if not self.points or sample_epoch > self.points[-1].sample_epoch:
+                self.points.append(point)
+            else:
+                insert_at = next(
+                    index
+                    for index, existing in enumerate(self.points)
+                    if existing.sample_epoch > sample_epoch
+                )
+                self.points.insert(insert_at, point)
+            self.total += raw_spread_bps
+            self.total_squares += raw_spread_bps * raw_spread_bps
+
+    def prune(self, cutoff_epoch: int) -> None:
+        while self.points and self.points[0].sample_epoch < cutoff_epoch:
+            point = self.points.popleft()
+            self.total -= point.raw_spread_bps
+            self.total_squares -= point.raw_spread_bps * point.raw_spread_bps
+
+    def stats_before(self, sample_epoch: int) -> RollingBasisStats:
+        cutoff_epoch = sample_epoch - ROLLING_WINDOW_SECONDS
+        self.prune(cutoff_epoch)
+        excluded = (
+            self.points[-1]
+            if self.points and self.points[-1].sample_epoch == sample_epoch
+            else None
+        )
+        sample_count = len(self.points) - (1 if excluded is not None else 0)
+        total = self.total - (excluded.raw_spread_bps if excluded is not None else 0.0)
+        total_squares = self.total_squares - (
+            excluded.raw_spread_bps * excluded.raw_spread_bps
+            if excluded is not None
+            else 0.0
+        )
+        mean: float | None = None
+        std: float | None = None
+        if sample_count > 0:
+            mean = total / sample_count
+            variance = max(0.0, total_squares / sample_count - mean * mean)
+            std = math.sqrt(variance)
+        oldest = next(
+            (point.sample_epoch for point in self.points if point.sample_epoch < sample_epoch),
+            None,
+        )
+        coverage = sample_count / (
+            ROLLING_WINDOW_SECONDS / EXPECTED_INTERVAL_SECONDS
+        )
+        if oldest is None or oldest > cutoff_epoch:
+            coverage = 0.0
+        return RollingBasisStats(
+            sample_count=sample_count,
+            coverage=coverage,
+            mean_bps=mean,
+            std_bps=std,
+            min_observations=MIN_HISTORY_OBSERVATIONS,
+        )
+
+
+@dataclass(slots=True)
+class _ScannerModel:
+    known_files: set[Path]
+    latest_rows: dict[tuple[str, str, str], _MarketRow]
+    pair_states: dict[SpreadPairKey, _PairScannerState]
+    data_as_of: datetime | None = None
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ScannerSnapshot:
+    files: tuple[Path, ...]
+    latest_file_mtime: datetime | None
+    latest_rows: Mapping[tuple[str, str, str], _MarketRow]
+    pair_states: Mapping[SpreadPairKey, _PairScannerState]
+    current_observations: Mapping[SpreadPairKey, _PairObservation]
+    basis_by_key: Mapping[SpreadPairKey, dict[str, object]]
+    data_as_of: datetime | None
+    errors: tuple[str, ...]
+
+
 class DashboardQueryService:
     """Bounded, read-only queries over Radar's existing persisted sources."""
 
@@ -184,9 +297,181 @@ class DashboardQueryService:
         self._max_cache_entries = max_cache_entries
         self._cache: dict[tuple[object, ...], _CacheEntry] = {}
         self._cache_lock = threading.Lock()
+        self._scanner_lock = threading.RLock()
+        self._scanner_refresh_lock = threading.Lock()
+        self._scanner_model: _ScannerModel | None = None
+        self._scanner_snapshot: _ScannerSnapshot | None = None
+        self._scanner_stop = threading.Event()
+        self._scanner_thread: threading.Thread | None = None
+
+    def start(self, *, background: bool = False) -> None:
+        """Hydrate the read view and optionally refresh it in the background."""
+        self._ensure_scanner(_as_utc(self._clock(), "now"))
+        if not background:
+            return
+        with self._scanner_lock:
+            if self._scanner_thread is not None:
+                return
+            self._scanner_stop.clear()
+            self._scanner_thread = threading.Thread(
+                target=self._scanner_loop,
+                name="radar-dashboard-scanner",
+                daemon=True,
+            )
+            self._scanner_thread.start()
+
+    def close(self) -> None:
+        """Stop the optional refresh thread without touching persisted sources."""
+        self._scanner_stop.set()
+        thread = self._scanner_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        with self._scanner_lock:
+            self._scanner_thread = None
+
+    def _scanner_loop(self) -> None:
+        while not self._scanner_stop.wait(SCANNER_REFRESH_SECONDS):
+            try:
+                self._refresh_scanner(_as_utc(self._clock(), "now"))
+            except Exception:  # noqa: BLE001
+                # The refresh method records source errors; a background read
+                # failure must not terminate the dashboard process.
+                continue
+
+    def _ensure_scanner(self, now: datetime) -> None:
+        with self._scanner_lock:
+            initial = self._scanner_snapshot is None
+        self._refresh_scanner(now, force=initial)
+
+    def _scanner_snapshot_or_raise(self) -> _ScannerSnapshot:
+        with self._scanner_lock:
+            snapshot = self._scanner_snapshot
+        if snapshot is None:
+            raise RuntimeError("dashboard scanner is not hydrated")
+        return snapshot
+
+    def _refresh_scanner(self, now: datetime, *, force: bool = False) -> None:
+        current_time = _as_utc(now, "now")
+        with self._scanner_refresh_lock:
+            files = self._partition_files(
+                current_time - timedelta(seconds=ROLLING_WINDOW_SECONDS), current_time
+            )
+            with self._scanner_lock:
+                model = self._scanner_model
+                known_files = set(model.known_files) if model is not None else set()
+                last_data_as_of = model.data_as_of if model is not None else None
+            if model is not None and not force and not (set(files) - known_files):
+                return
+
+            if model is None:
+                model = _ScannerModel(
+                    known_files=set(),
+                    latest_rows={},
+                    pair_states={},
+                )
+                query_start = current_time - timedelta(
+                    seconds=ROLLING_WINDOW_SECONDS
+                    + self.config.monitors.spread.stale_after_seconds
+                )
+            else:
+                query_start = current_time - timedelta(
+                    seconds=ROLLING_WINDOW_SECONDS
+                    + self.config.monitors.spread.stale_after_seconds
+                )
+                if last_data_as_of is not None:
+                    query_start = max(
+                        query_start,
+                        last_data_as_of - timedelta(seconds=SCANNER_OVERLAP_SECONDS),
+                    )
+
+            sample_rows: list[_MarketRow] = []
+            sample_time: datetime | None = None
+
+            def consume(row: _MarketRow) -> None:
+                nonlocal sample_rows, sample_time
+                if sample_time is not None and row.sample_time != sample_time:
+                    self._apply_scanner_sample(model, sample_rows, current_time)
+                    sample_rows = []
+                sample_time = row.sample_time
+                sample_rows.append(row)
+                identity = (row.venue, row.venue_symbol, row.canonical_symbol)
+                previous = model.latest_rows.get(identity)
+                if previous is None or (row.sample_time, row.observed_at) > (
+                    previous.sample_time,
+                    previous.observed_at,
+                ):
+                    model.latest_rows[identity] = row
+
+            errors, data_as_of = self._read_market_rows_stream(
+                query_start,
+                current_time,
+                files=files,
+                on_row=consume,
+            )
+            if sample_rows:
+                self._apply_scanner_sample(model, sample_rows, current_time)
+            if data_as_of is not None:
+                model.data_as_of = max(model.data_as_of or data_as_of, data_as_of)
+            if errors:
+                model.errors = tuple(errors)
+            else:
+                model.errors = ()
+                model.known_files = set(files)
+            with self._scanner_lock:
+                self._scanner_model = model
+                self._scanner_snapshot = self._build_scanner_snapshot(model, files)
+
+    def _apply_scanner_sample(
+        self,
+        model: _ScannerModel,
+        rows: list[_MarketRow],
+        now: datetime,
+    ) -> None:
+        for observation in self._build_pair_observations(rows, now):
+            state = model.pair_states.setdefault(
+                observation.key,
+                _PairScannerState(points=deque()),
+            )
+            state.upsert_point(
+                int(observation.sample_time.timestamp()),
+                observation.raw_spread_bps,
+                valid_for_history=observation.valid_for_history,
+            )
+            previous = state.latest
+            if previous is None or (
+                observation.sample_time,
+                observation.observed_at,
+            ) >= (previous.sample_time, previous.observed_at):
+                state.latest = observation
+
+    def _build_scanner_snapshot(
+        self,
+        model: _ScannerModel,
+        files: tuple[Path, ...],
+    ) -> _ScannerSnapshot:
+        current: dict[SpreadPairKey, _PairObservation] = {}
+        basis_by_key: dict[SpreadPairKey, dict[str, object]] = {}
+        if not model.errors:
+            for key, state in model.pair_states.items():
+                if state.latest is None:
+                    continue
+                current[key] = state.latest
+                stats = state.stats_before(int(state.latest.sample_time.timestamp()))
+                basis_by_key[key] = self._basis_stats_payload(stats)
+        return _ScannerSnapshot(
+            files=files,
+            latest_file_mtime=self._latest_file_mtime(files),
+            latest_rows=MappingProxyType(dict(model.latest_rows if not model.errors else {})),
+            pair_states=MappingProxyType(dict(model.pair_states)),
+            current_observations=MappingProxyType(current),
+            basis_by_key=MappingProxyType(basis_by_key),
+            data_as_of=model.data_as_of,
+            errors=model.errors,
+        )
 
     def get_status(self, *, now: datetime | None = None) -> dict[str, object]:
         current_time = _as_utc(self._clock() if now is None else now, "now")
+        self._ensure_scanner(current_time)
         return self._cached(
             ("status",),
             current_time,
@@ -201,6 +486,7 @@ class DashboardQueryService:
     ) -> dict[str, object]:
         self._validate_filters(filters)
         current_time = _as_utc(self._clock() if now is None else now, "now")
+        self._ensure_scanner(current_time)
         key = (
             "opportunities",
             filters.symbol,
@@ -300,25 +586,16 @@ class DashboardQueryService:
             raise ValueError(f"limit must be between 1 and {MAX_OPPORTUNITY_LIMIT}")
 
     def _compute_status(self, now: datetime) -> dict[str, object]:
-        rows, market_errors, data_as_of = self._read_market_rows(
-            now - timedelta(seconds=ROLLING_WINDOW_SECONDS), now
-        )
+        snapshot = self._scanner_snapshot_or_raise()
+        market_errors = list(snapshot.errors)
+        data_as_of = snapshot.data_as_of
         runtime = self._read_runtime(now)
         errors = [*market_errors, *runtime.errors]
         expected = self._expected_feeds()
-        latest_by_identity: dict[tuple[str, str, str], _MarketRow] = {}
-        for row in rows:
-            identity = (row.venue, row.venue_symbol, row.canonical_symbol)
-            previous = latest_by_identity.get(identity)
-            if previous is None or (row.sample_time, row.observed_at) > (
-                previous.sample_time,
-                previous.observed_at,
-            ):
-                latest_by_identity[identity] = row
 
         feeds: list[dict[str, object]] = []
         for venue, venue_symbol, canonical_symbol in expected:
-            row = latest_by_identity.get((venue, venue_symbol, canonical_symbol))
+            row = snapshot.latest_rows.get((venue, venue_symbol, canonical_symbol))
             feed = self._feed_payload(row, now)
             feed.update(
                 {
@@ -342,9 +619,7 @@ class DashboardQueryService:
         else:
             overall_status = "healthy"
 
-        files = self._partition_files(
-            now - timedelta(seconds=ROLLING_WINDOW_SECONDS), now
-        )
+        files = snapshot.files
         parquet_status = "healthy" if files and not market_errors else "unavailable"
         if files and market_errors:
             parquet_status = "degraded"
@@ -392,32 +667,24 @@ class DashboardQueryService:
         filters: OpportunitiesFilters,
         now: datetime,
     ) -> dict[str, object]:
-        query_start = now - timedelta(seconds=ROLLING_WINDOW_SECONDS)
-        rows, market_errors, data_as_of = self._read_market_rows(query_start, now)
+        snapshot = self._scanner_snapshot_or_raise()
+        market_errors = list(snapshot.errors)
+        data_as_of = snapshot.data_as_of
         runtime = self._read_runtime(now)
-        observations = self._build_pair_observations(rows, now)
-        current_by_key = self._current_observations(observations, rows, now)
-        # Basis windows belong to the matched sample, which can precede the
-        # request time. Read only the small missing prefix of those windows.
-        if current_by_key:
-            prior_start = min(
-                observation.sample_time - timedelta(seconds=ROLLING_WINDOW_SECONDS)
-                for observation in current_by_key.values()
-            )
-            if prior_start < query_start:
-                prior_rows, prior_errors, _ = self._read_market_rows(
-                    prior_start, query_start - timedelta(microseconds=1)
-                )
-                market_errors.extend(prior_errors)
-                observations = self._build_pair_observations([*prior_rows, *rows], now)
+        current_by_key = {
+            key: observation
+            for key, observation in snapshot.current_observations.items()
+            if self._is_current_observation(observation, now)
+        }
         output_rows: list[dict[str, object]] = []
         basis_unavailable = False
         for key, observation in current_by_key.items():
             row = self._opportunity_payload(
                 observation,
-                observations,
+                (),
                 runtime.episodes_by_key,
                 now,
+                basis=snapshot.basis_by_key.get(key, self._unavailable_basis()),
             )
             if not self._matches_filters(row, filters):
                 continue
@@ -543,21 +810,11 @@ class DashboardQueryService:
             "errors": errors,
         }
 
-    def _read_market_rows(
+    def _market_query(
         self,
-        start: datetime,
-        end: datetime,
-        *,
-        identities: Iterable[tuple[str, str, str]] | None = None,
-    ) -> tuple[list[_MarketRow], list[str], datetime | None]:
-        start = _as_utc(start, "start")
-        end = _as_utc(end, "end")
-        if start > end:
-            raise ValueError("start must not be after end")
-        files = self._partition_files(start, end)
-        if not files:
-            return [], [], None
-        expected = tuple(self._expected_feeds() if identities is None else identities)
+        files: tuple[Path, ...],
+        expected: tuple[tuple[str, str, str], ...],
+    ) -> tuple[str, list[object]]:
         predicates = " OR ".join(
             "(venue = ? AND venue_symbol = ? AND canonical_symbol = ?)"
             for _ in expected
@@ -603,6 +860,94 @@ class DashboardQueryService:
             WHERE row_number = 1
             ORDER BY sample_time, venue, venue_symbol
         """
+        return query, [value for item in expected for value in item]
+
+    @staticmethod
+    def _market_row_from_values(values: tuple[object, ...]) -> tuple[_MarketRow | None, str | None]:
+        sample_time = _parse_timestamp(values[0])
+        observed_at = _parse_timestamp(values[1])
+        venue = _text(values[2])
+        venue_symbol = _text(values[3])
+        canonical_symbol = _text(values[4])
+        if (
+            sample_time is None
+            or observed_at is None
+            or venue is None
+            or venue_symbol is None
+            or canonical_symbol is None
+        ):
+            return None, "invalid market row ignored"
+        return (
+            _MarketRow(
+                sample_time=sample_time,
+                observed_at=observed_at,
+                venue=venue,
+                venue_symbol=venue_symbol,
+                canonical_symbol=canonical_symbol,
+                buy_1k_vwap=_finite_float(values[5]),
+                sell_1k_vwap=_finite_float(values[6]),
+                buy_5k_vwap=_finite_float(values[7]),
+                sell_5k_vwap=_finite_float(values[8]),
+                buy_10k_vwap=_finite_float(values[9]),
+                sell_10k_vwap=_finite_float(values[10]),
+            ),
+            None,
+        )
+
+    def _read_market_rows_stream(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        files: tuple[Path, ...],
+        on_row: Callable[[_MarketRow], None],
+        identities: Iterable[tuple[str, str, str]] | None = None,
+    ) -> tuple[list[str], datetime | None]:
+        start = _as_utc(start, "start")
+        end = _as_utc(end, "end")
+        if start > end:
+            raise ValueError("start must not be after end")
+        if not files:
+            return [], None
+        expected = tuple(self._expected_feeds() if identities is None else identities)
+        query, identity_params = self._market_query(files, expected)
+        errors: list[str] = []
+        data_as_of: datetime | None = None
+        try:
+            with duckdb.connect() as connection:
+                result = connection.execute(query, [start, end, *identity_params])
+                while batch := result.fetchmany(SCANNER_BATCH_ROWS):
+                    for values in batch:
+                        row, error = self._market_row_from_values(values)
+                        if error is not None:
+                            errors.append(error)
+                        if row is None:
+                            continue
+                        data_as_of = max(data_as_of or row.sample_time, row.sample_time)
+                        on_row(row)
+        except Exception as error:  # noqa: BLE001
+            errors.append(f"market data read failed: {type(error).__name__}: {error}")
+        return errors, data_as_of
+
+    def _read_market_rows(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        identities: Iterable[tuple[str, str, str]] | None = None,
+    ) -> tuple[list[_MarketRow], list[str], datetime | None]:
+        start = _as_utc(start, "start")
+        end = _as_utc(end, "end")
+        if start > end:
+            raise ValueError("start must not be after end")
+        files = self._partition_files(start, end)
+        if not files:
+            return [], [], None
+        expected = tuple(self._expected_feeds() if identities is None else identities)
+        path_list = ", ".join(
+            "'" + str(path).replace("'", "''") + "'" for path in files
+        )
+        query, identity_params = self._market_query(files, expected)
         try:
             with duckdb.connect() as connection:
                 data_as_of = connection.execute(
@@ -611,7 +956,7 @@ class DashboardQueryService:
                     [start, end],
                 ).fetchone()[0]
                 result = connection.execute(
-                    query, [start, end, *(value for item in expected for value in item)]
+                    query, [start, end, *identity_params]
                 ).fetchall()
         except Exception as error:  # noqa: BLE001
             return [], [f"market data read failed: {type(error).__name__}: {error}"], None
@@ -619,35 +964,11 @@ class DashboardQueryService:
         rows: list[_MarketRow] = []
         errors: list[str] = []
         for values in result:
-            sample_time = _parse_timestamp(values[0])
-            observed_at = _parse_timestamp(values[1])
-            venue = _text(values[2])
-            venue_symbol = _text(values[3])
-            canonical_symbol = _text(values[4])
-            if (
-                sample_time is None
-                or observed_at is None
-                or venue is None
-                or venue_symbol is None
-                or canonical_symbol is None
-            ):
-                errors.append("invalid market row ignored")
-                continue
-            rows.append(
-                _MarketRow(
-                    sample_time=sample_time,
-                    observed_at=observed_at,
-                    venue=venue,
-                    venue_symbol=venue_symbol,
-                    canonical_symbol=canonical_symbol,
-                    buy_1k_vwap=_finite_float(values[5]),
-                    sell_1k_vwap=_finite_float(values[6]),
-                    buy_5k_vwap=_finite_float(values[7]),
-                    sell_5k_vwap=_finite_float(values[8]),
-                    buy_10k_vwap=_finite_float(values[9]),
-                    sell_10k_vwap=_finite_float(values[10]),
-                )
-            )
+            row, row_error = self._market_row_from_values(values)
+            if row_error is not None:
+                errors.append(row_error)
+            if row is not None:
+                rows.append(row)
         return rows, errors, _parse_timestamp(data_as_of)
 
     def _partition_files(self, start: datetime, end: datetime) -> tuple[Path, ...]:
@@ -929,6 +1250,19 @@ class DashboardQueryService:
             and 0 <= age_seconds <= self.config.monitors.spread.stale_after_seconds
         )
 
+    def _is_current_observation(
+        self,
+        observation: _PairObservation,
+        now: datetime,
+    ) -> bool:
+        age_seconds = (now - observation.observed_at).total_seconds()
+        return (
+            observation.sample_time <= now
+            and 0 <= age_seconds <= self.config.monitors.spread.stale_after_seconds
+            and age_seconds + observation.observed_at_skew_seconds
+            <= self.config.monitors.spread.stale_after_seconds
+        )
+
     def _fee_for(self, venue: str) -> float | None:
         for configured_venue, value in self.config.fees_bps.items():
             if not isinstance(configured_venue, str) or configured_venue.lower() != venue.lower():
@@ -945,8 +1279,14 @@ class DashboardQueryService:
         all_observations: Iterable[_PairObservation],
         episodes_by_key: Mapping[tuple[str, str, str, str, str], dict[str, object]],
         now: datetime,
+        *,
+        basis: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        basis = self._basis_payload_for(all_observations, observation)
+        basis = (
+            self._basis_payload_for(all_observations, observation)
+            if basis is None
+            else basis
+        )
         lifecycle = self._lifecycle_for(observation.key, episodes_by_key, now)
         deviation = (
             observation.raw_spread_bps - float(basis["mean_bps"])

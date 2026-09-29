@@ -73,6 +73,12 @@ class DashboardStatusService:
             short_venue_symbol=short_venue_symbol, range_name=range_name, now=now,
         )
 
+    def start(self, *, background: bool = False) -> None:
+        self._query_service.start(background=background)
+
+    def close(self) -> None:
+        self._query_service.close()
+
 
 def parse_pair_query(query: str) -> dict[str, str]:
     """Preserve complete exact identity; scanner links default to 24h."""
@@ -555,13 +561,17 @@ def main(argv: list[str] | None = None) -> int:
     service = DashboardStatusService(
         config, data_root=args.data_root, runtime_db=args.runtime_db,
     )
-    server = create_dashboard_server(service, host=args.host, port=args.port)
+    server: ThreadingHTTPServer | None = None
     try:
+        service.start(background=True)
+        server = create_dashboard_server(service, host=args.host, port=args.port)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
+        if server is not None:
+            server.server_close()
+        service.close()
     return 0
 
 
