@@ -216,17 +216,31 @@ class _PairScannerState:
             self.total -= point.raw_spread_bps
             self.total_squares -= point.raw_spread_bps * point.raw_spread_bps
 
-    def stats_before(self, sample_epoch: int) -> RollingBasisStats:
+    def stats_before(self, sample_epoch: int, *, prune: bool = True) -> RollingBasisStats:
         cutoff_epoch = sample_epoch - ROLLING_WINDOW_SECONDS
-        self.prune(cutoff_epoch)
+        if prune:
+            self.prune(cutoff_epoch)
+            points = tuple(self.points)
+            total = self.total
+            total_squares = self.total_squares
+        else:
+            # Snapshot construction must not mutate a state still referenced
+            # by a concurrently readable immutable snapshot.
+            points = tuple(
+                point for point in self.points if point.sample_epoch >= cutoff_epoch
+            )
+            total = math.fsum(point.raw_spread_bps for point in points)
+            total_squares = math.fsum(
+                point.raw_spread_bps * point.raw_spread_bps for point in points
+            )
         excluded = (
-            self.points[-1]
-            if self.points and self.points[-1].sample_epoch == sample_epoch
+            points[-1]
+            if points and points[-1].sample_epoch == sample_epoch
             else None
         )
-        sample_count = len(self.points) - (1 if excluded is not None else 0)
-        total = self.total - (excluded.raw_spread_bps if excluded is not None else 0.0)
-        total_squares = self.total_squares - (
+        sample_count = len(points) - (1 if excluded is not None else 0)
+        total -= excluded.raw_spread_bps if excluded is not None else 0.0
+        total_squares -= (
             excluded.raw_spread_bps * excluded.raw_spread_bps
             if excluded is not None
             else 0.0
@@ -238,7 +252,7 @@ class _PairScannerState:
             variance = max(0.0, total_squares / sample_count - mean * mean)
             std = math.sqrt(variance)
         oldest = next(
-            (point.sample_epoch for point in self.points if point.sample_epoch < sample_epoch),
+            (point.sample_epoch for point in points if point.sample_epoch < sample_epoch),
             None,
         )
         coverage = sample_count / (
@@ -392,11 +406,17 @@ class DashboardQueryService:
 
             sample_rows: list[_MarketRow] = []
             sample_time: datetime | None = None
+            mutable_state_keys: set[SpreadPairKey] = set()
 
             def consume(row: _MarketRow) -> None:
                 nonlocal sample_rows, sample_time
                 if sample_time is not None and row.sample_time != sample_time:
-                    self._consider_scanner_sample(model, sample_rows, current_time)
+                    self._consider_scanner_sample(
+                        model,
+                        sample_rows,
+                        current_time,
+                        mutable_state_keys,
+                    )
                     sample_rows = []
                 sample_time = row.sample_time
                 sample_rows.append(row)
@@ -415,7 +435,12 @@ class DashboardQueryService:
                 on_row=consume,
             )
             if sample_rows:
-                self._consider_scanner_sample(model, sample_rows, current_time)
+                self._consider_scanner_sample(
+                    model,
+                    sample_rows,
+                    current_time,
+                    mutable_state_keys,
+                )
             if data_as_of is not None:
                 model.data_as_of = max(model.data_as_of or data_as_of, data_as_of)
             if errors:
@@ -432,6 +457,7 @@ class DashboardQueryService:
         model: _ScannerModel,
         rows: list[_MarketRow],
         now: datetime,
+        mutable_state_keys: set[SpreadPairKey],
     ) -> None:
         if not rows:
             return
@@ -443,7 +469,7 @@ class DashboardQueryService:
             return
         if not self._has_publishable_feed_coverage(rows):
             return
-        self._apply_scanner_sample(model, rows, now)
+        self._apply_scanner_sample(model, rows, now, mutable_state_keys)
         if (
             model.scanner_data_as_of is None
             or sample_time > model.scanner_data_as_of
@@ -467,12 +493,20 @@ class DashboardQueryService:
         model: _ScannerModel,
         rows: list[_MarketRow],
         now: datetime,
+        mutable_state_keys: set[SpreadPairKey],
     ) -> None:
         for observation in self._build_pair_observations(rows, now):
-            state = model.pair_states.setdefault(
-                observation.key,
-                _PairScannerState(points=deque()),
-            )
+            if observation.key not in mutable_state_keys:
+                previous = model.pair_states.get(observation.key)
+                state = (
+                    copy.deepcopy(previous)
+                    if previous is not None
+                    else _PairScannerState(points=deque())
+                )
+                model.pair_states[observation.key] = state
+                mutable_state_keys.add(observation.key)
+            else:
+                state = model.pair_states[observation.key]
             state.upsert_point(
                 int(observation.sample_time.timestamp()),
                 observation.raw_spread_bps,
@@ -484,6 +518,9 @@ class DashboardQueryService:
                 observation.observed_at,
             ) >= (previous.sample_time, previous.observed_at):
                 state.latest = observation
+            state.prune(
+                int(observation.sample_time.timestamp()) - ROLLING_WINDOW_SECONDS
+            )
 
     def _build_scanner_snapshot(
         self,
@@ -492,13 +529,7 @@ class DashboardQueryService:
     ) -> _ScannerSnapshot:
         current: dict[SpreadPairKey, _PairObservation] = {}
         basis_by_key: dict[SpreadPairKey, dict[str, object]] = {}
-        for state in model.pair_states.values():
-            if state.latest is not None:
-                state.prune(
-                    int(state.latest.sample_time.timestamp())
-                    - ROLLING_WINDOW_SECONDS
-                )
-        pair_states = copy.deepcopy(model.pair_states)
+        pair_states = dict(model.pair_states)
         if not model.errors:
             for key, state in pair_states.items():
                 if (
@@ -508,7 +539,10 @@ class DashboardQueryService:
                 ):
                     continue
                 current[key] = state.latest
-                stats = state.stats_before(int(state.latest.sample_time.timestamp()))
+                stats = state.stats_before(
+                    int(state.latest.sample_time.timestamp()),
+                    prune=False,
+                )
                 basis_by_key[key] = self._basis_stats_payload(stats)
         return _ScannerSnapshot(
             files=files,
