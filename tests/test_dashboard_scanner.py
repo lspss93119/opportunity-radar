@@ -8,8 +8,11 @@ import pytest
 from radar.dashboard_data import DashboardQueryService, OpportunitiesFilters
 from test_dashboard_data import (
     LONG_VENUE,
+    MarketConfig,
     NOW,
     SHORT_VENUE,
+    make_config,
+    make_market,
     pair_config,
     pair_markets,
     write_markets,
@@ -44,6 +47,33 @@ def make_service(tmp_path, *, clock=lambda: NOW):
         clock=clock,
         cache_ttl_seconds=0,
     )
+
+
+def make_multi_feed_config(*venues: str):
+    return make_config(
+        *[
+            MarketConfig(venue=venue, venue_symbol="BTC", canonical_symbol="BTC")
+            for venue in venues
+        ],
+        fees_bps={venue: 1.0 for venue in venues},
+    )
+
+
+def multi_feed_markets(
+    venues: tuple[str, ...],
+    *,
+    sample_time,
+    observed_at=None,
+) -> list:
+    return [
+        make_market(
+            sample_time=sample_time,
+            observed_at=observed_at or sample_time,
+            venue=venue,
+            venue_symbol="BTC",
+        )
+        for venue in venues
+    ]
 
 
 def test_scanner_hydration_keeps_compact_prior_only_pair_state(tmp_path):
@@ -86,6 +116,121 @@ def test_scanner_incremental_refresh_updates_current_snapshot(tmp_path):
 
     assert scanner_row(first)["current_raw_spread_bps"] == pytest.approx(100.0)
     assert scanner_row(second)["current_raw_spread_bps"] == pytest.approx(300.0)
+
+
+def test_scanner_keeps_published_sample_until_new_sample_has_enough_feeds(tmp_path):
+    venues = ("lighter", "hyperliquid", "backpack", "arcus")
+    previous_sample = NOW - timedelta(seconds=10)
+    next_sample = NOW
+    write_markets(
+        tmp_path / "data",
+        multi_feed_markets(venues, sample_time=previous_sample),
+    )
+    service = DashboardQueryService(
+        make_multi_feed_config(*venues),
+        data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3",
+        clock=lambda: NOW,
+        cache_ttl_seconds=0,
+    )
+    initial = service.get_opportunities(OpportunitiesFilters())
+    assert initial["scanner_data_as_of"] == previous_sample.isoformat()
+
+    # Two of four feeds are visible first.  This is enough to build a pair,
+    # but not enough to replace the previous complete scanner sample.
+    write_markets(
+        tmp_path / "data",
+        multi_feed_markets(venues[:2], sample_time=next_sample),
+    )
+    partial = service.get_opportunities(OpportunitiesFilters())
+    assert partial["data_as_of"] == next_sample.isoformat()
+    assert partial["latest_dataset_sample_time"] == next_sample.isoformat()
+    assert partial["scanner_data_as_of"] == previous_sample.isoformat()
+    assert {
+        observation.sample_time
+        for observation in service._scanner_snapshot.current_observations.values()
+    } == {previous_sample}
+    status = service.get_status()
+    assert status["data_as_of"] == next_sample.isoformat()
+    assert status["scanner_data_as_of"] == previous_sample.isoformat()
+
+    # The remaining rows arrive in a later Parquet file.  The scanner now
+    # advances atomically and every current pair belongs to the same slot.
+    write_markets(
+        tmp_path / "data",
+        multi_feed_markets(venues[2:], sample_time=next_sample),
+    )
+    complete = service.get_opportunities(OpportunitiesFilters())
+    assert complete["scanner_data_as_of"] == next_sample.isoformat()
+    assert {
+        observation.sample_time
+        for observation in service._scanner_snapshot.current_observations.values()
+    } == {next_sample}
+    assert len(service._scanner_snapshot.current_observations) == len(venues) * (
+        len(venues) - 1
+    )
+
+
+def test_scanner_accepts_legitimate_one_feed_gap(tmp_path):
+    venues = ("lighter", "hyperliquid", "backpack")
+    sample = NOW - timedelta(seconds=10)
+    write_markets(
+        tmp_path / "data",
+        multi_feed_markets(venues[:2], sample_time=sample),
+    )
+    service = DashboardQueryService(
+        make_multi_feed_config(*venues),
+        data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3",
+        clock=lambda: NOW,
+        cache_ttl_seconds=0,
+    )
+
+    result = service.get_opportunities(OpportunitiesFilters())
+
+    assert result["scanner_data_as_of"] == sample.isoformat()
+    assert len(service._scanner_snapshot.current_observations) == 2
+    assert all(
+        key.long_venue != "backpack" and key.short_venue != "backpack"
+        for key in service._scanner_snapshot.current_observations
+    )
+
+
+def test_scanner_opportunities_report_observation_freshness(tmp_path):
+    observed_at = NOW - timedelta(seconds=2)
+    write_markets(
+        tmp_path / "data",
+        pair_markets(sample_time=NOW, observed_at=observed_at),
+    )
+
+    result = make_service(tmp_path).get_opportunities(OpportunitiesFilters())
+
+    assert scanner_row(result)["freshness_seconds"] == pytest.approx(2.0)
+
+
+def test_scanner_snapshot_is_not_mutated_by_later_refresh(tmp_path):
+    previous_sample = NOW - timedelta(seconds=10)
+    next_sample = NOW
+    write_markets(
+        tmp_path / "data",
+        pair_markets(sample_time=previous_sample),
+    )
+    service = make_service(tmp_path)
+    service.get_opportunities(OpportunitiesFilters())
+    previous_snapshot = service._scanner_snapshot
+
+    write_markets(tmp_path / "data", pair_markets(sample_time=next_sample))
+    service.get_opportunities(OpportunitiesFilters())
+
+    assert previous_snapshot is not None
+    assert {
+        observation.sample_time
+        for observation in previous_snapshot.current_observations.values()
+    } == {previous_sample}
+    assert {
+        observation.sample_time
+        for observation in service._scanner_snapshot.current_observations.values()
+    } == {next_sample}
 
 
 def test_scanner_duplicate_sample_replaces_without_double_counting(tmp_path):

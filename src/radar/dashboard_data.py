@@ -7,7 +7,7 @@ import sqlite3
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -35,6 +35,10 @@ MAX_OPPORTUNITY_LIMIT = 200
 MAX_DISPLAY_POINTS = 500
 SCANNER_REFRESH_SECONDS = 10.0
 SCANNER_OVERLAP_SECONDS = EXPECTED_INTERVAL_SECONDS * 2
+# A newly visible Parquet file can contain a partial sample while the Radar
+# writer is handing rows to storage.  One missing configured feed is a
+# legitimate production sample; a larger gap is held back as unsettled.
+SCANNER_MAX_MISSING_FEEDS = 1
 SCANNER_BATCH_ROWS = 8_192
 PAIR_RANGES = ("1h", "6h", "24h", "3d", "7d", "all")
 PairRange = Literal["1h", "6h", "24h", "3d", "7d", "all"]
@@ -257,6 +261,7 @@ class _ScannerModel:
     latest_rows: dict[tuple[str, str, str], _MarketRow]
     pair_states: dict[SpreadPairKey, _PairScannerState]
     data_as_of: datetime | None = None
+    scanner_data_as_of: datetime | None = None
     errors: tuple[str, ...] = ()
 
 
@@ -269,6 +274,7 @@ class _ScannerSnapshot:
     current_observations: Mapping[SpreadPairKey, _PairObservation]
     basis_by_key: Mapping[SpreadPairKey, dict[str, object]]
     data_as_of: datetime | None
+    scanner_data_as_of: datetime | None
     errors: tuple[str, ...]
 
 
@@ -390,7 +396,7 @@ class DashboardQueryService:
             def consume(row: _MarketRow) -> None:
                 nonlocal sample_rows, sample_time
                 if sample_time is not None and row.sample_time != sample_time:
-                    self._apply_scanner_sample(model, sample_rows, current_time)
+                    self._consider_scanner_sample(model, sample_rows, current_time)
                     sample_rows = []
                 sample_time = row.sample_time
                 sample_rows.append(row)
@@ -409,7 +415,7 @@ class DashboardQueryService:
                 on_row=consume,
             )
             if sample_rows:
-                self._apply_scanner_sample(model, sample_rows, current_time)
+                self._consider_scanner_sample(model, sample_rows, current_time)
             if data_as_of is not None:
                 model.data_as_of = max(model.data_as_of or data_as_of, data_as_of)
             if errors:
@@ -420,6 +426,41 @@ class DashboardQueryService:
             with self._scanner_lock:
                 self._scanner_model = model
                 self._scanner_snapshot = self._build_scanner_snapshot(model, files)
+
+    def _consider_scanner_sample(
+        self,
+        model: _ScannerModel,
+        rows: list[_MarketRow],
+        now: datetime,
+    ) -> None:
+        if not rows:
+            return
+        sample_time = rows[0].sample_time
+        if (
+            model.scanner_data_as_of is not None
+            and sample_time < model.scanner_data_as_of
+        ):
+            return
+        if not self._has_publishable_feed_coverage(rows):
+            return
+        self._apply_scanner_sample(model, rows, now)
+        if (
+            model.scanner_data_as_of is None
+            or sample_time > model.scanner_data_as_of
+        ):
+            model.scanner_data_as_of = sample_time
+
+    def _has_publishable_feed_coverage(self, rows: Iterable[_MarketRow]) -> bool:
+        identities = {
+            (row.venue, row.venue_symbol, row.canonical_symbol) for row in rows
+        }
+        symbols = {row.canonical_symbol for row in rows}
+        expected_count = sum(
+            canonical_symbol in symbols
+            for _, _, canonical_symbol in self._expected_feeds()
+        )
+        minimum_count = max(1, expected_count - SCANNER_MAX_MISSING_FEEDS)
+        return len(identities) >= minimum_count
 
     def _apply_scanner_sample(
         self,
@@ -451,9 +492,20 @@ class DashboardQueryService:
     ) -> _ScannerSnapshot:
         current: dict[SpreadPairKey, _PairObservation] = {}
         basis_by_key: dict[SpreadPairKey, dict[str, object]] = {}
+        for state in model.pair_states.values():
+            if state.latest is not None:
+                state.prune(
+                    int(state.latest.sample_time.timestamp())
+                    - ROLLING_WINDOW_SECONDS
+                )
+        pair_states = copy.deepcopy(model.pair_states)
         if not model.errors:
-            for key, state in model.pair_states.items():
-                if state.latest is None:
+            for key, state in pair_states.items():
+                if (
+                    state.latest is None
+                    or model.scanner_data_as_of is None
+                    or state.latest.sample_time != model.scanner_data_as_of
+                ):
                     continue
                 current[key] = state.latest
                 stats = state.stats_before(int(state.latest.sample_time.timestamp()))
@@ -462,10 +514,11 @@ class DashboardQueryService:
             files=files,
             latest_file_mtime=self._latest_file_mtime(files),
             latest_rows=MappingProxyType(dict(model.latest_rows if not model.errors else {})),
-            pair_states=MappingProxyType(dict(model.pair_states)),
+            pair_states=MappingProxyType(pair_states),
             current_observations=MappingProxyType(current),
             basis_by_key=MappingProxyType(basis_by_key),
             data_as_of=model.data_as_of,
+            scanner_data_as_of=model.scanner_data_as_of,
             errors=model.errors,
         )
 
@@ -589,6 +642,7 @@ class DashboardQueryService:
         snapshot = self._scanner_snapshot_or_raise()
         market_errors = list(snapshot.errors)
         data_as_of = snapshot.data_as_of
+        scanner_data_as_of = snapshot.scanner_data_as_of
         runtime = self._read_runtime(now)
         errors = [*market_errors, *runtime.errors]
         expected = self._expected_feeds()
@@ -628,8 +682,15 @@ class DashboardQueryService:
         return {
             "generated_at": now.isoformat(),
             "data_as_of": _iso(data_as_of),
+            "latest_dataset_sample_time": _iso(data_as_of),
+            "scanner_data_as_of": _iso(scanner_data_as_of),
             "sample_age_seconds": (
                 (now - data_as_of).total_seconds() if data_as_of is not None else None
+            ),
+            "scanner_sample_age_seconds": (
+                (now - scanner_data_as_of).total_seconds()
+                if scanner_data_as_of is not None
+                else None
             ),
             "heartbeat": runtime.heartbeat,
             "radar_heartbeat": runtime.heartbeat,
@@ -670,12 +731,16 @@ class DashboardQueryService:
         snapshot = self._scanner_snapshot_or_raise()
         market_errors = list(snapshot.errors)
         data_as_of = snapshot.data_as_of
+        scanner_data_as_of = snapshot.scanner_data_as_of
         runtime = self._read_runtime(now)
-        current_by_key = {
-            key: observation
-            for key, observation in snapshot.current_observations.items()
-            if self._is_current_observation(observation, now)
-        }
+        current_by_key = {}
+        for key, observation in snapshot.current_observations.items():
+            if not self._is_current_observation(observation, now):
+                continue
+            current_by_key[key] = replace(
+                observation,
+                freshness_seconds=(now - observation.observed_at).total_seconds(),
+            )
         output_rows: list[dict[str, object]] = []
         basis_unavailable = False
         for key, observation in current_by_key.items():
@@ -701,6 +766,8 @@ class DashboardQueryService:
             status = "down"
         return {
             "data_as_of": _iso(data_as_of),
+            "latest_dataset_sample_time": _iso(data_as_of),
+            "scanner_data_as_of": _iso(scanner_data_as_of),
             "generated_at": now.isoformat(),
             "status": status,
             "rows": output_rows,
