@@ -16,6 +16,8 @@ from radar.dashboard_data import (
     DashboardQueryService,
     MAX_OPPORTUNITY_LIMIT,
     OpportunitiesFilters,
+    PAIR_RANGES,
+    PairRange,
     classify_heartbeat as _classify_heartbeat,
     utc_now,
 )
@@ -59,6 +61,41 @@ class DashboardStatusService:
         self, filters: OpportunitiesFilters, *, now: datetime | None = None
     ) -> dict[str, object]:
         return self._query_service.get_opportunities(filters, now=now)
+
+    def get_pair(
+        self, *, canonical_symbol: str, long_venue: str, long_venue_symbol: str,
+        short_venue: str, short_venue_symbol: str, range_name: PairRange,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        return self._query_service.get_pair(
+            canonical_symbol=canonical_symbol, long_venue=long_venue,
+            long_venue_symbol=long_venue_symbol, short_venue=short_venue,
+            short_venue_symbol=short_venue_symbol, range_name=range_name, now=now,
+        )
+
+
+def parse_pair_query(query: str) -> dict[str, str]:
+    """Preserve complete exact identity; scanner links default to 24h."""
+    required = {"symbol", "long_venue", "long_venue_symbol", "short_venue", "short_venue_symbol"}
+    if re.search(r"%(?![0-9a-fA-F]{2})", query):
+        raise ValueError("invalid percent encoding")
+    values: dict[str, str] = {}
+    for name, value in parse_qsl(query, keep_blank_values=True, strict_parsing=True,
+                                 errors="strict", max_num_fields=12):
+        if name not in required | {"range"}:
+            raise ValueError(f"unknown pair parameter: {name}")
+        if name in values:
+            raise ValueError(f"duplicate pair parameter: {name}")
+        if not value.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise ValueError(f"{name} must be non-empty text")
+        values[name] = value
+    if missing := required - values.keys():
+        raise ValueError("missing exact pair identity: " + ", ".join(sorted(missing)))
+    range_name = values.pop("range", "24h")
+    if range_name not in PAIR_RANGES:
+        raise ValueError("range must be one of " + ", ".join(PAIR_RANGES))
+    values["canonical_symbol"] = values.pop("symbol")
+    return {**values, "range_name": range_name}
 
 
 def parse_opportunities_filters(query: str) -> OpportunitiesFilters:
@@ -154,7 +191,13 @@ td small { display: block; color: #94a3b8; margin-top: 3px; }
 .degraded { color: #fcd34d; }
 .down, .error { color: #fca5a5; }
 .error { margin: 8px 0; overflow-wrap: anywhere; font-size: .82rem; }
-[data-view="opportunities"] #status-view, [data-view="status"] #opportunities-view { display: none; }
+[data-view="opportunities"] #status-view, [data-view="opportunities"] #pair-view,
+[data-view="status"] #opportunities-view, [data-view="status"] #pair-view,
+[data-view="pair"] #opportunities-view, [data-view="pair"] #status-view { display: none; }
+select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; border: 1px solid #4b5563; border-radius: 5px; }
+#pair-chart svg { display: block; width: 100%; height: auto; }
+.chart-legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0; font-size: .8rem; }
+.raw-color { color: #93c5fd; } .mean-color { color: #fcd34d; } .current-color { color: #6ee7b7; }
 @media(max-width: 760px) { main { padding: 14px; } #filters label:not(.check) { flex: 1 1 130px; } input { width: 100%; } }
 </style>
 </head>
@@ -176,7 +219,7 @@ td small { display: block; color: #94a3b8; margin-top: 3px; }
 <label class="check"><input id="active_only" name="active_only" type="checkbox">Active only</label>
 <button type="submit">Apply filters</button><button id="reset" type="button">Reset</button>
 </form>
-<p class="muted">Deviation descending · RT Fee and Theo Edge are display-only · Duration comes from persisted SQLite episodes. Pair detail is available in Phase 3.</p>
+<p class="muted">Deviation descending · RT Fee and Theo Edge are display-only · Duration comes from persisted SQLite episodes.</p>
 <div class="table-wrap"><table aria-label="Opportunities"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>Spread</th><th>24h Mean</th><th>24h Std</th><th>Deviation</th><th>Duration</th><th>RT Fee</th><th>Theo Edge</th><th>Skew</th><th>Freshness</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="12" class="muted">Loading…</td></tr></tbody></table></div>
 </section>
 <section id="status-view">
@@ -195,6 +238,15 @@ td small { display: block; color: #94a3b8; margin-top: 3px; }
 <section class="section"><h2>Recent events</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Type</th><th>Net bps</th></tr></thead><tbody id="event-rows"></tbody></table></div></section>
 <p id="unavailable" class="muted">Unavailable from persisted sources: deployed SHA, Telegram transport health, collector error counters.</p>
 </section>
+<section id="pair-view">
+<h2 id="pair-identity">Pair Detail — exact identity unavailable</h2>
+<div id="pair-summary" class="metrics"></div>
+<label>History range<select id="pair-range" aria-label="History range"><option value="1h">1h</option><option value="6h">6h</option><option value="24h" selected>24h</option><option value="3d">3d</option><option value="7d">7d</option><option value="all">All available (90 days)</option></select></label>
+<div class="chart-legend"><span class="raw-color">Raw executable spread</span><span class="mean-color">Rolling 24h mean (prior-only)</span><span class="current-color">Current point</span></div>
+<div id="pair-chart" class="card">History unavailable</div>
+<p id="pair-coverage" class="muted"></p>
+<p class="muted">Spreads in bps · Exact sample_time joins · Missing slots stay as gaps; no interpolation. Display points preserve first/latest and significant extrema. Statistics use complete history with full 24h / 80% coverage. RT Fee and Theo Edge are display-only; duration and lifecycle come from persisted SQLite.</p>
+</section>
 </main>
 <script>
 const byId = id => document.getElementById(id);
@@ -207,7 +259,8 @@ const emptyRow = (columns, message) => '<tr><td colspan="' + columns + '" class=
 const cell = value => '<td>' + esc(value) + '</td>';
 const filterNames = ['symbol','long_venue','short_venue','max_std','min_deviation','min_duration','limit'];
 const isStatus = location.pathname === '/status';
-byId(isStatus ? 'nav-status' : 'nav-opportunities').setAttribute?.('aria-current', 'page');
+const isPair = location.pathname === '/pair';
+if (!isPair) byId(isStatus ? 'nav-status' : 'nav-opportunities').setAttribute?.('aria-current', 'page');
 function restoreFilters() {
   const query = new URLSearchParams(location.search);
   for (const name of filterNames) byId(name).value = query.get(name) ?? '';
@@ -270,13 +323,73 @@ function renderStatus(data) {
     [row.occurred_at,row.symbol,row.event_type,number(row.net_spread_bps)].map(cell).join('') + '</tr>').join('') ||
     emptyRow(4, data.sqlite?.status === 'healthy' ? 'No recent events' : 'Events unavailable');
 }
+function restorePairRange() {
+  byId('pair-range').value = new URLSearchParams(location.search).get('range') ?? '24h';
+}
+function renderPair(data) {
+  const identity = data.identity || {}, current = data.current || {}, basis = data.basis || {}, lifecycle = data.lifecycle || {};
+  text('pair-identity', (identity.canonical_symbol ?? 'Unavailable') + ' · Long ' +
+    (identity.long_venue ?? 'Unavailable') + ' / ' + (identity.long_venue_symbol ?? 'Unavailable') + ' → Short ' +
+    (identity.short_venue ?? 'Unavailable') + ' / ' + (identity.short_venue_symbol ?? 'Unavailable'));
+  const metrics = [
+    ['Raw spread (bps)',number(current.raw_spread_bps)], ['24h Mean (bps)',number(current.rolling_mean_bps)],
+    ['24h Std (bps)',number(current.rolling_std_bps)], ['Deviation (bps)',number(current.deviation_bps)],
+    ['Signal duration (persisted)',age(current.signal_duration_seconds)],
+    ['Long $10k buy VWAP',number(current.long_buy_vwap)], ['Short $10k sell VWAP',number(current.short_sell_vwap)],
+    ['RT Fee (bps, display-only)',number(current.round_trip_fee_bps)], ['Theo Edge (bps, display-only)',number(current.theoretical_edge_bps)],
+    ['Observed skew (s)',number(current.observed_at_skew_seconds)], ['Freshness (s)',number(current.freshness_seconds)],
+    ['Sample time (UTC)',current.sample_time ?? 'Unavailable'],
+    ['Lifecycle (persisted)',lifecycle.available ? 'Active · confirmed: ' + (lifecycle.candidate_confirmed ? 'yes' : 'no') + ' · alerted: ' + (lifecycle.alerted ? 'yes' : 'no') + ' · ' + (lifecycle.episode_id ?? 'Unavailable') : 'Inactive / unavailable']
+  ];
+  byId('pair-summary').innerHTML = metrics.map(([label,value]) => '<div class="card"><div class="metric-label">' + esc(label) + '</div><div class="metric-value">' + esc(value) + '</div></div>').join('');
+  text('pair-coverage', (basis.eligible ? '24h basis available' : '24h basis unavailable') + ' · prior samples: ' +
+    (basis.sample_count ?? 'Unavailable') + ' · coverage: ' + (typeof basis.coverage === 'number' ? number(basis.coverage * 100) + '%' : 'Unavailable'));
+  renderPairChart(data);
+}
+function renderPairChart(data) {
+  const finite = value => typeof value === 'number' && Number.isFinite(value);
+  const points = (data.history || []).filter(p => finite(p.raw_spread_bps) && Number.isFinite(Date.parse(p.sample_time)));
+  const means = data.rolling_mean_series || [];
+  const current = data.current;
+  if (!points.length) { text('pair-chart', 'History unavailable'); return; }
+  const values = points.map(p => p.raw_spread_bps).concat(means.filter(p => finite(p.rolling_mean_bps)).map(p => p.rolling_mean_bps));
+  if (current && finite(current.raw_spread_bps)) values.push(current.raw_spread_bps);
+  const start = Date.parse(points[0].sample_time), end = Date.parse(points.at(-1).sample_time);
+  let low = Math.min(...values), high = Math.max(...values);
+  const pad = Math.max((high - low) * .08, 1); low -= pad; high += pad;
+  const x = time => 70 + (Date.parse(time) - start) / Math.max(end - start, 1) * 840;
+  const y = value => 290 - (value - low) / (high - low) * 260;
+  function series(rows, field, name, color) {
+    let path = '', previous = null, dots = '';
+    for (const point of rows) {
+      if (!finite(point[field]) || !Number.isFinite(Date.parse(point.sample_time))) { previous = null; continue; }
+      const px = x(point.sample_time).toFixed(2), py = y(point[field]).toFixed(2);
+      path += (previous && previous.segment === point.segment ? 'L' : 'M') + px + ',' + py + ' ';
+      // Dots keep singleton segments visible without joining missing slots.
+      dots += '<circle cx="' + px + '" cy="' + py + '" r="1.5" fill="' + color + '"><title>' + esc(point.sample_time) + ' · ' + number(point[field]) + ' bps</title></circle>';
+      previous = point;
+    }
+    return path ? '<g><path data-series="' + name + '" d="' + path + '" fill="none" stroke="' + color + '" stroke-width="1.6"/>' + dots + '</g>' : '';
+  }
+  let svg = '<svg viewBox="0 0 960 350" role="img" aria-label="Executable spread and prior-only rolling 24h mean in basis points"><title>Exact sampled executable spread history</title>';
+  for (let i = 0; i <= 4; i++) {
+    const value = low + (high - low) * i / 4, py = y(value).toFixed(2);
+    svg += '<line x1="70" x2="910" y1="' + py + '" y2="' + py + '" stroke="#374151"/><text x="60" y="' + py + '" text-anchor="end" fill="#94a3b8" font-size="11">' + number(value) + '</text>';
+  }
+  svg += series(points, 'raw_spread_bps', 'raw', '#93c5fd') + series(means, 'rolling_mean_bps', 'mean', '#fcd34d');
+  if (current && finite(current.raw_spread_bps) && Date.parse(current.sample_time) >= start && Date.parse(current.sample_time) <= end) {
+    svg += '<circle data-series="current" cx="' + x(current.sample_time).toFixed(2) + '" cy="' + y(current.raw_spread_bps).toFixed(2) + '" r="5" fill="#6ee7b7"><title>Current · ' + esc(current.sample_time) + ' · ' + number(current.raw_spread_bps) + ' bps</title></circle>';
+  }
+  svg += '<text x="70" y="320" fill="#94a3b8" font-size="11">' + esc(points[0].sample_time) + '</text><text x="910" y="338" text-anchor="end" fill="#94a3b8" font-size="11">' + esc(points.at(-1).sample_time) + '</text></svg>';
+  byId('pair-chart').innerHTML = svg;
+}
 let requestSequence = 0;
 let requestInFlight = false;
 async function refresh(query = new URLSearchParams(location.search)) {
   const sequence = ++requestSequence;
   requestInFlight = true;
   try {
-    const response = await fetch(isStatus ? '/api/status' : '/api/opportunities?' + query.toString(), {cache:'no-store'});
+    const response = await fetch(isStatus ? '/api/status' : (isPair ? '/api/pair?' : '/api/opportunities?') + query.toString(), {cache:'no-store'});
     const data = await response.json();
     if (sequence !== requestSequence) return;
     const status = isStatus ? data.overall?.status : data.status;
@@ -285,7 +398,7 @@ async function refresh(query = new URLSearchParams(location.search)) {
     text('data-as-of', 'Data as of: ' + (data.data_as_of ?? 'Unavailable'));
     text('refreshed', 'Fetched ' + new Date().toLocaleTimeString() + ' · Generated ' + (data.generated_at ?? 'Unavailable'));
     byId('errors').innerHTML = (data.errors || []).map(error => '<div class="error">' + esc(error) + '</div>').join('');
-    if (isStatus) renderStatus(data); else renderOpportunities(data);
+    if (isStatus) renderStatus(data); else if (isPair) renderPair(data); else renderOpportunities(data);
   } catch (error) {
     if (sequence !== requestSequence) return;
     text('overall', 'DEGRADED — dashboard request failed');
@@ -293,12 +406,19 @@ async function refresh(query = new URLSearchParams(location.search)) {
     text('data-as-of', 'Data as of: Unavailable');
     text('refreshed', 'Request failed at ' + new Date().toLocaleTimeString());
     byId('errors').innerHTML = '<div class="error">' + esc(error) + '</div>';
-    if (isStatus) renderStatus({}); else byId('opportunity-rows').innerHTML = emptyRow(12, 'Data unavailable');
+    if (isStatus) renderStatus({}); else if (isPair) renderPair({}); else byId('opportunity-rows').innerHTML = emptyRow(12, 'Data unavailable');
   } finally {
     if (sequence === requestSequence) requestInFlight = false;
   }
 }
 restoreFilters();
+restorePairRange();
+byId('pair-range').addEventListener('change', () => {
+  const query = new URLSearchParams(location.search);
+  query.set('range', byId('pair-range').value);
+  history.replaceState(null, '', location.pathname + '?' + query.toString());
+  refresh(query);
+});
 byId('filters').addEventListener('submit', event => {
   event.preventDefault();
   const query = filterQuery();
@@ -311,7 +431,7 @@ byId('reset').addEventListener('click', () => {
   history.replaceState(null, '', location.pathname);
   refresh(new URLSearchParams());
 });
-window.addEventListener('popstate', () => { restoreFilters(); refresh(); });
+window.addEventListener('popstate', () => { restoreFilters(); restorePairRange(); refresh(); });
 refresh();
 setInterval(() => { if (!requestInFlight) refresh(); }, 10000);
 </script>
@@ -326,9 +446,38 @@ def _handler_for(
         def do_GET(self) -> None:  # noqa: N802
             request = urlparse(self.path)
             path = request.path
-            if path in ("/", "/opportunities", "/status"):
-                view = "status" if path == "/status" else "opportunities"
+            if path in ("/", "/opportunities", "/status", "/pair"):
+                view = "pair" if path == "/pair" else "status" if path == "/status" else "opportunities"
                 self._send(200, "text/html; charset=utf-8", HTML.replace("__VIEW__", view).encode("utf-8"))
+                return
+            if path == "/api/pair":
+                empty = {"status": "degraded", "data_as_of": None, "current": None,
+                         "basis": None, "lifecycle": None, "history": [], "rolling_mean_series": []}
+                try:
+                    pair = parse_pair_query(request.query)
+                except ValueError as error:
+                    self._json(400, {**empty, "errors": [str(error)]})
+                    return
+                symbol = pair["canonical_symbol"]
+                feeds = {(m.venue, m.venue_symbol, m.canonical_symbol)
+                         for m in service.config.markets if m.enabled}
+                if (pair["long_venue"].lower() == pair["short_venue"].lower()
+                    or (pair["long_venue"], pair["long_venue_symbol"], symbol) not in feeds
+                    or (pair["short_venue"], pair["short_venue_symbol"], symbol) not in feeds):
+                    self._json(404, {**empty, "errors": ["pair identity is not an enabled configured mapping"]})
+                    return
+                try:
+                    payload = service.get_pair(**pair)
+                    if payload.get("errors") and payload.get("status") == "down":
+                        payload = {**payload, "status": "degraded"}
+                    body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                except Exception as error:  # noqa: BLE001
+                    self._json(200, {**empty, "generated_at": utc_now().isoformat(),
+                        "identity": {k: v for k, v in pair.items() if k != "range_name"},
+                        "range": pair["range_name"],
+                        "errors": [f"dashboard query failed: {type(error).__name__}: {error}"]})
+                    return
+                self._send(200, "application/json; charset=utf-8", body)
                 return
             if path in ("/api/status", "/api/opportunities"):
                 filters = None

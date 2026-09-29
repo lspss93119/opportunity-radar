@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import pytest
 
@@ -743,9 +743,141 @@ console.log(JSON.stringify({symbol:document.getElementById('symbol').value, acti
     assert parse_qs(result["query"]) == {"symbol": ["ETH"], "active_only": ["true"], "min_deviation": ["200"]}
 
 
-def test_pair_routes_remain_deferred_and_unknown_api_is_json(scanner_http):
-    for path in ("/api/pair?symbol=BTC", "/api/unknown"):
-        assert http_json(scanner_http, path, 404)["errors"]
-    with pytest.raises(HTTPError) as error:
-        urlopen(scanner_http + "/pair?symbol=BTC")
-    assert error.value.code == 404
+def test_unknown_api_is_json(scanner_http):
+    assert http_json(scanner_http, "/api/unknown", 404)["errors"]
+
+
+PAIR_QUERY = dict(symbol="BTC", long_venue="lighter", long_venue_symbol="BTC-USD",
+                  short_venue="hyperliquid", short_venue_symbol="xyz:BTC")
+
+
+@pytest.mark.parametrize("range_name", ["1h", "6h", "24h", "3d", "7d", "all"])
+def test_pair_http_ranges_summary_and_complete_statistics(scanner_http, range_name):
+    payload = http_json(scanner_http, "/api/pair?" + urlencode({**PAIR_QUERY, "range": range_name}))
+    assert payload["identity"] == {"canonical_symbol": "BTC", **{k: v for k, v in PAIR_QUERY.items() if k != "symbol"}}
+    assert payload["range"] == range_name
+    assert payload["data_as_of"] == payload["generated_at"] == NOW.isoformat()
+    current = payload["current"]
+    for field, expected in dict(raw_spread_bps=500, rolling_mean_bps=200,
+        rolling_std_bps=100, deviation_bps=300, signal_duration_seconds=75,
+        long_buy_vwap=100, short_sell_vwap=105, round_trip_fee_bps=6,
+        theoretical_edge_bps=294, observed_at_skew_seconds=0, freshness_seconds=0).items():
+        assert current[field] == pytest.approx(expected)
+    assert current["sample_time"] == NOW.isoformat()
+    assert payload["lifecycle"]["active"] and payload["lifecycle"]["candidate_confirmed"]
+    assert payload["lifecycle"]["episode_id"] == "BTC:episode"
+    assert payload["basis"]["sample_count"] == 6912  # All prior points, not <=500 chart points.
+    assert 0 < len(payload["history"]) <= 500
+    assert len(payload["rolling_mean_series"]) == len(payload["history"])
+    assert payload["history"][-1]["sample_time"] == NOW.isoformat()
+    assert payload["history"][-1]["raw_spread_bps"] == pytest.approx(500)
+    assert payload["rolling_mean_series"][-1]["rolling_mean_bps"] == pytest.approx(200)
+
+
+@pytest.mark.parametrize("missing", list(PAIR_QUERY))
+def test_pair_http_requires_every_exact_identity_even_unique_mapping(scanner_http, missing):
+    query = {k: v for k, v in PAIR_QUERY.items() if k != missing}
+    payload = http_json(scanner_http, "/api/pair?" + urlencode(query), 400)
+    assert payload["errors"] and payload["current"] is None
+
+
+@pytest.mark.parametrize("suffix", ["&range=2h", "&range=", "&range=ALL", "&range=1h&range=6h",
+    "&symbol=ETH", "&long_venue_symbol=", "&extra=1", "&range=%FF", "&range=%ZZ"])
+def test_pair_http_rejects_invalid_duplicate_unknown_query(scanner_http, suffix):
+    assert http_json(scanner_http, "/api/pair?" + urlencode(PAIR_QUERY) + suffix, 400)["errors"]
+
+
+@pytest.mark.parametrize("replacement", [dict(long_venue_symbol="BTC"), dict(symbol="btc"),
+    dict(long_venue="LIGHTER"), dict(short_venue="lighter", short_venue_symbol="BTC-USD")])
+def test_pair_http_unknown_exact_identity_is_client_error(scanner_http, replacement):
+    assert http_json(scanner_http, "/api/pair?" + urlencode({**PAIR_QUERY, **replacement}), 404)["errors"]
+
+
+def test_pair_http_exact_matching_formula_unavailable_basis_and_dataset_time(tmp_path, monkeypatch):
+    from radar.monitors.spread import SpreadMonitor
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("dashboard must not evaluate monitor")
+    monkeypatch.setattr(SpreadMonitor, "evaluate", forbidden)
+    markets = [MarketConfig(venue=v, venue_symbol=s, canonical_symbol="BTC") for v, s in
+               [("lighter", "BTC-USD"), ("lighter", "BTC-USDC"), ("hyperliquid", "xyz:BTC")]]
+    t = NOW - timedelta(seconds=30)
+    snapshots = [make_market(venue="lighter", venue_symbol="BTC-USD", sample_time=t, observed_at=t, buy_10k_vwap=200),
+        make_market(venue="hyperliquid", venue_symbol="xyz:BTC", sample_time=t, observed_at=t, sell_10k_vwap=202),
+        make_market(venue="lighter", venue_symbol="BTC-USD", sample_time=NOW - timedelta(seconds=10)),
+        make_market(venue="hyperliquid", venue_symbol="xyz:BTC", sample_time=NOW - timedelta(seconds=11)),
+        make_market(venue="lighter", venue_symbol="BTC-USD", sample_time=NOW - timedelta(seconds=2), observed_at=NOW - timedelta(seconds=1), buy_10k_vwap=200),
+        make_market(venue="hyperliquid", venue_symbol="xyz:BTC", sample_time=NOW - timedelta(seconds=2), observed_at=NOW, sell_10k_vwap=206)]
+    write_markets(tmp_path / "data", snapshots)
+    write_heartbeat(tmp_path / "runtime.sqlite3")
+    service = DashboardStatusService(RadarConfig(markets=markets, fees_bps={"lighter": 1, "hyperliquid": 2}),
+        data_root=tmp_path / "data", runtime_db=tmp_path / "runtime.sqlite3", clock=lambda: NOW)
+    with dashboard_http(service) as base:
+        payload = http_json(base, "/api/pair?" + urlencode(PAIR_QUERY))
+        assert payload["range"] == "24h"  # Scanner links omit range.
+        assert payload["status"] == "degraded"
+        assert payload["data_as_of"] == (NOW - timedelta(seconds=2)).isoformat()
+        assert [p["raw_spread_bps"] for p in payload["history"]] == pytest.approx([100, 300])
+        assert [p["sample_time"] for p in payload["history"]] == [t.isoformat(), (NOW - timedelta(seconds=2)).isoformat()]
+        assert payload["current"]["observed_at_skew_seconds"] == 1
+        assert payload["current"]["freshness_seconds"] == 1
+        assert payload["basis"]["eligible"] is False
+        for field in ("rolling_mean_bps", "rolling_std_bps", "deviation_bps", "theoretical_edge_bps", "signal_duration_seconds"):
+            assert payload["current"][field] is None
+        assert all(p["rolling_mean_bps"] is None for p in payload["rolling_mean_series"])
+        assert payload["lifecycle"]["available"] is False
+        ambiguous = {k: v for k, v in PAIR_QUERY.items() if k != "long_venue_symbol"}
+        assert http_json(base, "/api/pair?" + urlencode(ambiguous), 400)["errors"]
+
+
+def test_pair_http_storage_failure_never_creates_sources(tmp_path, monkeypatch):
+    service = DashboardStatusService(RadarConfig(markets=[
+        MarketConfig(venue="lighter", venue_symbol="BTC-USD", canonical_symbol="BTC"),
+        MarketConfig(venue="hyperliquid", venue_symbol="xyz:BTC", canonical_symbol="BTC")], fees_bps={"lighter": 1, "hyperliquid": 2}),
+        data_root=tmp_path / "missing", runtime_db=tmp_path / "runtime" / "missing.sqlite3", clock=lambda: NOW)
+    with dashboard_http(service) as base:
+        payload = http_json(base, "/api/pair?" + urlencode(PAIR_QUERY))
+        assert payload["errors"] and payload["current"] is None
+        assert payload["data_as_of"] is None and payload["status"] == "degraded"
+        assert not service.data_root.exists() and not service.runtime_db.parent.exists()
+
+
+def test_pair_ui_summary_chart_and_range_state(scanner_http):
+    query = urlencode(PAIR_QUERY)
+    payload = http_json(scanner_http, "/api/pair?" + query)
+    with urlopen(scanner_http + "/pair?" + query) as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+renderPair(payload);
+const summary = byId('pair-summary').innerHTML;
+const chart = byId('pair-chart').innerHTML;
+byId('pair-range').value = '7d';
+byId('pair-range').listeners.change();
+console.log(JSON.stringify({summary, chart, search:location.search, requests:requests.map(r=>r.url)}));
+""", setup=POLLING_SETUP + "location.pathname='/pair'; location.search=" + json.dumps("?" + query) + "; const payload=" + json.dumps(payload) + ";\n")
+    for label in ("Raw spread", "24h Mean", "24h Std", "Deviation", "Signal duration", "Long $10k buy VWAP", "Short $10k sell VWAP", "RT Fee", "Theo Edge", "Observed skew", "Freshness", "Sample time", "Lifecycle"):
+        assert label in result["summary"]
+    assert "500.00" in result["summary"] and "294.00" in result["summary"]
+    assert "<svg" in result["chart"] and 'data-series="raw"' in result["chart"]
+    assert 'data-series="mean"' in result["chart"] and 'data-series="current"' in result["chart"]
+    assert parse_qs(result["search"][1:]) == {**{k: [v] for k, v in PAIR_QUERY.items()}, "range": ["7d"]}
+    assert all(url.startswith("/api/pair?") for url in result["requests"])
+    assert parse_qs(urlparse(result["requests"][-1]).query)["range"] == ["7d"]
+
+
+def test_pair_ui_gaps_unavailable_mean_and_current_are_not_synthesized(scanner_http):
+    with urlopen(scanner_http + "/pair?" + urlencode(PAIR_QUERY)) as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+renderPair({history:[{sample_time:'2026-09-23T11:59:00Z',raw_spread_bps:100,segment:0},
+  {sample_time:'2026-09-23T12:00:00Z',raw_spread_bps:300,segment:1}],
+  rolling_mean_series:[{sample_time:'2026-09-23T11:59:00Z',rolling_mean_bps:null,segment:0},
+  {sample_time:'2026-09-23T12:00:00Z',rolling_mean_bps:null,segment:1}],
+  basis:{eligible:false}, lifecycle:{available:false}, current:null});
+console.log(JSON.stringify({chart:byId('pair-chart').innerHTML,summary:byId('pair-summary').innerHTML}));
+""", setup="location.pathname='/pair';\n")
+    assert 'data-series="current"' not in result["chart"]
+    assert 'data-series="mean"' not in result["chart"]
+    raw_paths = re.findall(r'<path[^>]*data-series="raw"[^>]*d="([^"]*)"', result["chart"])
+    assert raw_paths and all("L" not in path for path in raw_paths)
+    assert "Unavailable" in result["summary"]

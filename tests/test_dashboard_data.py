@@ -794,6 +794,35 @@ def query_pair(service, range_name="1h", *, now=NOW):
     )
 
 
+def test_pair_display_preserves_extrema_and_gap_segments_without_interpolation(tmp_path):
+    start = NOW - timedelta(days=3)
+    snapshots = []
+    original = {}
+    for index in range(1200):
+        sample = start + timedelta(seconds=10 * index + (60 if index >= 600 else 0))
+        spread = {201: 900, 701: -800, 901: 700}.get(index, 200)
+        original[sample.isoformat()] = spread
+        snapshots.extend(pair_markets(sample_time=sample, observed_at=sample,
+            long_buy=100, short_sell=100 * (1 + spread / 10000)))
+    write_markets(tmp_path / "data", snapshots)
+    service = DashboardQueryService(pair_config(), data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3", clock=lambda: NOW)
+    payload = query_pair(service, "all")
+    assert payload["range"] == "all"
+    assert payload["generated_at"] == NOW.isoformat()
+    history = payload["history"]
+    assert len(history) <= 500
+    assert history[0]["sample_time"] == start.isoformat()
+    assert history[-1]["sample_time"] == list(original)[-1]
+    assert payload["data_as_of"] == list(original)[-1]
+    for point in history:
+        assert point["raw_spread_bps"] == pytest.approx(original[point["sample_time"]])
+        assert point["segment"] == (0 if datetime.fromisoformat(point["sample_time"]) < start + timedelta(seconds=6000) else 1)
+    assert {900, -800, 700} <= {round(p["raw_spread_bps"]) for p in history}
+    assert [p["sample_time"] for p in history] == sorted(p["sample_time"] for p in history)
+    assert [p["segment"] for p in payload["rolling_mean_series"]] == [p["segment"] for p in history]
+
+
 def test_status_with_active_episode_is_json_and_reports_latest_sample_age(tmp_path):
     write_markets(tmp_path / "data", pair_markets(sample_time=NOW - timedelta(seconds=10)))
     write_episodes(tmp_path / "runtime.sqlite3", {"episode": make_episode()})

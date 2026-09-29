@@ -451,6 +451,8 @@ class DashboardQueryService:
         if not self._is_configured_pair(identity):
             return {
                 "identity": self._identity_payload(key),
+                "range": range_name,
+                "generated_at": now.isoformat(),
                 "data_as_of": None,
                 "status": "down",
                 "current": None,
@@ -499,14 +501,25 @@ class DashboardQueryService:
                 )
             )
         ]
+        # Segment on complete observations before display downsampling, so an
+        # omitted slot never becomes a line through a gap in the browser.
+        segments: dict[datetime, int] = {}
+        segment = 0
+        for index, point in enumerate(display_points):
+            if index and (point.sample_time - display_points[index - 1].sample_time).total_seconds() > EXPECTED_INTERVAL_SECONDS:
+                segment += 1
+            segments[point.sample_time] = segment
         history = [
             {
                 "sample_time": observation.sample_time.isoformat(),
                 "raw_spread_bps": observation.raw_spread_bps,
+                "segment": segments[observation.sample_time],
             }
             for observation in self._downsample_points(display_points)
         ]
         rolling_mean_series = self._rolling_mean_series(observations, display_points)
+        for point, mean in zip(history, rolling_mean_series, strict=True):
+            mean["segment"] = point["segment"]
         lifecycle = self._lifecycle_for(key, runtime.episodes_by_key, now)
         current_payload = (
             self._current_payload(current_observation, basis, lifecycle)
@@ -520,6 +533,8 @@ class DashboardQueryService:
             status = "down"
         return {
             "identity": self._identity_payload(key),
+            "range": range_name,
+            "generated_at": now.isoformat(),
             "data_as_of": _iso(data_as_of),
             "status": status,
             "current": current_payload,
