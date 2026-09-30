@@ -10,6 +10,7 @@ import pytest
 
 from radar import analysis_daily
 from radar.analysis_export import ExportError, ExportResult, RemoteMismatchError
+from radar.storage.parquet import DATASET_SCHEMAS
 
 
 SAMPLE_SCHEMA = pa.schema(
@@ -64,11 +65,17 @@ def _closed_partial_slots(target_date: date, slot_count: int) -> list[datetime]:
     return _slots(target_date)[: slot_count - 1] + [_slots(target_date)[-1]]
 
 
-def _result(target_date: date, *, converted: bool, uploaded: bool) -> ExportResult:
+def _result(
+    target_date: date,
+    *,
+    converted: bool,
+    uploaded: bool,
+    dataset: str = "market",
+) -> ExportResult:
     return ExportResult(
         local_path=Path(f"/tmp/date={target_date.isoformat()}.csv.gz"),
         remote_path=(
-            "opportunity-drive-own:OpportunityRadar/analysis_csv/market/"
+            f"opportunity-drive-own:OpportunityRadar/analysis_csv/{dataset}/"
             f"date={target_date.isoformat()}.csv.gz"
         ),
         row_count=0,
@@ -76,6 +83,76 @@ def _result(target_date: date, *, converted: bool, uploaded: bool) -> ExportResu
         uploaded=uploaded,
         remote_verified=True,
     )
+
+
+def _write_ancillary_partition(
+    data_root: Path,
+    dataset: str,
+    target_date: date,
+    *,
+    malformed: bool = False,
+) -> None:
+    base = datetime.combine(target_date, datetime.min.time(), tzinfo=UTC)
+    if dataset == "funding":
+        rows = [
+            {
+                "effective_time": base,
+                "observed_at": base,
+                "venue": "lighter",
+                "venue_symbol": "BTC",
+                "canonical_symbol": "BTC",
+                "funding_rate": 0.0,
+                "next_funding_time": None,
+            }
+        ]
+        if malformed:
+            rows[0]["effective_time"] = base + timedelta(days=1)
+    elif dataset == "hourly_context":
+        rows = [
+            {
+                "sample_time": base,
+                "observed_at": base,
+                "venue": "lighter",
+                "venue_symbol": "BTC",
+                "canonical_symbol": "BTC",
+                "open_interest": None,
+                "volume_24h": 1.0,
+            }
+        ]
+    elif dataset == "quoted_market":
+        rows = [
+            {
+                "quote_time": base,
+                "fetched_at": base,
+                "venue": "variational",
+                "venue_symbol": "BTC",
+                "canonical_symbol": "BTC",
+                "mark_price": 100.0,
+                "bid_1k": 99.0,
+                "ask_1k": 101.0,
+                "bid_100k": 98.0,
+                "ask_100k": 102.0,
+                "bid_1m": None,
+                "ask_1m": None,
+                "funding_rate": 0.0,
+                "funding_interval_seconds": 3600,
+                "volume_24h": None,
+                "long_open_interest": None,
+                "short_open_interest": None,
+            }
+        ]
+    else:
+        raise AssertionError(dataset)
+    partition = data_root / dataset / f"date={target_date.isoformat()}"
+    partition.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_pylist(rows, schema=DATASET_SCHEMAS[dataset])
+    pq.write_table(table, partition / "part-0000.parquet")
+
+
+def _write_complete_bundle(data_root: Path, target_date: date) -> None:
+    _complete_partition(data_root, target_date)
+    for dataset in ("funding", "hourly_context", "quoted_market"):
+        _write_ancillary_partition(data_root, dataset, target_date)
 
 
 def _run_kwargs(
@@ -253,14 +330,17 @@ def test_lookback_is_oldest_to_newest_and_current_date_is_excluded(
 ) -> None:
     dates = [NOW.date() - timedelta(days=offset) for offset in (3, 2, 1)]
     for target_date in dates:
-        _complete_partition(tmp_path / "data", target_date)
+        _write_complete_bundle(tmp_path / "data", target_date)
     calls: list[date] = []
 
     def exporter(**kwargs: object) -> ExportResult:
         target_date = kwargs["target_date"]
+        dataset = kwargs["dataset"]
         assert isinstance(target_date, date)
-        calls.append(target_date)
-        return _result(target_date, converted=False, uploaded=False)
+        assert isinstance(dataset, str)
+        if dataset == "market":
+            calls.append(target_date)
+        return _result(target_date, converted=False, uploaded=False, dataset=dataset)
 
     result = _run_kwargs(tmp_path, lookback_days=3, exporter=exporter)
 
@@ -275,16 +355,25 @@ def test_already_exported_partial_date_can_be_passed_over_idempotently(
     target_date = NOW.date() - timedelta(days=2)
     incomplete = _closed_partial_slots(target_date, 8639)
     _write_partition(tmp_path / "data", target_date, incomplete)
+    for dataset in ("funding", "hourly_context", "quoted_market"):
+        _write_ancillary_partition(tmp_path / "data", dataset, target_date)
     calls: list[date] = []
+    market_calls = 0
 
     def exporter(**kwargs: object) -> ExportResult:
         target = kwargs["target_date"]
+        dataset = kwargs["dataset"]
         assert isinstance(target, date)
-        calls.append(target)
+        assert isinstance(dataset, str)
+        nonlocal market_calls
+        if dataset == "market":
+            market_calls += 1
+            calls.append(target)
         return _result(
             target,
-            converted=len(calls) > 1,
-            uploaded=len(calls) > 1,
+            converted=market_calls > 1,
+            uploaded=market_calls > 1,
+            dataset=dataset,
         )
 
     first = _run_kwargs(tmp_path, lookback_days=2, exporter=exporter)
@@ -334,13 +423,18 @@ def test_partial_date_can_invoke_exporter(tmp_path: Path) -> None:
         target_date,
         _closed_partial_slots(target_date, 8630),
     )
+    for dataset in ("funding", "hourly_context", "quoted_market"):
+        _write_ancillary_partition(tmp_path / "data", dataset, target_date)
     calls: list[date] = []
 
     def exporter(**kwargs: object) -> ExportResult:
         target = kwargs["target_date"]
+        dataset = kwargs["dataset"]
         assert isinstance(target, date)
-        calls.append(target)
-        return _result(target, converted=False, uploaded=False)
+        assert isinstance(dataset, str)
+        if dataset == "market":
+            calls.append(target)
+        return _result(target, converted=False, uploaded=False, dataset=dataset)
 
     result = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter)
 
@@ -359,14 +453,24 @@ def test_already_exported_partial_date_is_passed_over_to_newer_work(
         older,
         _closed_partial_slots(older, 8630),
     )
-    _complete_partition(tmp_path / "data", newer)
+    _write_complete_bundle(tmp_path / "data", newer)
+    for dataset in ("funding", "hourly_context", "quoted_market"):
+        _write_ancillary_partition(tmp_path / "data", dataset, older)
     calls: list[date] = []
 
     def exporter(**kwargs: object) -> ExportResult:
         target = kwargs["target_date"]
+        dataset = kwargs["dataset"]
         assert isinstance(target, date)
-        calls.append(target)
-        return _result(target, converted=False, uploaded=target == newer)
+        assert isinstance(dataset, str)
+        if dataset == "market":
+            calls.append(target)
+        return _result(
+            target,
+            converted=False,
+            uploaded=target == newer,
+            dataset=dataset,
+        )
 
     result = _run_kwargs(tmp_path, lookback_days=2, exporter=exporter)
 
@@ -380,14 +484,22 @@ def test_already_exported_partial_date_is_passed_over_to_newer_work(
 def test_only_one_date_performs_actual_work(tmp_path: Path) -> None:
     dates = [NOW.date() - timedelta(days=offset) for offset in (3, 2, 1)]
     for target_date in dates:
-        _complete_partition(tmp_path / "data", target_date)
+        _write_complete_bundle(tmp_path / "data", target_date)
     calls: list[date] = []
 
     def exporter(**kwargs: object) -> ExportResult:
         target = kwargs["target_date"]
+        dataset = kwargs["dataset"]
         assert isinstance(target, date)
-        calls.append(target)
-        return _result(target, converted=target == dates[0], uploaded=target == dates[0])
+        assert isinstance(dataset, str)
+        if dataset == "market":
+            calls.append(target)
+        return _result(
+            target,
+            converted=target == dates[0],
+            uploaded=target == dates[0],
+            dataset=dataset,
+        )
 
     result = _run_kwargs(tmp_path, lookback_days=3, exporter=exporter)
 
@@ -403,20 +515,23 @@ def test_exporter_failure_stops_subsequent_processing(
 ) -> None:
     older = NOW.date() - timedelta(days=2)
     newer = NOW.date() - timedelta(days=1)
-    _complete_partition(tmp_path / "data", older)
-    _complete_partition(tmp_path / "data", newer)
+    _write_complete_bundle(tmp_path / "data", older)
+    _write_complete_bundle(tmp_path / "data", newer)
     calls: list[date] = []
 
     def exporter(**kwargs: object) -> ExportResult:
         target = kwargs["target_date"]
+        dataset = kwargs["dataset"]
         assert isinstance(target, date)
-        calls.append(target)
+        assert isinstance(dataset, str)
+        if dataset == "market":
+            calls.append(target)
         raise failure
 
     result = _run_kwargs(tmp_path, lookback_days=2, exporter=exporter)
 
     assert result.outcome == "error"
-    assert result.error == str(failure)
+    assert result.error == f"market export failed: {failure}"
     assert calls == [older]
 
 
@@ -512,3 +627,260 @@ def test_completeness_reads_only_sample_time_in_batches(
     assert calls
     assert all(columns == ["sample_time"] for columns, _ in calls)
     assert all(isinstance(batch_size, int) for _, batch_size in calls)
+
+
+def test_bundle_processes_all_datasets_for_one_selected_date(tmp_path: Path) -> None:
+    target_date = NOW.date() - timedelta(days=1)
+    _write_complete_bundle(tmp_path / "data", target_date)
+    calls: list[tuple[date, str]] = []
+
+    def exporter(**kwargs: object) -> ExportResult:
+        target = kwargs["target_date"]
+        dataset = kwargs["dataset"]
+        assert isinstance(target, date)
+        assert isinstance(dataset, str)
+        calls.append((target, dataset))
+        return _result(target, converted=True, uploaded=True, dataset=dataset)
+
+    result = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter)
+
+    assert result.outcome == "work_completed"
+    assert result.selected_date == target_date
+    assert calls == [
+        (target_date, "market"),
+        (target_date, "funding"),
+        (target_date, "hourly_context"),
+        (target_date, "quoted_market"),
+    ]
+    assert len(result.dataset_runs) == 4
+    assert {run.dataset for run in result.dataset_runs} == set(
+        analysis_daily.DATASET_NAMES
+    )
+
+
+def test_partial_market_date_can_export_full_bundle(tmp_path: Path) -> None:
+    target_date = NOW.date() - timedelta(days=1)
+    data_root = tmp_path / "data"
+    _write_partition(
+        data_root,
+        target_date,
+        _closed_partial_slots(target_date, 8630),
+    )
+    for dataset in ("funding", "hourly_context", "quoted_market"):
+        _write_ancillary_partition(data_root, dataset, target_date)
+    calls: list[str] = []
+
+    def exporter(**kwargs: object) -> ExportResult:
+        dataset = kwargs["dataset"]
+        assert isinstance(dataset, str)
+        calls.append(dataset)
+        return _result(
+            kwargs["target_date"],  # type: ignore[arg-type]
+            converted=True,
+            uploaded=True,
+            dataset=dataset,
+        )
+
+    result = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter)
+
+    assert result.outcome == "work_completed"
+    assert calls == list(analysis_daily.DATASET_NAMES)
+
+
+def test_rejected_market_never_exports_or_validates_ancillary(
+    tmp_path: Path,
+) -> None:
+    target_date = NOW.date() - timedelta(days=1)
+    _write_partition(
+        tmp_path / "data",
+        target_date,
+        _closed_partial_slots(target_date, 8622),
+    )
+    calls: list[str] = []
+
+    def exporter(**kwargs: object) -> ExportResult:
+        calls.append(str(kwargs.get("dataset")))
+        raise AssertionError("rejected market date must not export a bundle")
+
+    result = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter)
+
+    assert result.outcome == "incomplete_only"
+    assert calls == []
+
+
+def test_malformed_ancillary_partition_fails_closed_before_export(
+    tmp_path: Path,
+) -> None:
+    target_date = NOW.date() - timedelta(days=1)
+    data_root = tmp_path / "data"
+    _complete_partition(data_root, target_date)
+    _write_ancillary_partition(
+        data_root,
+        "funding",
+        target_date,
+        malformed=True,
+    )
+    for dataset in ("hourly_context", "quoted_market"):
+        _write_ancillary_partition(data_root, dataset, target_date)
+    calls: list[str] = []
+
+    def exporter(**kwargs: object) -> ExportResult:
+        calls.append(str(kwargs.get("dataset")))
+        raise AssertionError("malformed bundle must fail before export")
+
+    result = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter)
+
+    assert result.outcome == "error"
+    assert result.selected_date == target_date
+    assert result.error is not None
+    assert "funding" in result.error
+    assert calls == []
+
+
+def test_missing_ancillary_partition_fails_closed(tmp_path: Path) -> None:
+    target_date = NOW.date() - timedelta(days=1)
+    data_root = tmp_path / "data"
+    _complete_partition(data_root, target_date)
+    calls: list[str] = []
+
+    def exporter(**kwargs: object) -> ExportResult:
+        calls.append(str(kwargs.get("dataset")))
+        raise AssertionError("missing ancillary data must fail before export")
+
+    result = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter)
+
+    assert result.outcome == "error"
+    assert result.error is not None
+    assert "funding" in result.error
+    assert calls == []
+
+
+def test_only_one_date_can_perform_work_but_all_bundle_datasets_run(
+    tmp_path: Path,
+) -> None:
+    older = NOW.date() - timedelta(days=2)
+    newer = NOW.date() - timedelta(days=1)
+    _write_complete_bundle(tmp_path / "data", older)
+    _write_complete_bundle(tmp_path / "data", newer)
+    calls: list[tuple[date, str]] = []
+
+    def exporter(**kwargs: object) -> ExportResult:
+        target = kwargs["target_date"]
+        dataset = kwargs["dataset"]
+        assert isinstance(target, date)
+        assert isinstance(dataset, str)
+        calls.append((target, dataset))
+        actual_work = target == newer
+        return _result(
+            target,
+            converted=actual_work,
+            uploaded=actual_work,
+            dataset=dataset,
+        )
+
+    result = _run_kwargs(tmp_path, lookback_days=2, exporter=exporter)
+
+    assert result.outcome == "work_completed"
+    assert result.selected_date == newer
+    assert calls == [
+        (older, "market"),
+        (older, "funding"),
+        (older, "hourly_context"),
+        (older, "quoted_market"),
+        (newer, "market"),
+        (newer, "funding"),
+        (newer, "hourly_context"),
+        (newer, "quoted_market"),
+    ]
+
+
+def test_bundle_failure_stops_later_datasets_and_dates(tmp_path: Path) -> None:
+    older = NOW.date() - timedelta(days=2)
+    newer = NOW.date() - timedelta(days=1)
+    _write_complete_bundle(tmp_path / "data", older)
+    _write_complete_bundle(tmp_path / "data", newer)
+    calls: list[tuple[date, str]] = []
+
+    def exporter(**kwargs: object) -> ExportResult:
+        target = kwargs["target_date"]
+        dataset = kwargs["dataset"]
+        assert isinstance(target, date)
+        assert isinstance(dataset, str)
+        calls.append((target, dataset))
+        if dataset == "funding":
+            raise RemoteMismatchError("mismatch")
+        return _result(target, converted=False, uploaded=False, dataset=dataset)
+
+    result = _run_kwargs(tmp_path, lookback_days=2, exporter=exporter)
+
+    assert result.outcome == "error"
+    assert result.selected_date == older
+    assert calls == [(older, "market"), (older, "funding")]
+
+
+def test_bundle_retry_resumes_after_partial_success_without_newer_date(
+    tmp_path: Path,
+) -> None:
+    target_date = NOW.date() - timedelta(days=1)
+    _write_complete_bundle(tmp_path / "data", target_date)
+    phase = 0
+    calls: list[str] = []
+
+    def exporter(**kwargs: object) -> ExportResult:
+        nonlocal phase
+        dataset = kwargs["dataset"]
+        assert isinstance(dataset, str)
+        calls.append(dataset)
+        if phase == 0 and dataset == "funding":
+            raise ExportError("funding upload interrupted")
+        actual_work = phase == 0 and dataset == "market" or (
+            phase == 1 and dataset == "funding"
+        )
+        return _result(
+            kwargs["target_date"],  # type: ignore[arg-type]
+            converted=actual_work,
+            uploaded=actual_work,
+            dataset=dataset,
+        )
+
+    first = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter)
+    assert first.outcome == "error"
+    assert calls == ["market", "funding"]
+
+    phase = 1
+    second = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter)
+    assert second.outcome == "work_completed"
+    assert second.selected_date == target_date
+    assert calls == [
+        "market",
+        "funding",
+        "market",
+        "funding",
+        "hourly_context",
+        "quoted_market",
+    ]
+
+
+def test_bundle_summary_includes_source_rows_and_dataset_results(
+    tmp_path: Path,
+) -> None:
+    target_date = NOW.date() - timedelta(days=1)
+    _write_complete_bundle(tmp_path / "data", target_date)
+
+    def exporter(**kwargs: object) -> ExportResult:
+        dataset = kwargs["dataset"]
+        assert isinstance(dataset, str)
+        return _result(
+            kwargs["target_date"],  # type: ignore[arg-type]
+            converted=False,
+            uploaded=False,
+            dataset=dataset,
+        )
+
+    summary = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter).summary()
+
+    assert "dataset=market" in summary
+    assert "dataset=funding" in summary
+    assert "dataset=hourly_context" in summary
+    assert "dataset=quoted_market" in summary
+    assert "source_rows=" in summary

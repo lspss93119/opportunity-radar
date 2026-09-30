@@ -13,17 +13,33 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Literal, cast
 
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
+from radar.storage.parquet import DATASET_SCHEMAS
+
 REMOTE_NAME = "opportunity-drive-own"
-REMOTE_ROOT = "OpportunityRadar/analysis_csv/market"
+REMOTE_ROOT = "OpportunityRadar/analysis_csv"
 CSV_BATCH_SIZE = 8192
 RCLONE_TIMEOUT_SECONDS = 120.0
 RCLONE_CONTIMEOUT_SECONDS = 30.0
 RCLONE_RETRIES = 1
 RCLONE_LOW_LEVEL_RETRIES = 1
+DatasetName = Literal["market", "funding", "hourly_context", "quoted_market"]
+DATASET_NAMES: tuple[DatasetName, ...] = (
+    "market",
+    "funding",
+    "hourly_context",
+    "quoted_market",
+)
+DATASET_TIMESTAMP_FIELDS: dict[DatasetName, str] = {
+    "market": "sample_time",
+    "funding": "effective_time",
+    "hourly_context": "sample_time",
+    "quoted_market": "quote_time",
+}
 
 
 class ExportError(RuntimeError):
@@ -55,27 +71,51 @@ def _validate_remote(remote: str) -> None:
         raise ValueError(f"remote must be exactly {REMOTE_NAME}")
 
 
-def _source_partition(data_root: Path, target_date: date) -> Path:
-    return data_root / "market" / f"date={target_date.isoformat()}"
+def _validate_dataset(dataset: str) -> DatasetName:
+    if dataset not in DATASET_SCHEMAS:
+        raise ValueError(f"dataset must be one of {', '.join(DATASET_NAMES)}")
+    return cast(DatasetName, dataset)
 
 
-def _source_files(data_root: Path, target_date: date) -> tuple[Path, ...]:
-    partition = _source_partition(data_root, target_date)
+def _source_partition(
+    data_root: Path,
+    target_date: date,
+    dataset: DatasetName,
+) -> Path:
+    return data_root / dataset / f"date={target_date.isoformat()}"
+
+
+def _source_files(
+    data_root: Path,
+    target_date: date,
+    dataset: DatasetName,
+) -> tuple[Path, ...]:
+    partition = _source_partition(data_root, target_date, dataset)
     files = tuple(path for path in sorted(partition.glob("part-*.parquet")) if path.is_file())
     if not files:
-        raise ExportError(f"no market Parquet files found in {partition}")
+        raise ExportError(f"no {dataset} Parquet files found in {partition}")
     return files
 
 
 def _source_schema_and_rows(files: Sequence[Path]) -> tuple[pa.Schema, int]:
     first = pq.ParquetFile(files[0])
-    schema = first.schema_arrow
-    row_count = first.metadata.num_rows
+    try:
+        schema = first.schema_arrow
+        row_count = first.metadata.num_rows
+    finally:
+        close = getattr(first, "close", None)
+        if callable(close):
+            close()
     for path in files[1:]:
         parquet = pq.ParquetFile(path)
-        if not parquet.schema_arrow.equals(schema, check_metadata=True):
-            raise ExportError(f"source Parquet schema mismatch: {path.name}")
-        row_count += parquet.metadata.num_rows
+        try:
+            if not parquet.schema_arrow.equals(schema, check_metadata=True):
+                raise ExportError(f"source Parquet schema mismatch: {path.name}")
+            row_count += parquet.metadata.num_rows
+        finally:
+            close = getattr(parquet, "close", None)
+            if callable(close):
+                close()
     return schema, row_count
 
 
@@ -164,14 +204,19 @@ def _convert_partition(
         writer.writerow(schema.names)
         for path in files:
             parquet = pq.ParquetFile(path)
-            if not parquet.schema_arrow.equals(schema, check_metadata=True):
-                raise ExportError(f"source Parquet schema mismatch: {path.name}")
-            for batch in parquet.iter_batches(batch_size=CSV_BATCH_SIZE):
-                for row in batch.to_pylist():
-                    writer.writerow(
-                        [_csv_value(field, row[field.name]) for field in fields]
-                    )
-                    row_count += 1
+            try:
+                if not parquet.schema_arrow.equals(schema, check_metadata=True):
+                    raise ExportError(f"source Parquet schema mismatch: {path.name}")
+                for batch in parquet.iter_batches(batch_size=CSV_BATCH_SIZE):
+                    for row in batch.to_pylist():
+                        writer.writerow(
+                            [_csv_value(field, row[field.name]) for field in fields]
+                        )
+                        row_count += 1
+            finally:
+                close = getattr(parquet, "close", None)
+                if callable(close):
+                    close()
     return row_count
 
 
@@ -315,20 +360,22 @@ def _copy_to_remote(
     )
 
 
-def export_market_date(
+def export_dataset_date(
     *,
     data_root: Path,
     output_root: Path,
     target_date: date,
+    dataset: str,
     remote: str,
     rclone: Path,
 ) -> ExportResult:
     _validate_remote(remote)
-    files = _source_files(data_root, target_date)
+    normalized_dataset = _validate_dataset(dataset)
+    files = _source_files(data_root, target_date, normalized_dataset)
     schema, expected_rows = _source_schema_and_rows(files)
     filename = f"date={target_date.isoformat()}.csv.gz"
-    output = output_root / "market" / filename
-    remote_parent = f"{remote}:{REMOTE_ROOT}"
+    output = output_root / normalized_dataset / filename
+    remote_parent = f"{remote}:{REMOTE_ROOT}/{normalized_dataset}"
     remote_path = f"{remote_parent}/{filename}"
 
     converted = False
@@ -377,6 +424,24 @@ def export_market_date(
     )
 
 
+def export_market_date(
+    *,
+    data_root: Path,
+    output_root: Path,
+    target_date: date,
+    remote: str,
+    rclone: Path,
+) -> ExportResult:
+    return export_dataset_date(
+        data_root=data_root,
+        output_root=output_root,
+        target_date=target_date,
+        dataset="market",
+        remote=remote,
+        rclone=rclone,
+    )
+
+
 def _parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -385,10 +450,11 @@ def _parse_date(value: str) -> date:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Export market Parquet to CSV.GZ")
+    parser = argparse.ArgumentParser(description="Export a Parquet dataset to CSV.GZ")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--date", type=_parse_date, required=True)
+    parser.add_argument("--dataset", choices=DATASET_NAMES, default="market")
     parser.add_argument("--remote", required=True)
     parser.add_argument("--rclone", type=Path, required=True)
     return parser
@@ -397,10 +463,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        result = export_market_date(
+        result = export_dataset_date(
             data_root=args.data_root,
             output_root=args.output_root,
             target_date=args.date,
+            dataset=args.dataset,
             remote=args.remote,
             rclone=args.rclone,
         )

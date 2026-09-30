@@ -12,7 +12,13 @@ import pyarrow.parquet as pq
 import pytest
 
 from radar import analysis_export
-from radar.storage.parquet import MARKET_SCHEMA
+from radar.storage.parquet import (
+    DATASET_SCHEMAS,
+    FUNDING_SCHEMA,
+    HOURLY_CONTEXT_SCHEMA,
+    MARKET_SCHEMA,
+    QUOTED_MARKET_SCHEMA,
+)
 
 
 DATE_TEXT = "2026-09-29"
@@ -57,6 +63,109 @@ def _write_market_parts(data_root: Path, parts: list[list[dict[str, object]]]) -
     for index, rows in enumerate(parts, start=1):
         table = pa.Table.from_pylist(rows, schema=MARKET_SCHEMA)
         pq.write_table(table, partition / f"part-{index:02d}.parquet", compression="zstd")
+
+
+def _write_dataset_parts(
+    data_root: Path,
+    dataset: str,
+    parts: list[list[dict[str, object]]],
+) -> None:
+    partition = data_root / dataset / f"date={DATE_TEXT}"
+    partition.mkdir(parents=True)
+    for index, rows in enumerate(parts, start=1):
+        table = pa.Table.from_pylist(rows, schema=DATASET_SCHEMAS[dataset])
+        pq.write_table(table, partition / f"part-{index:02d}.parquet", compression="zstd")
+
+
+def _ancillary_rows(dataset: str) -> list[list[dict[str, object]]]:
+    base = datetime(2026, 9, 29, tzinfo=UTC)
+    if dataset == "funding":
+        rows = [
+            {
+                "effective_time": base,
+                "observed_at": base + timedelta(microseconds=1),
+                "venue": "lighter",
+                "venue_symbol": "QQQ",
+                "canonical_symbol": "QQQ",
+                "funding_rate": 0.0001,
+                "next_funding_time": None,
+            },
+            {
+                "effective_time": base + timedelta(hours=1),
+                "observed_at": base + timedelta(hours=1, microseconds=2),
+                "venue": "arcus",
+                "venue_symbol": "QQQ-USD",
+                "canonical_symbol": "QQQ",
+                "funding_rate": -0.0002,
+                "next_funding_time": base + timedelta(hours=2),
+            },
+        ]
+    elif dataset == "hourly_context":
+        rows = [
+            {
+                "sample_time": base,
+                "observed_at": base + timedelta(microseconds=3),
+                "venue": "lighter",
+                "venue_symbol": "QQQ",
+                "canonical_symbol": "QQQ",
+                "open_interest": None,
+                "volume_24h": 10.5,
+            },
+            {
+                "sample_time": base + timedelta(hours=1),
+                "observed_at": base + timedelta(hours=1, microseconds=4),
+                "venue": "arcus",
+                "venue_symbol": "QQQ-USD",
+                "canonical_symbol": "QQQ",
+                "open_interest": 12.5,
+                "volume_24h": None,
+            },
+        ]
+    elif dataset == "quoted_market":
+        rows = [
+            {
+                "quote_time": base + timedelta(microseconds=5),
+                "fetched_at": base + timedelta(microseconds=6),
+                "venue": "variational",
+                "venue_symbol": "QQQ",
+                "canonical_symbol": "QQQ",
+                "mark_price": 100.0,
+                "bid_1k": 99.9,
+                "ask_1k": 100.1,
+                "bid_100k": 99.5,
+                "ask_100k": 100.5,
+                "bid_1m": None,
+                "ask_1m": 101.0,
+                "funding_rate": 0.0003,
+                "funding_interval_seconds": 3600,
+                "volume_24h": None,
+                "long_open_interest": 50.0,
+                "short_open_interest": None,
+            },
+            {
+                "quote_time": base + timedelta(seconds=30),
+                "fetched_at": base + timedelta(seconds=31),
+                "venue": "variational",
+                "venue_symbol": "QQQ",
+                "canonical_symbol": "QQQ",
+                "mark_price": 100.2,
+                "bid_1k": 100.1,
+                "ask_1k": 100.3,
+                "bid_100k": 99.7,
+                "ask_100k": 100.7,
+                "bid_1m": 99.0,
+                "ask_1m": None,
+                "funding_rate": -0.0001,
+                "funding_interval_seconds": 7200,
+                "volume_24h": 1000.0,
+                "long_open_interest": None,
+                "short_open_interest": 60.0,
+            },
+        ]
+    else:
+        raise AssertionError(dataset)
+    midpoint = len(rows) // 2
+    return [rows[:midpoint], rows[midpoint:]]
 
 
 def _source_rows() -> list[list[dict[str, object]]]:
@@ -351,3 +460,95 @@ def test_old_remote_is_rejected_without_fallback(tmp_path: Path) -> None:
             remote="opportunity-drive",
             rclone=Path("/opt/homebrew/bin/rclone"),
         )
+
+
+@pytest.mark.parametrize(
+    ("dataset", "schema"),
+    [
+        ("funding", FUNDING_SCHEMA),
+        ("hourly_context", HOURLY_CONTEXT_SCHEMA),
+        ("quoted_market", QUOTED_MARKET_SCHEMA),
+    ],
+)
+def test_export_dataset_streams_and_preserves_ancillary_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dataset: str,
+    schema: pa.Schema,
+) -> None:
+    data_root = tmp_path / "data"
+    output_root = tmp_path / "analysis"
+    parts = _ancillary_rows(dataset)
+    _write_dataset_parts(data_root, dataset, parts)
+    output = output_root / dataset / f"date={DATE_TEXT}.csv.gz"
+    fake = FakeRclone(output)
+    monkeypatch.setattr(analysis_export, "_run_rclone", fake)
+
+    result = analysis_export.export_dataset_date(
+        data_root=data_root,
+        output_root=output_root,
+        target_date=TARGET_DATE,
+        dataset=dataset,
+        remote="opportunity-drive-own",
+        rclone=Path("/opt/homebrew/bin/rclone"),
+    )
+
+    assert result.converted is True
+    assert result.uploaded is True
+    assert result.row_count == 2
+    with gzip.open(output, "rt", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+    assert reader.fieldnames == list(schema.names)
+    assert len(rows) == 2
+    timestamp_field = schema.field(0).name
+    assert rows[0][timestamp_field].endswith("Z")
+    assert any(value == "" for value in rows[0].values())
+    assert all("opportunity-drive:" not in " ".join(call) for call in fake.calls)
+    copy_calls = [call for call in fake.calls if call[1] == "copyto"]
+    assert len(copy_calls) == 1
+    assert copy_calls[0][3] == (
+        f"opportunity-drive-own:OpportunityRadar/analysis_csv/{dataset}/"
+        f"date={DATE_TEXT}.csv.gz"
+    )
+
+
+def test_quoted_market_conversion_reads_high_fragment_count_in_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "data"
+    output_root = tmp_path / "analysis"
+    rows = [
+        row
+        for part in _ancillary_rows("quoted_market")
+        for row in part
+    ]
+    _write_dataset_parts(
+        data_root,
+        "quoted_market",
+        [[row] for row in rows * 12],
+    )
+    output = output_root / "quoted_market" / f"date={DATE_TEXT}.csv.gz"
+    fake = FakeRclone(output)
+    monkeypatch.setattr(analysis_export, "_run_rclone", fake)
+    original_iter_batches = pq.ParquetFile.iter_batches
+    batch_sizes: list[int | None] = []
+
+    def tracked_iter_batches(self: pq.ParquetFile, *args: object, **kwargs: object):
+        batch_sizes.append(kwargs.get("batch_size"))
+        return original_iter_batches(self, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", tracked_iter_batches)
+    result = analysis_export.export_dataset_date(
+        data_root=data_root,
+        output_root=output_root,
+        target_date=TARGET_DATE,
+        dataset="quoted_market",
+        remote="opportunity-drive-own",
+        rclone=Path("/opt/homebrew/bin/rclone"),
+    )
+
+    assert result.row_count == 24
+    assert batch_sizes
+    assert all(size is not None and size <= 8192 for size in batch_sizes)

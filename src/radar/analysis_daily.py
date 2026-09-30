@@ -11,7 +11,14 @@ from typing import Literal
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
-from radar.analysis_export import REMOTE_NAME, ExportResult, export_market_date
+from radar.analysis_export import (
+    DATASET_NAMES,
+    DATASET_TIMESTAMP_FIELDS,
+    REMOTE_NAME,
+    DatasetName,
+    ExportResult,
+    export_dataset_date,
+)
 
 
 EXPECTED_SAMPLE_SLOTS = 8640
@@ -45,6 +52,28 @@ class DateInspection:
 
 
 @dataclass(frozen=True)
+class DatasetInspection:
+    dataset: DatasetName
+    target_date: date
+    valid: bool
+    timestamp_field: str
+    fragment_count: int
+    row_count: int
+    source_bytes: int
+    first_timestamp: datetime | None
+    last_timestamp: datetime | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class DatasetRun:
+    dataset: DatasetName
+    target_date: date
+    source_rows: int
+    result: ExportResult
+
+
+@dataclass(frozen=True)
 class DailyRunResult:
     current_date: date
     lookback_days: int
@@ -54,6 +83,8 @@ class DailyRunResult:
     selected_date: date | None = None
     export_result: ExportResult | None = None
     error: str | None = None
+    dataset_inspections: tuple[DatasetInspection, ...] = ()
+    dataset_runs: tuple[DatasetRun, ...] = ()
 
     def summary(self) -> str:
         lines = [
@@ -82,6 +113,30 @@ class DailyRunResult:
                     _format_sample(sample) for sample in inspection.missing_slots
                 )
                 lines.append(f"missing_slot_timestamps={missing}")
+
+        for dataset_inspection in self.dataset_inspections:
+            lines.append(
+                f"dataset={dataset_inspection.dataset} "
+                f"date={dataset_inspection.target_date.isoformat()} "
+                f"valid={str(dataset_inspection.valid).lower()} "
+                f"source_rows={dataset_inspection.row_count} "
+                f"fragments={dataset_inspection.fragment_count} "
+                f"first_timestamp={_format_sample(dataset_inspection.first_timestamp)} "
+                f"last_timestamp={_format_sample(dataset_inspection.last_timestamp)} "
+                f"reason={dataset_inspection.reason or 'none'}"
+            )
+
+        for dataset_run in self.dataset_runs:
+            result = dataset_run.result
+            lines.append(
+                f"dataset={dataset_run.dataset} "
+                f"date={dataset_run.target_date.isoformat()} "
+                f"source_rows={dataset_run.source_rows} "
+                f"local={result.local_path} "
+                f"converted={str(result.converted).lower()} "
+                f"uploaded={str(result.uploaded).lower()} "
+                f"remote_verified={str(result.remote_verified).lower()}"
+            )
 
         selected = (
             self.selected_date.isoformat() if self.selected_date is not None else "none"
@@ -371,6 +426,157 @@ def _inspect_market_date(
         )
 
 
+def inspect_dataset_date(
+    data_root: Path,
+    dataset: DatasetName,
+    target_date: date,
+) -> DatasetInspection:
+    partition = data_root / dataset / f"date={target_date.isoformat()}"
+    timestamp_field = DATASET_TIMESTAMP_FIELDS[dataset]
+    if not partition.is_dir():
+        return DatasetInspection(
+            dataset=dataset,
+            target_date=target_date,
+            valid=False,
+            timestamp_field=timestamp_field,
+            fragment_count=0,
+            row_count=0,
+            source_bytes=0,
+            first_timestamp=None,
+            last_timestamp=None,
+            reason="partition_missing",
+        )
+
+    try:
+        files = tuple(
+            path for path in sorted(partition.glob("part-*.parquet")) if path.is_file()
+        )
+        if not files:
+            return DatasetInspection(
+                dataset=dataset,
+                target_date=target_date,
+                valid=False,
+                timestamp_field=timestamp_field,
+                fragment_count=0,
+                row_count=0,
+                source_bytes=0,
+                first_timestamp=None,
+                last_timestamp=None,
+                reason="no_parquet_fragments",
+            )
+
+        first_schema = None
+        row_count = 0
+        source_bytes = 0
+        schema_mismatch = False
+        missing_timestamp = False
+        invalid_timestamp_schema = False
+        first_timestamp: datetime | None = None
+        last_timestamp: datetime | None = None
+        structural_reasons: list[str] = []
+
+        for path in files:
+            source_bytes += path.stat().st_size
+            parquet = pq.ParquetFile(path)
+            try:
+                schema = parquet.schema_arrow
+                if first_schema is None:
+                    first_schema = schema
+                elif not schema.equals(first_schema, check_metadata=True):
+                    schema_mismatch = True
+                row_count += parquet.metadata.num_rows
+                field_index = schema.get_field_index(timestamp_field)
+                if field_index < 0:
+                    missing_timestamp = True
+                    continue
+                field = schema.field(field_index)
+                if not pa.types.is_timestamp(field.type) or field.type.tz != "UTC":
+                    invalid_timestamp_schema = True
+                    continue
+                for batch in parquet.iter_batches(
+                    columns=[timestamp_field],
+                    batch_size=SAMPLE_SCAN_BATCH_SIZE,
+                ):
+                    for value in batch.column(0).to_pylist():
+                        if value is None:
+                            if "timestamp_null" not in structural_reasons:
+                                structural_reasons.append("timestamp_null")
+                            continue
+                        if not isinstance(value, datetime):
+                            if "timestamp_not_datetime" not in structural_reasons:
+                                structural_reasons.append("timestamp_not_datetime")
+                            continue
+                        if value.tzinfo is None or value.utcoffset() is None:
+                            if "timestamp_not_timezone_aware" not in structural_reasons:
+                                structural_reasons.append("timestamp_not_timezone_aware")
+                            continue
+                        timestamp = value.astimezone(UTC)
+                        if first_timestamp is None or timestamp < first_timestamp:
+                            first_timestamp = timestamp
+                        if last_timestamp is None or timestamp > last_timestamp:
+                            last_timestamp = timestamp
+                        if timestamp.date() != target_date:
+                            if "timestamp_wrong_date" not in structural_reasons:
+                                structural_reasons.append("timestamp_wrong_date")
+            finally:
+                close = getattr(parquet, "close", None)
+                if callable(close):
+                    close()
+
+        if row_count == 0:
+            reason = "empty_partition"
+        elif schema_mismatch:
+            reason = "schema_mismatch"
+        elif missing_timestamp:
+            reason = f"{timestamp_field}_missing"
+        elif invalid_timestamp_schema:
+            reason = f"{timestamp_field}_not_utc_timestamp"
+        elif structural_reasons:
+            reason = ",".join(structural_reasons)
+        else:
+            reason = None
+        return DatasetInspection(
+            dataset=dataset,
+            target_date=target_date,
+            valid=reason is None,
+            timestamp_field=timestamp_field,
+            fragment_count=len(files),
+            row_count=row_count,
+            source_bytes=source_bytes,
+            first_timestamp=first_timestamp,
+            last_timestamp=last_timestamp,
+            reason=reason,
+        )
+    except Exception as error:
+        return DatasetInspection(
+            dataset=dataset,
+            target_date=target_date,
+            valid=False,
+            timestamp_field=timestamp_field,
+            fragment_count=0,
+            row_count=0,
+            source_bytes=0,
+            first_timestamp=None,
+            last_timestamp=None,
+            reason=f"unreadable_parquet:{type(error).__name__}",
+        )
+
+
+def _market_dataset_inspection(inspection: DateInspection) -> DatasetInspection:
+    return DatasetInspection(
+        dataset="market",
+        target_date=inspection.target_date,
+        valid=inspection.eligible,
+        timestamp_field="sample_time",
+        fragment_count=inspection.fragment_count,
+        row_count=inspection.row_count,
+        source_bytes=inspection.source_bytes,
+        first_timestamp=inspection.first_sample,
+        last_timestamp=inspection.last_sample,
+        reason=None if inspection.eligible else inspection.reason,
+    )
+
+
 def _validate_now(now: datetime | None) -> datetime:
     current = datetime.now(UTC) if now is None else now
     if current.tzinfo is None or current.utcoffset() is None:
@@ -387,7 +593,7 @@ def run_daily(
     lookback_days: int = 7,
     min_coverage_pct: float = DEFAULT_MIN_COVERAGE_PCT,
     now: datetime | None = None,
-    exporter: Exporter = export_market_date,
+    exporter: Exporter = export_dataset_date,
 ) -> DailyRunResult:
     if remote != REMOTE_NAME:
         raise ValueError(f"remote must be exactly {REMOTE_NAME}")
@@ -401,6 +607,8 @@ def run_daily(
         for offset in range(lookback_days, 0, -1)
     )
     inspections: list[DateInspection] = []
+    dataset_inspections: list[DatasetInspection] = []
+    dataset_runs: list[DatasetRun] = []
     for target_date in candidate_dates:
         inspection = _inspect_market_date(
             data_root,
@@ -411,15 +619,21 @@ def run_daily(
         if not inspection.eligible:
             continue
 
-        try:
-            result = exporter(
-                data_root=data_root,
-                output_root=output_root,
-                target_date=target_date,
-                remote=remote,
-                rclone=rclone,
-            )
-        except Exception as error:
+        bundle_inspections = (
+            _market_dataset_inspection(inspection),
+            *(
+                inspect_dataset_date(data_root, dataset, target_date)
+                for dataset in DATASET_NAMES
+                if dataset != "market"
+            ),
+        )
+        dataset_inspections.extend(bundle_inspections)
+        invalid_dataset = next(
+            (dataset_inspection for dataset_inspection in bundle_inspections
+             if not dataset_inspection.valid),
+            None,
+        )
+        if invalid_dataset is not None:
             return DailyRunResult(
                 current_date=current_date,
                 lookback_days=lookback_days,
@@ -427,10 +641,49 @@ def run_daily(
                 inspections=tuple(inspections),
                 outcome="error",
                 selected_date=target_date,
-                error=str(error),
+                error=(
+                    f"{invalid_dataset.dataset} dataset invalid: "
+                    f"{invalid_dataset.reason or 'unknown error'}"
+                ),
+                dataset_inspections=tuple(dataset_inspections),
+                dataset_runs=tuple(dataset_runs),
             )
 
-        if result.converted or result.uploaded:
+        selected_bundle_runs: list[DatasetRun] = []
+        actual_work = False
+        for dataset in DATASET_NAMES:
+            try:
+                result = exporter(
+                    data_root=data_root,
+                    output_root=output_root,
+                    target_date=target_date,
+                    dataset=dataset,
+                    remote=remote,
+                    rclone=rclone,
+                )
+            except Exception as error:
+                return DailyRunResult(
+                    current_date=current_date,
+                    lookback_days=lookback_days,
+                    min_coverage_pct=min_coverage_pct,
+                    inspections=tuple(inspections),
+                    outcome="error",
+                    selected_date=target_date,
+                    error=f"{dataset} export failed: {error}",
+                    dataset_inspections=tuple(dataset_inspections),
+                    dataset_runs=tuple(dataset_runs),
+                )
+            run = DatasetRun(
+                dataset=dataset,
+                target_date=target_date,
+                source_rows=result.row_count,
+                result=result,
+            )
+            selected_bundle_runs.append(run)
+            dataset_runs.append(run)
+            actual_work = actual_work or result.converted or result.uploaded
+
+        if actual_work:
             return DailyRunResult(
                 current_date=current_date,
                 lookback_days=lookback_days,
@@ -438,7 +691,9 @@ def run_daily(
                 inspections=tuple(inspections),
                 outcome="work_completed",
                 selected_date=target_date,
-                export_result=result,
+                export_result=selected_bundle_runs[0].result,
+                dataset_inspections=tuple(dataset_inspections),
+                dataset_runs=tuple(dataset_runs),
             )
 
     outcome: Outcome = "no_work" if any(
@@ -450,6 +705,8 @@ def run_daily(
         min_coverage_pct=min_coverage_pct,
         inspections=tuple(inspections),
         outcome=outcome,
+        dataset_inspections=tuple(dataset_inspections),
+        dataset_runs=tuple(dataset_runs),
     )
 
 
