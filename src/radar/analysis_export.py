@@ -280,9 +280,13 @@ def _run_rclone(
 
     if completed.returncode != 0:
         operation = argv[1] if len(argv) > 1 else "command"
-        detail = "rate-limited" if _rate_limited(completed.stderr or "") else (
-            f"exit code {completed.returncode}"
-        )
+        stderr = completed.stderr or ""
+        if _rate_limited(stderr):
+            detail = "rate-limited"
+        elif "directory not found" in stderr.lower():
+            detail = "directory not found"
+        else:
+            detail = f"exit code {completed.returncode}"
         raise ExportError(f"rclone {operation} failed ({detail})")
     return completed
 
@@ -292,16 +296,21 @@ def _remote_file(
     remote_parent: str,
     filename: str,
 ) -> _RemoteFile | None:
-    listing = _run_rclone(
-        [
-            str(rclone),
-            "lsl",
-            remote_parent,
-            "--include",
-            filename,
-        ],
-        timeout_seconds=RCLONE_TIMEOUT_SECONDS,
-    )
+    try:
+        listing = _run_rclone(
+            [
+                str(rclone),
+                "lsl",
+                remote_parent,
+                "--include",
+                filename,
+            ],
+            timeout_seconds=RCLONE_TIMEOUT_SECONDS,
+        )
+    except ExportError as error:
+        if "directory not found" in str(error).lower():
+            return None
+        raise
     remote_size: int | None = None
     for line in (listing.stdout or "").splitlines():
         parts = line.split(maxsplit=3)

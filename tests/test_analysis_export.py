@@ -245,6 +245,44 @@ class FakeRclone:
         raise AssertionError(f"unexpected rclone operation: {operation}")
 
 
+class MissingDirectorySubprocess:
+    def __init__(self, local_path: Path) -> None:
+        self.local_path = local_path
+        self.calls: list[tuple[str, ...]] = []
+        self.remote_exists = False
+        self.remote_size = 0
+        self.remote_md5 = ""
+
+    def __call__(
+        self,
+        argv: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(tuple(argv))
+        if argv[1] == "lsl" and not self.remote_exists:
+            return subprocess.CompletedProcess(argv, 3, "", "directory not found")
+        if argv[1] == "md5sum":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                f"{self.remote_md5} date=2026-09-29.csv.gz\n",
+                "",
+            )
+        if argv[1] == "copyto":
+            self.remote_exists = True
+            self.remote_size = self.local_path.stat().st_size
+            self.remote_md5 = hashlib.md5(self.local_path.read_bytes()).hexdigest()
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[1] == "lsl":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                f"{self.remote_size} 2026-09-30 00:00:00 date=2026-09-29.csv.gz\n",
+                "",
+            )
+        raise AssertionError(argv[1])
+
+
 def _run_export(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -392,6 +430,30 @@ def test_remote_mismatch_fails_closed_without_copying(
 
     assert output.read_bytes() == original_bytes
     assert not any(call[1] == "copyto" for call in mismatch.calls)
+
+
+def test_missing_remote_dataset_directory_is_treated_as_absent_and_uploaded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "data"
+    output_root = tmp_path / "analysis"
+    _write_market_parts(data_root, _source_rows())
+    output = output_root / "market" / f"date={DATE_TEXT}.csv.gz"
+    fake = MissingDirectorySubprocess(output)
+    monkeypatch.setattr(analysis_export.subprocess, "run", fake)
+
+    result = analysis_export.export_market_date(
+        data_root=data_root,
+        output_root=output_root,
+        target_date=TARGET_DATE,
+        remote="opportunity-drive-own",
+        rclone=Path("/opt/homebrew/bin/rclone"),
+    )
+
+    assert result.uploaded is True
+    assert result.remote_verified is True
+    assert any(call[1] == "copyto" for call in fake.calls)
 
 
 def test_rate_limit_failure_returns_nonzero_and_preserves_local_output(
