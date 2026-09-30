@@ -57,6 +57,13 @@ def _complete_partition(data_root: Path, target_date: date) -> Path:
     return _write_partition(data_root, target_date, _slots(target_date))
 
 
+def _closed_partial_slots(target_date: date, slot_count: int) -> list[datetime]:
+    """Return a slot set with both day boundaries preserved."""
+    if slot_count == 8640:
+        return _slots(target_date)
+    return _slots(target_date)[: slot_count - 1] + [_slots(target_date)[-1]]
+
+
 def _result(target_date: date, *, converted: bool, uploaded: bool) -> ExportResult:
     return ExportResult(
         local_path=Path(f"/tmp/date={target_date.isoformat()}.csv.gz"),
@@ -97,22 +104,54 @@ def test_exactly_8640_aligned_slots_are_complete(tmp_path: Path) -> None:
     inspection = analysis_daily.inspect_market_date(tmp_path / "data", target_date)
 
     assert inspection.complete is True
+    assert inspection.quality == "complete"
+    assert inspection.eligible is True
     assert inspection.slot_count == 8640
+    assert inspection.missing_slots == ()
     assert inspection.reason is None
     assert inspection.fragment_count == 2
 
 
-@pytest.mark.parametrize("slot_count", [8639, 8630])
-def test_incomplete_slot_counts_are_rejected(tmp_path: Path, slot_count: int) -> None:
+@pytest.mark.parametrize("slot_count", [8639, 8630, 8623])
+def test_threshold_eligible_slot_counts_are_partial(
+    tmp_path: Path,
+    slot_count: int,
+) -> None:
     target_date = date(2026, 9, 29)
-    _write_partition(tmp_path / "data", target_date, _slots(target_date)[:slot_count])
+    _write_partition(
+        tmp_path / "data",
+        target_date,
+        _closed_partial_slots(target_date, slot_count),
+    )
 
     inspection = analysis_daily.inspect_market_date(tmp_path / "data", target_date)
 
     assert inspection.complete is False
+    assert inspection.quality == "partial"
+    assert inspection.eligible is True
     assert inspection.slot_count == slot_count
-    assert inspection.reason is not None
-    assert "slot_count" in inspection.reason
+    assert inspection.coverage_pct == pytest.approx(slot_count / 8640 * 100)
+
+
+def test_below_threshold_is_rejected(tmp_path: Path) -> None:
+    target_date = date(2026, 9, 29)
+    _write_partition(
+        tmp_path / "data",
+        target_date,
+        _closed_partial_slots(target_date, 8622),
+    )
+
+    inspection = analysis_daily.inspect_market_date(tmp_path / "data", target_date)
+
+    assert inspection.quality == "rejected"
+    assert inspection.eligible is False
+    assert inspection.slot_count == 8622
+    assert inspection.reason == "coverage_below_threshold"
+
+
+def test_threshold_calculation_uses_ceil() -> None:
+    assert analysis_daily.minimum_required_slots(99.8) == 8623
+    assert analysis_daily.minimum_required_slots(99.79) == 8622
 
 
 def test_missing_beginning_slot_is_rejected(tmp_path: Path) -> None:
@@ -123,6 +162,8 @@ def test_missing_beginning_slot_is_rejected(tmp_path: Path) -> None:
     inspection = analysis_daily.inspect_market_date(tmp_path / "data", target_date)
 
     assert inspection.complete is False
+    assert inspection.quality == "rejected"
+    assert inspection.eligible is False
     assert inspection.slot_count == 8639
     assert inspection.reason is not None
     assert "missing_start" in inspection.reason
@@ -136,6 +177,8 @@ def test_missing_ending_slot_is_rejected(tmp_path: Path) -> None:
     inspection = analysis_daily.inspect_market_date(tmp_path / "data", target_date)
 
     assert inspection.complete is False
+    assert inspection.quality == "rejected"
+    assert inspection.eligible is False
     assert inspection.slot_count == 8639
     assert inspection.reason is not None
     assert "missing_end" in inspection.reason
@@ -150,8 +193,42 @@ def test_unaligned_sample_time_is_rejected(tmp_path: Path) -> None:
     inspection = analysis_daily.inspect_market_date(tmp_path / "data", target_date)
 
     assert inspection.complete is False
+    assert inspection.quality == "rejected"
+    assert inspection.eligible is False
     assert inspection.reason is not None
     assert "unaligned" in inspection.reason
+
+
+def test_outside_date_sample_time_is_rejected(tmp_path: Path) -> None:
+    target_date = date(2026, 9, 29)
+    sample_times = _slots(target_date)
+    sample_times[100] = datetime(2026, 9, 30, tzinfo=UTC)
+    _write_partition(tmp_path / "data", target_date, sample_times)
+
+    inspection = analysis_daily.inspect_market_date(tmp_path / "data", target_date)
+
+    assert inspection.quality == "rejected"
+    assert inspection.eligible is False
+    assert inspection.reason == "sample_time_wrong_date"
+
+
+def test_custom_min_coverage_percentage(tmp_path: Path) -> None:
+    target_date = date(2026, 9, 29)
+    _write_partition(
+        tmp_path / "data",
+        target_date,
+        _closed_partial_slots(target_date, 8630),
+    )
+
+    inspection = analysis_daily.inspect_market_date(
+        tmp_path / "data",
+        target_date,
+        min_coverage_pct=99.9,
+    )
+
+    assert inspection.quality == "rejected"
+    assert inspection.eligible is False
+    assert inspection.reason == "coverage_below_threshold"
 
 
 def test_current_utc_date_is_never_eligible(tmp_path: Path) -> None:
@@ -192,9 +269,11 @@ def test_lookback_is_oldest_to_newest_and_current_date_is_excluded(
     assert result.outcome == "no_work"
 
 
-def test_previously_incomplete_date_can_become_eligible_later(tmp_path: Path) -> None:
+def test_already_exported_partial_date_can_be_passed_over_idempotently(
+    tmp_path: Path,
+) -> None:
     target_date = NOW.date() - timedelta(days=2)
-    incomplete = _slots(target_date)[:-1]
+    incomplete = _closed_partial_slots(target_date, 8639)
     _write_partition(tmp_path / "data", target_date, incomplete)
     calls: list[date] = []
 
@@ -202,25 +281,84 @@ def test_previously_incomplete_date_can_become_eligible_later(tmp_path: Path) ->
         target = kwargs["target_date"]
         assert isinstance(target, date)
         calls.append(target)
-        return _result(target, converted=True, uploaded=True)
+        return _result(
+            target,
+            converted=len(calls) > 1,
+            uploaded=len(calls) > 1,
+        )
 
     first = _run_kwargs(tmp_path, lookback_days=2, exporter=exporter)
-    assert first.outcome == "incomplete_only"
-    assert calls == []
+    assert first.outcome == "no_work"
+    assert calls == [target_date]
+    assert first.inspections[0].quality == "partial"
+    assert first.inspections[0].eligible is True
 
-    _write_partition(tmp_path / "data", target_date, _slots(target_date), fragments=3)
+    _write_partition(
+        tmp_path / "data",
+        target_date,
+        _slots(target_date),
+        fragments=3,
+    )
     second = _run_kwargs(tmp_path, lookback_days=2, exporter=exporter)
 
     assert second.outcome == "work_completed"
+    assert calls == [target_date, target_date]
+    assert second.export_result is not None
+    assert second.export_result.converted is True
+
+
+def test_rejected_date_never_invokes_exporter(tmp_path: Path) -> None:
+    target_date = NOW.date() - timedelta(days=1)
+    _write_partition(
+        tmp_path / "data",
+        target_date,
+        _closed_partial_slots(target_date, 8622),
+    )
+    calls: list[date] = []
+
+    def exporter(**kwargs: object) -> ExportResult:
+        calls.append(kwargs["target_date"])  # type: ignore[arg-type]
+        raise AssertionError("rejected date must not be exported")
+
+    result = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter)
+
+    assert result.outcome == "incomplete_only"
+    assert result.inspections[0].quality == "rejected"
+    assert calls == []
+
+
+def test_partial_date_can_invoke_exporter(tmp_path: Path) -> None:
+    target_date = NOW.date() - timedelta(days=1)
+    _write_partition(
+        tmp_path / "data",
+        target_date,
+        _closed_partial_slots(target_date, 8630),
+    )
+    calls: list[date] = []
+
+    def exporter(**kwargs: object) -> ExportResult:
+        target = kwargs["target_date"]
+        assert isinstance(target, date)
+        calls.append(target)
+        return _result(target, converted=False, uploaded=False)
+
+    result = _run_kwargs(tmp_path, lookback_days=1, exporter=exporter)
+
+    assert result.outcome == "no_work"
     assert calls == [target_date]
+    assert result.inspections[0].quality == "partial"
 
 
-def test_already_exported_complete_date_is_passed_over_to_newer_work(
+def test_already_exported_partial_date_is_passed_over_to_newer_work(
     tmp_path: Path,
 ) -> None:
     older = NOW.date() - timedelta(days=2)
     newer = NOW.date() - timedelta(days=1)
-    _complete_partition(tmp_path / "data", older)
+    _write_partition(
+        tmp_path / "data",
+        older,
+        _closed_partial_slots(older, 8630),
+    )
     _complete_partition(tmp_path / "data", newer)
     calls: list[date] = []
 
@@ -292,6 +430,48 @@ def test_remote_name_is_rejected_without_fallback(tmp_path: Path) -> None:
             exporter=exporter,
             remote="opportunity-drive",
         )
+
+
+@pytest.mark.parametrize("coverage", [0.0, 100.01])
+def test_min_coverage_percentage_is_validated(
+    tmp_path: Path,
+    coverage: float,
+) -> None:
+    with pytest.raises(ValueError, match="min_coverage_pct"):
+        analysis_daily.run_daily(
+            data_root=tmp_path / "data",
+            output_root=tmp_path / "analysis",
+            remote="opportunity-drive-own",
+            rclone=Path("/opt/homebrew/bin/rclone"),
+            lookback_days=1,
+            min_coverage_pct=coverage,
+        )
+
+
+def test_summary_reports_quality_and_partial_missing_slots(tmp_path: Path) -> None:
+    target_date = NOW.date() - timedelta(days=1)
+    _write_partition(
+        tmp_path / "data",
+        target_date,
+        _closed_partial_slots(target_date, 8630),
+    )
+
+    result = _run_kwargs(
+        tmp_path,
+        lookback_days=1,
+        exporter=lambda **kwargs: _result(
+            kwargs["target_date"],  # type: ignore[arg-type]
+            converted=False,
+            uploaded=False,
+        ),
+    )
+
+    summary = result.summary()
+    assert "quality=partial" in summary
+    assert "eligible=true" in summary
+    assert "expected_slots=8640" in summary
+    assert "missing_slots=10" in summary
+    assert "missing_slot_timestamps=" in summary
 
 
 def test_source_is_not_modified_by_completeness_check(tmp_path: Path) -> None:
