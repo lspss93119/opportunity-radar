@@ -226,6 +226,14 @@ def test_anomalies_http_route_and_page_are_available(tmp_path):
     thread.start()
     try:
         host, port = server.server_address
+        with urlopen(f"http://{host}:{port}/") as response:
+            root_html = response.read().decode()
+            assert response.status == 200
+            assert 'id="anomalies-view"' in root_html
+        with urlopen(f"http://{host}:{port}/opportunities") as response:
+            all_pairs_html = response.read().decode()
+            assert response.status == 200
+            assert 'id="opportunities-view"' in all_pairs_html
         with urlopen(f"http://{host}:{port}/anomalies") as response:
             html = response.read().decode()
             assert response.status == 200
@@ -243,3 +251,13 @@ def test_anomalies_http_route_and_page_are_available(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_anomaly_filters_are_exposed_in_primary_view():
+    from radar.dashboard import HTML
+
+    assert 'id="anomaly-filters"' in HTML
+    assert 'id="anomaly-symbol"' in HTML
+    assert 'id="anomaly-long-venue"' in HTML
+    assert 'id="anomaly-short-venue"' in HTML
+    assert 'id="anomaly-eligible-only"' in HTML

@@ -368,3 +368,88 @@ def test_load_recent_pair_points_hydrates_all_directional_pairs_and_excludes_aso
     assert points[key][0][0] == sample_time
     assert points[key][0][1] == pytest.approx((101.0 / 99.0 - 1.0) * 10_000)
     assert all(point[0] < AS_OF for values in points.values() for point in values)
+
+
+def test_v2_hydration_applies_optional_observation_skew_validation(tmp_path):
+    sample_time = AS_OF - timedelta(seconds=10)
+    long_snapshot, short_snapshot = make_pair(
+        sample_time,
+        observed_at=sample_time + timedelta(seconds=6),
+    )
+    write_markets(tmp_path, [long_snapshot, short_snapshot])
+    history = SpreadHistory(tmp_path / "data")
+    key = SpreadPairKey("BTC", "lighter", "BTC", "hyperliquid", "BTC")
+
+    legacy = history.load_recent_pair_points(
+        primary_size_usd=10_000,
+        as_of=AS_OF,
+    )
+    strict = history.load_recent_pair_points(
+        primary_size_usd=10_000,
+        as_of=AS_OF,
+        stale_after_seconds=5,
+    )
+
+    assert key in legacy
+    assert key not in strict
+
+
+def test_v2_hydration_keeps_latest_valid_duplicate_and_pair_identity(tmp_path):
+    sample_time = AS_OF - timedelta(seconds=10)
+    long_snapshot, short_snapshot = make_pair(
+        sample_time,
+        observed_at=sample_time + timedelta(seconds=1),
+        long_buy=100.0,
+        short_sell=101.0,
+    )
+    newer_long = long_snapshot.model_copy(
+        update={
+            "observed_at": sample_time + timedelta(seconds=2),
+            "buy_10k_vwap": 99.0,
+        }
+    )
+    write_markets(tmp_path, [long_snapshot, short_snapshot, newer_long])
+
+    points = SpreadHistory(tmp_path / "data").load_recent_pair_points(
+        primary_size_usd=10_000,
+        as_of=AS_OF,
+        stale_after_seconds=5,
+    )
+
+    key = SpreadPairKey("BTC", "lighter", "BTC", "hyperliquid", "BTC")
+    assert key in points
+    assert points[key][0][0] == sample_time
+    assert points[key][0][1] == pytest.approx((101.0 / 99.0 - 1.0) * 10_000)
+
+
+def test_v2_hydration_mean_matches_replay_mean_on_same_fixture(tmp_path):
+    from radar.history.anomaly_replay import _ContextHistory
+
+    values = [100.0, 101.0, 99.5, 102.0, 100.5]
+    snapshots: list[MarketSnapshot] = []
+    for index, raw_spread in enumerate(values, start=1):
+        sample_time = AS_OF - timedelta(seconds=index * 10)
+        long_snapshot, short_snapshot = make_pair(
+            sample_time,
+            long_buy=100.0,
+            short_sell=100.0 * (1.0 + raw_spread / 10_000.0),
+            observed_at=sample_time + timedelta(seconds=1),
+        )
+        snapshots.extend((long_snapshot, short_snapshot))
+    write_markets(tmp_path, snapshots)
+
+    key = SpreadPairKey("BTC", "lighter", "BTC", "hyperliquid", "BTC")
+    points = SpreadHistory(tmp_path / "data").load_recent_pair_points(
+        primary_size_usd=10_000,
+        as_of=AS_OF,
+        window=timedelta(seconds=60),
+        stale_after_seconds=5,
+    )
+    replay = _ContextHistory()
+    for sample_time, raw_spread in points[key]:
+        replay.append(sample_time, raw_spread)
+
+    live_mean = sum(raw_spread for _, raw_spread in points[key]) / len(points[key])
+    replay_mean = replay.stats_before(AS_OF, 60).mean_bps
+
+    assert replay_mean == pytest.approx(live_mean)

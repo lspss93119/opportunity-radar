@@ -218,6 +218,28 @@ class AnomalyV2Lifecycle:
                     alerts,
                     events,
                 )
+        for key, tracker in tuple(self._trackers.items()):
+            if key in candidates:
+                continue
+            transitions = tracker.advance_time(current_time)
+            state_record = self._states.get(key)
+            for transition in transitions:
+                if transition.kind != "resolved" or state_record is None:
+                    continue
+                state_record.episode = transition.episode
+                alert = self._alert_for(
+                    "anomaly_resolved",
+                    transition.episode,
+                    state_record.candidate,
+                    current_time,
+                    state,
+                )
+                events.append(self._event("anomaly_resolved", alert, transition.at))
+                self._states.pop(key, None)
+            if tracker.active_episode is None:
+                # Unconfirmed gaps are abandoned without a lifecycle event;
+                # remove their persisted wrapper state as well.
+                self._states.pop(key, None)
         # A tracker with no active episode has no restartable live state.
         for key, tracker in tuple(self._trackers.items()):
             if tracker.active_episode is None:

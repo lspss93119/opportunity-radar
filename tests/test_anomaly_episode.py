@@ -241,6 +241,28 @@ def test_data_gap_abandons_candidate_and_resolves_confirmed_episode():
     assert transitions[0].episode.ended_at == START + timedelta(seconds=60)
 
 
+def test_advance_time_expires_missing_candidates_without_synthetic_observations():
+    candidate = tracker(max_gap=20)
+    candidate.observe(observation(0, raw=112.0))
+
+    assert candidate.advance_time(START + timedelta(seconds=20)) == ()
+    assert candidate.active_episode is not None
+    assert candidate.advance_time(START + timedelta(seconds=21)) == ()
+    assert candidate.active_episode is None
+
+    confirmed = tracker(max_gap=20)
+    for seconds in range(0, 61, 10):
+        confirmed.observe(observation(seconds, raw=112.0))
+
+    transitions = confirmed.advance_time(START + timedelta(seconds=81))
+
+    assert [transition.kind for transition in transitions] == ["resolved"]
+    assert transitions[0].episode.resolution_reason == "data_gap"
+    assert transitions[0].episode.ended_at == START + timedelta(seconds=60)
+    assert transitions[0].episode.end_spread_bps == 112.0
+    assert confirmed.active_episode is None
+
+
 def test_active_episode_at_end_is_marked_open_at_end():
     instance = tracker(max_gap=120)
     instance.observe(observation(0, raw=112.0))

@@ -562,10 +562,17 @@ def build_application(
     )
     history = SpreadHistory(Path(data_root))
     monitors = build_enabled_monitors(config, runtime_store=runtime_store)
-    history_points = history.load_recent_pair_points(
-        primary_size_usd=config.monitors.spread.primary_size_usd,
-        as_of=clock(),
-    )
+    if config.monitors.spread.anomaly_v2.enabled:
+        history_points = history.load_recent_pair_points(
+            primary_size_usd=config.monitors.spread.primary_size_usd,
+            as_of=clock(),
+            stale_after_seconds=config.monitors.spread.stale_after_seconds,
+        )
+    else:
+        history_points = history.load_recent_pair_points(
+            primary_size_usd=config.monitors.spread.primary_size_usd,
+            as_of=clock(),
+        )
     for monitor in monitors:
         hydrate_history = getattr(monitor, "hydrate_history", None)
         if callable(hydrate_history):

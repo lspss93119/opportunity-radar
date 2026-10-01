@@ -218,7 +218,7 @@ nav a[aria-current="page"] { background: #374151; color: #fff; }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 18px; }
 .card { background: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 14px; overflow-wrap: anywhere; }
 .metric-value { margin-top: 6px; font-size: 1rem; }
-#filters { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; margin-bottom: 16px; }
+#filters, #anomaly-filters { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; margin-bottom: 16px; }
 label { display: grid; gap: 5px; font-size: .78rem; color: #cbd5e1; }
 input, button { font: inherit; color: #e5e7eb; background: #1f2937; border: 1px solid #4b5563; border-radius: 5px; padding: 8px; }
 input { width: 130px; }
@@ -245,7 +245,7 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 #pair-chart svg { display: block; width: 100%; height: auto; }
 .chart-legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0; font-size: .8rem; }
 .raw-color { color: #93c5fd; } .mean-color { color: #fcd34d; } .current-color { color: #6ee7b7; }
-@media(max-width: 760px) { main { padding: 14px; } #filters label:not(.check) { flex: 1 1 130px; } input { width: 100%; } }
+@media(max-width: 760px) { main { padding: 14px; } #filters label:not(.check), #anomaly-filters label:not(.check) { flex: 1 1 130px; } input { width: 100%; } }
 </style>
 </head>
 <body data-view="__VIEW__">
@@ -257,6 +257,13 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 <section id="anomalies-view">
 <h2>Active Anomalies</h2>
 <p class="muted">Confirmed v2 episodes only · lifecycle and Telegram state come from read-only SQLite.</p>
+<form id="anomaly-filters">
+<label>Symbol<input id="anomaly-symbol" name="symbol" placeholder="All symbols"></label>
+<label>Long venue<input id="anomaly-long-venue" name="long_venue" placeholder="All venues"></label>
+<label>Short venue<input id="anomaly-short-venue" name="short_venue" placeholder="All venues"></label>
+<label class="check"><input id="anomaly-eligible-only" name="eligible_only" type="checkbox">TG eligible only</label>
+<button type="submit">Apply filters</button><button id="anomaly-reset" type="button">Reset</button>
+</form>
 <div class="table-wrap"><table aria-label="Active anomalies"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>Current</th><th>Reference</th><th>Deviation</th><th>Age</th><th>Peak</th><th>12h / 24h / 48h</th><th>Alignment</th><th>Telegram</th></tr></thead><tbody id="anomaly-rows"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody></table></div>
 </section>
 <section id="opportunities-view">
@@ -310,16 +317,26 @@ const text = (id, value) => { byId(id).textContent = value ?? 'Unavailable'; };
 const emptyRow = (columns, message) => '<tr><td colspan="' + columns + '" class="muted">' + esc(message) + '</td></tr>';
 const cell = value => '<td>' + esc(value) + '</td>';
 const filterNames = ['symbol','long_venue','short_venue','max_std','min_deviation','min_duration','limit'];
+const anomalyFilterNames = ['symbol','long_venue','short_venue'];
 const isStatus = location.pathname === '/status';
 const isPair = location.pathname === '/pair';
-const isAnomalies = location.pathname === '/anomalies';
+const isAnomalies = location.pathname === '/' || location.pathname === '/anomalies';
 if (!isPair) byId(isAnomalies ? 'nav-anomalies' : isStatus ? 'nav-status' : 'nav-opportunities').setAttribute?.('aria-current', 'page');
 function restoreFilters() {
   const query = new URLSearchParams(location.search);
-  for (const name of filterNames) byId(name).value = query.get(name) ?? '';
-  byId('active_only').checked = query.get('active_only') === 'true';
+  if (isAnomalies) {
+    for (const name of anomalyFilterNames) byId('anomaly-' + name.replace('_', '-')).value = query.get(name) ?? '';
+    byId('anomaly-eligible-only').checked = query.get('eligible_only') === 'true';
+  } else {
+    for (const name of filterNames) byId(name).value = query.get(name) ?? '';
+    byId('active_only').checked = query.get('active_only') === 'true';
+  }
 }
 function filterQuery() {
+  if (isAnomalies) return anomalyFilterQuery();
+  return opportunityFilterQuery();
+}
+function opportunityFilterQuery() {
   const query = new URLSearchParams();
   for (const name of filterNames) {
     let value = byId(name).value.trim();
@@ -328,6 +345,17 @@ function filterQuery() {
     if (value) query.set(name, value);
   }
   if (byId('active_only').checked) query.set('active_only', 'true');
+  return query;
+}
+function anomalyFilterQuery() {
+  const query = new URLSearchParams();
+  for (const name of anomalyFilterNames) {
+    let value = byId('anomaly-' + name.replace('_', '-')).value.trim();
+    if (name === 'symbol') value = value.toUpperCase();
+    if (name.endsWith('_venue')) value = value.toLowerCase();
+    if (value) query.set(name, value);
+  }
+  if (byId('anomaly-eligible-only').checked) query.set('eligible_only', 'true');
   return query;
 }
 function pairLink(row) {
@@ -519,18 +547,33 @@ byId('pair-range').addEventListener('change', () => {
   history.replaceState(null, '', location.pathname + '?' + query.toString());
   refresh(query);
 });
-byId('filters').addEventListener('submit', event => {
-  event.preventDefault();
-  const query = filterQuery();
-  history.replaceState(null, '', location.pathname + (query.size ? '?' + query.toString() : ''));
-  refresh(query);
-});
-byId('reset').addEventListener('click', () => {
-  for (const name of filterNames) byId(name).value = '';
-  byId('active_only').checked = false;
-  history.replaceState(null, '', location.pathname);
-  refresh(new URLSearchParams());
-});
+if (isAnomalies) {
+  byId('anomaly-filters').addEventListener('submit', event => {
+    event.preventDefault();
+    const query = anomalyFilterQuery();
+    history.replaceState(null, '', location.pathname + (query.size ? '?' + query.toString() : ''));
+    refresh(query);
+  });
+  byId('anomaly-reset').addEventListener('click', () => {
+    for (const name of anomalyFilterNames) byId('anomaly-' + name.replace('_', '-')).value = '';
+    byId('anomaly-eligible-only').checked = false;
+    history.replaceState(null, '', location.pathname);
+    refresh(new URLSearchParams());
+  });
+} else if (!isStatus && !isPair) {
+  byId('filters').addEventListener('submit', event => {
+    event.preventDefault();
+    const query = opportunityFilterQuery();
+    history.replaceState(null, '', location.pathname + (query.size ? '?' + query.toString() : ''));
+    refresh(query);
+  });
+  byId('reset').addEventListener('click', () => {
+    for (const name of filterNames) byId(name).value = '';
+    byId('active_only').checked = false;
+    history.replaceState(null, '', location.pathname);
+    refresh(new URLSearchParams());
+  });
+}
 window.addEventListener('popstate', () => { restoreFilters(); restorePairRange(); refresh(); });
 refresh();
 setInterval(() => { if (!requestInFlight) refresh(); }, 10000);
@@ -550,7 +593,7 @@ def _handler_for(
                 view = (
                     "pair" if path == "/pair" else
                     "status" if path == "/status" else
-                    "opportunities" if path in ("/", "/opportunities") else
+                    "opportunities" if path == "/opportunities" else
                     "anomalies"
                 )
                 self._send(200, "text/html; charset=utf-8", HTML.replace("__VIEW__", view).encode("utf-8"))

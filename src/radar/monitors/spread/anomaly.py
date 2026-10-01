@@ -322,28 +322,22 @@ class AnomalyTracker:
             ),
         }
 
+    def advance_time(self, timestamp: datetime) -> tuple[AnomalyTransition, ...]:
+        """Expire an active episode when its observation gap is too large."""
+        sample_time = _as_utc(timestamp, "timestamp")
+        if self._active_episode is None:
+            return ()
+        if self._last_sample_time is not None and sample_time < self._last_sample_time:
+            raise ValueError("timestamp must not move backwards")
+        return self._expire_gap(sample_time)
+
     def observe(self, observation: AnomalyObservation) -> tuple[AnomalyTransition, ...]:
         sample_time = observation.sample_time
         if self._last_sample_time is not None and sample_time < self._last_sample_time:
             raise ValueError("sample_time must not move backwards")
 
-        transitions: list[AnomalyTransition] = []
+        transitions = list(self._expire_gap(sample_time))
         episode = self._active_episode
-        if episode is not None:
-            gap_seconds = (sample_time - episode.last_seen_at).total_seconds()
-            if gap_seconds > self.parameters.max_gap_seconds:
-                if episode.is_confirmed:
-                    transitions.append(
-                        self._resolve(
-                            episode,
-                            ended_at=episode.last_seen_at,
-                            end_spread=episode.current_spread_bps,
-                            reason="data_gap",
-                        )
-                    )
-                else:
-                    self._active_episode = None
-                episode = self._active_episode
 
         if episode is None:
             if self._qualifies(observation):
@@ -398,6 +392,25 @@ class AnomalyTracker:
 
         self._last_sample_time = sample_time
         return tuple(transitions)
+
+    def _expire_gap(self, sample_time: datetime) -> tuple[AnomalyTransition, ...]:
+        episode = self._active_episode
+        if episode is None:
+            return ()
+        gap_seconds = (sample_time - episode.last_seen_at).total_seconds()
+        if gap_seconds <= self.parameters.max_gap_seconds:
+            return ()
+        if not episode.is_confirmed:
+            self._active_episode = None
+            return ()
+        return (
+            self._resolve(
+                episode,
+                ended_at=episode.last_seen_at,
+                end_spread=episode.current_spread_bps,
+                reason="data_gap",
+            ),
+        )
 
     def finalize(self) -> AnomalyEpisode | None:
         episode = self._active_episode

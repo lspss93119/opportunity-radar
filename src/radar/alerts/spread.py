@@ -21,6 +21,8 @@ from radar.storage.sqlite import SQLiteRuntimeStore
 
 SUPPORTED_SIZES = frozenset({1_000, 5_000, 10_000})
 LOGGER = logging.getLogger(__name__)
+ANOMALY_CONTEXT_QUERY_ATTEMPTS = 3
+ANOMALY_CONTEXT_QUERY_DELAY_SECONDS = 0.05
 
 
 def _require_text(payload: Mapping[str, JSONValue], field_name: str) -> str:
@@ -666,21 +668,7 @@ class SpreadAlertProcessor:
             except (TypeError, ValueError):
                 context = None
         if context is None and details.confirmed_at is not None:
-            try:
-                context = await asyncio.to_thread(
-                    self._history.query_anomaly_context,
-                    canonical_symbol=details.canonical_symbol,
-                    long_venue=details.long_venue,
-                    long_venue_symbol=details.long_venue_symbol,
-                    short_venue=details.short_venue,
-                    short_venue_symbol=details.short_venue_symbol,
-                    primary_size_usd=details.primary_size_usd,
-                    confirmed_at=details.confirmed_at,
-                    stale_after_seconds=self._stale_after_seconds,
-                )
-            except Exception:  # noqa: BLE001
-                LOGGER.error("anomaly context query failed for alert_id=%s", alert.event_id)
-                context = AnomalyConfirmationContext.empty()
+            context = await self._query_anomaly_context_with_retry(details)
 
         if context is None:
             context = AnomalyConfirmationContext.empty()
@@ -770,3 +758,32 @@ class SpreadAlertProcessor:
         elif delivery_kind == "anomaly_return":
             notification["return_sent_at"] = current_time.isoformat()
         self._anomaly_notifications.set(details.episode_id, notification, now=current_time)
+
+    async def _query_anomaly_context_with_retry(
+        self,
+        details: AnomalyAlertDetails,
+    ) -> AnomalyConfirmationContext:
+        confirmed_at = details.confirmed_at
+        if confirmed_at is None:
+            raise ValueError("anomaly context requires confirmed_at")
+        last_error: Exception | None = None
+        for attempt in range(ANOMALY_CONTEXT_QUERY_ATTEMPTS):
+            try:
+                return await asyncio.to_thread(
+                    self._history.query_anomaly_context,
+                    canonical_symbol=details.canonical_symbol,
+                    long_venue=details.long_venue,
+                    long_venue_symbol=details.long_venue_symbol,
+                    short_venue=details.short_venue,
+                    short_venue_symbol=details.short_venue_symbol,
+                    primary_size_usd=details.primary_size_usd,
+                    confirmed_at=confirmed_at,
+                    stale_after_seconds=self._stale_after_seconds,
+                )
+            except Exception as error:  # noqa: BLE001
+                last_error = error
+                if attempt + 1 < ANOMALY_CONTEXT_QUERY_ATTEMPTS:
+                    await asyncio.sleep(ANOMALY_CONTEXT_QUERY_DELAY_SECONDS)
+        LOGGER.error("anomaly context query failed after retries", exc_info=last_error)
+        assert last_error is not None
+        raise last_error

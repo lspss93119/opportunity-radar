@@ -254,12 +254,15 @@ class SpreadHistory:
         primary_size_usd: int,
         as_of: datetime,
         window: timedelta = timedelta(days=1),
+        stale_after_seconds: int | None = None,
     ) -> dict[SpreadPairKey, tuple[tuple[datetime, float], ...]]:
         """Load one bounded prior window for stable-basis monitor hydration."""
         try:
             buy_column, sell_column = VWAP_COLUMNS[primary_size_usd]
         except KeyError as exc:
             raise ValueError("primary_size_usd must be 1000, 5000, or 10000") from exc
+        if stale_after_seconds is not None and stale_after_seconds <= 0:
+            raise ValueError("stale_after_seconds must be positive")
 
         as_of_utc = _as_utc(as_of, "as_of")
         market_files = tuple(
@@ -311,6 +314,12 @@ class SpreadHistory:
                 sample_time_utc = _as_utc(sample_time, "sample_time")
                 observed_at_utc = _as_utc(observed_at, "observed_at")
             except (AttributeError, TypeError, ValueError):
+                continue
+            if (
+                stale_after_seconds is not None
+                and abs((sample_time_utc - observed_at_utc).total_seconds())
+                > stale_after_seconds
+            ):
                 continue
             feed_key = (venue, venue_symbol, canonical_symbol, sample_time_utc)
             previous = latest.get(feed_key)

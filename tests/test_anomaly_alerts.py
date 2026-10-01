@@ -92,6 +92,19 @@ class FakeHistory:
         )
 
 
+class FlakyContextHistory(FakeHistory):
+    def __init__(self, supplied: AnomalyConfirmationContext, failures: int) -> None:
+        super().__init__(supplied)
+        self.failures = failures
+        self.context_calls = 0
+
+    def query_anomaly_context(self, **kwargs):
+        self.context_calls += 1
+        if self.context_calls <= self.failures:
+            raise OSError("temporary history failure")
+        return self.supplied
+
+
 class FakeTelegram:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
@@ -173,6 +186,52 @@ async def test_alignment_above_five_suppresses_without_transport(tmp_path):
         state = store.get_monitor_state("spread", "anomaly_notifications_v2")
         assert state["episode"]["eligibility"] is False
         assert state["episode"]["eligibility_reason"] == "mean_alignment"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_context_persists_suppression_without_transport(tmp_path):
+    telegram = FakeTelegram()
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite3") as store:
+        processor = SpreadAlertProcessor(
+            FakeHistory(context(10.0, 10.0, 10.0, eligible=False)),
+            telegram,
+            runtime_store=store,
+        )
+        await processor.process(alert())
+        assert telegram.texts == []
+        state = store.get_monitor_state("spread", "anomaly_notifications_v2")
+        assert state["episode"]["eligibility"] is False
+        assert state["episode"]["eligibility_reason"] == "context_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_context_query_retries_then_delivers(tmp_path, monkeypatch):
+    monkeypatch.setattr("radar.alerts.spread.ANOMALY_CONTEXT_QUERY_DELAY_SECONDS", 0)
+    telegram = FakeTelegram()
+    history = FlakyContextHistory(context(10.0, 10.0, 10.0), failures=1)
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite3") as store:
+        processor = SpreadAlertProcessor(history, telegram, runtime_store=store)
+        await processor.process(alert())
+        assert history.context_calls == 2
+        assert telegram.texts
+        state = store.get_monitor_state("spread", "anomaly_notifications_v2")
+        assert state["episode"]["eligibility"] is True
+
+
+@pytest.mark.asyncio
+async def test_repeated_context_query_failure_leaves_eligibility_undecided(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("radar.alerts.spread.ANOMALY_CONTEXT_QUERY_DELAY_SECONDS", 0)
+    telegram = FakeTelegram()
+    history = FlakyContextHistory(context(10.0, 10.0, 10.0), failures=3)
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite3") as store:
+        processor = SpreadAlertProcessor(history, telegram, runtime_store=store)
+        with pytest.raises(OSError, match="temporary history failure"):
+            await processor.process(alert())
+        assert history.context_calls == 3
+        assert telegram.texts == []
+        assert store.get_monitor_state("spread", "anomaly_notifications_v2") is None
 
 
 @pytest.mark.asyncio

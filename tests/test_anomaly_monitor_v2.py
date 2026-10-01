@@ -167,6 +167,64 @@ async def test_v2_restart_restores_active_episode_and_deduplicates_confirmation(
         assert restored._anomaly_v2.active_states[0].initial_event_emitted is True
 
 
+@pytest.mark.asyncio
+async def test_v2_missing_pair_expires_and_recovery_starts_new_episode(tmp_path):
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(store=store, confirmation_seconds=0)
+        prime(monitor)
+        initial = await monitor.evaluate(START, state_at(START))
+        assert [alert.payload["event_kind"] for alert in initial] == [
+            "anomaly_initial"
+        ]
+        episode_id = monitor._anomaly_v2.active_states[0].episode.episode_id
+
+        within_gap = await monitor.evaluate(START + timedelta(seconds=20), RadarState())
+        assert within_gap == []
+        assert len(monitor.active_anomaly_episodes) == 1
+
+        data_gap = await monitor.evaluate(START + timedelta(seconds=21), RadarState())
+        assert data_gap == []
+        assert monitor.active_anomaly_episodes == ()
+        persisted = store.get_monitor_state("spread", "anomaly_episodes_v2")
+        assert persisted == {}
+        resolved = [
+            event
+            for event in store.list_opportunities(monitor_name="spread")
+            if event["event_type"] == "anomaly_resolved"
+        ]
+        assert len(resolved) == 1
+        assert resolved[0]["event"]["resolution_reason"] == "data_gap"
+
+        recovered = await monitor.evaluate(START + timedelta(seconds=30), state_at(START + timedelta(seconds=30)))
+        assert [alert.payload["event_kind"] for alert in recovered] == [
+            "anomaly_initial"
+        ]
+        new_episode_id = monitor._anomaly_v2.active_states[0].episode.episode_id
+        assert new_episode_id != episode_id
+
+
+@pytest.mark.asyncio
+async def test_v2_unconfirmed_missing_pair_is_kept_then_abandoned(tmp_path):
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(store=store, confirmation_seconds=60)
+        prime(monitor)
+        await monitor.evaluate(START, state_at(START))
+
+        await monitor.evaluate(START + timedelta(seconds=20), RadarState())
+        assert len(monitor.active_anomaly_episodes) == 1
+
+        await monitor.evaluate(START + timedelta(seconds=21), RadarState())
+        assert monitor.active_anomaly_episodes == ()
+        assert store.get_monitor_state("spread", "anomaly_episodes_v2") == {}
+        assert not [
+            event
+            for event in store.list_opportunities(monitor_name="spread")
+            if event["event_type"] == "anomaly_resolved"
+        ]
+
+
 def test_anomaly_v2_disabled_keeps_legacy_mode():
     monitor = make_monitor(enabled=False)
     assert monitor._anomaly_v2 is None

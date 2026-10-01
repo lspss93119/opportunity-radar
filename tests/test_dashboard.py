@@ -578,7 +578,7 @@ def test_storage_failure_json_and_http_reads_never_create_sources(tmp_path, monk
         assert payload["data_as_of"] is None
 
 
-@pytest.mark.parametrize("path", ["/", "/opportunities", "/status"])
+@pytest.mark.parametrize("path", ["/", "/anomalies", "/opportunities", "/status"])
 def test_dashboard_html_navigation_and_view_anchors(scanner_http, path):
     with urlopen(scanner_http + path) as response:
         assert response.headers["Content-Type"] == "text/html; charset=utf-8"
@@ -587,11 +587,14 @@ def test_dashboard_html_navigation_and_view_anchors(scanner_http, path):
     if path == "/status":
         for anchor in ("heartbeat", "venues", "parquet", "sqlite", "episode-rows", "event-rows", "unavailable"):
             assert f'id="{anchor}"' in html
-    else:
+    elif path == "/opportunities":
         for anchor in ("filters", "opportunity-rows", "data-as-of"):
             assert f'id="{anchor}"' in html
         for column in ("Symbol", "Long", "Short", "Spread", "24h Mean", "24h Std", "Deviation", "Duration", "RT Fee", "Theo Edge", "Skew", "Freshness"):
             assert f">{column}<" in html
+    else:
+        for anchor in ("anomaly-filters", "anomaly-symbol", "anomaly-long-venue", "anomaly-short-venue", "anomaly-eligible-only", "anomaly-rows", "data-as-of"):
+            assert f'id="{anchor}"' in html
 
 
 def run_ui_script(html, expression, setup=""):
@@ -629,7 +632,7 @@ function succeed(request, marker) {
 """
 
 
-@pytest.mark.parametrize("path", ["/", "/status"])
+@pytest.mark.parametrize("path", ["/opportunities", "/status"])
 def test_dashboard_polling_renders_delayed_successes_without_overlap(scanner_http, path):
     with urlopen(scanner_http + path) as response:
         html = response.read().decode()
@@ -659,7 +662,7 @@ def test_dashboard_polling_renders_delayed_successes_without_overlap(scanner_htt
 @pytest.mark.parametrize("action", ["submit", "reset", "popstate"])
 @pytest.mark.parametrize("old_first", [True, False])
 def test_dashboard_filter_refresh_invalidates_pending_response(scanner_http, action, old_first):
-    with urlopen(scanner_http + "/") as response:
+    with urlopen(scanner_http + "/opportunities") as response:
         html = response.read().decode()
     result = run_ui_script(html, """
 (async () => {
@@ -684,7 +687,7 @@ def test_dashboard_filter_refresh_invalidates_pending_response(scanner_http, act
   tick(); // Polling resumes after the current request has completed.
   console.log(JSON.stringify({rendered, urls:requests.map(request => request.url)}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
-""", setup=POLLING_SETUP + f"const action = {json.dumps(action)}, oldFirst = {json.dumps(old_first)};\n")
+""", setup=POLLING_SETUP + f"location.pathname = '/opportunities'; const action = {json.dumps(action)}, oldFirst = {json.dumps(old_first)};\n")
     assert result["rendered"]["overall"] == "HEALTHY"
     assert result["rendered"]["sample"] == "Data as of: current"
     assert "current" in result["rendered"]["rows"]
@@ -696,7 +699,7 @@ def test_dashboard_filter_refresh_invalidates_pending_response(scanner_http, act
         assert parse_qs(urlparse(url).query) == expected_query
 
 
-@pytest.mark.parametrize("path", ["/", "/status"])
+@pytest.mark.parametrize("path", ["/opportunities", "/status"])
 def test_dashboard_polling_resumes_after_request_failure(scanner_http, path):
     with urlopen(scanner_http + path) as response:
         html = response.read().decode()
@@ -717,12 +720,12 @@ def test_dashboard_polling_resumes_after_request_failure(scanner_http, path):
 
 
 def test_scanner_exact_pair_links_and_missing_identity_never_guessed(scanner_http):
-    with urlopen(scanner_http + "/") as response:
+    with urlopen(scanner_http + "/opportunities") as response:
         html = response.read().decode()
     links = run_ui_script(html, """
 const exact = {canonical_symbol:'BRK B', long_venue:'arcus', long_venue_symbol:'BRK/B-USD', short_venue:'trade_xyz', short_venue_symbol:'xyz:BRK B'};
 console.log(JSON.stringify([pairLink(exact), pairLink({...exact, long_venue_symbol:null}), pairLink({...exact, short_venue_symbol:''})]));
-""")
+""", setup="location.pathname = '/opportunities';\n")
     assert parse_qs(urlparse(links[0]).query) == {
         "symbol": ["BRK B"], "long_venue": ["arcus"], "long_venue_symbol": ["BRK/B-USD"],
         "short_venue": ["trade_xyz"], "short_venue_symbol": ["xyz:BRK B"],
@@ -732,15 +735,59 @@ console.log(JSON.stringify([pairLink(exact), pairLink({...exact, long_venue_symb
 
 
 def test_scanner_restores_and_preserves_filters_without_navigation(scanner_http):
-    with urlopen(scanner_http + "/") as response:
+    with urlopen(scanner_http + "/opportunities") as response:
         html = response.read().decode()
     result = run_ui_script(html, """
 document.getElementById('min_deviation').value = '200';
 const query = filterQuery();
 console.log(JSON.stringify({symbol:document.getElementById('symbol').value, active:document.getElementById('active_only').checked, query:query.toString()}));
-""")
+""", setup="location.pathname = '/opportunities';\n")
     assert result["symbol"] == "ETH" and result["active"] is True
     assert parse_qs(result["query"]) == {"symbol": ["ETH"], "active_only": ["true"], "min_deviation": ["200"]}
+
+
+def test_anomaly_filters_round_trip_reset_and_browser_navigation(scanner_http):
+    with urlopen(scanner_http + "/anomalies") as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+const initial = {
+  symbol: byId('anomaly-symbol').value,
+  longVenue: byId('anomaly-long-venue').value,
+  eligible: byId('anomaly-eligible-only').checked
+};
+byId('anomaly-symbol').value = 'BTC';
+byId('anomaly-long-venue').value = 'arcus';
+byId('anomaly-eligible-only').checked = true;
+byId('anomaly-filters').listeners.submit({preventDefault(){}});
+const applied = history.url;
+byId('anomaly-reset').listeners.click();
+const reset = history.url;
+location.search = '?symbol=SOL&short_venue=lighter_robinhood&eligible_only=true';
+window.listeners.popstate();
+console.log(JSON.stringify({
+  initial,
+  applied: parse_qs_for_test(applied),
+  reset: parse_qs_for_test(reset),
+  restored: {
+    symbol: byId('anomaly-symbol').value,
+    shortVenue: byId('anomaly-short-venue').value,
+    eligible: byId('anomaly-eligible-only').checked
+  }
+}));
+function parse_qs_for_test(url) {
+  return new URL(url, 'http://localhost').search;
+}
+""", setup="location.pathname = '/anomalies'; location.search = '?symbol=ETH&long_venue=arcus&eligible_only=true';\n")
+    assert result["initial"] == {"symbol": "ETH", "longVenue": "arcus", "eligible": True}
+    assert "symbol=BTC" in result["applied"]
+    assert "long_venue=arcus" in result["applied"]
+    assert "eligible_only=true" in result["applied"]
+    assert result["reset"] == ""
+    assert result["restored"] == {
+        "symbol": "SOL",
+        "shortVenue": "lighter_robinhood",
+        "eligible": True,
+    }
 
 
 def test_unknown_api_is_json(scanner_http):
