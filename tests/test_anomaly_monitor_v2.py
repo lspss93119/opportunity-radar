@@ -137,9 +137,19 @@ async def test_v2_expansion_is_post_confirmation_and_return_is_one_alert():
 
     returned = await monitor.evaluate(
         START + timedelta(seconds=20),
-        state_at(START + timedelta(seconds=20), spread_bps=104.0),
+        state_at(START + timedelta(seconds=20), spread_bps=110.0),
+    )
+    assert returned == []
+    assert len(monitor.active_anomaly_episodes) == 1
+
+    returned = await monitor.evaluate(
+        START + timedelta(seconds=30),
+        state_at(START + timedelta(seconds=30), spread_bps=104.0),
     )
     assert [alert.payload["event_kind"] for alert in returned] == ["anomaly_return"]
+    assert monitor.active_anomaly_episodes == ()
+    assert monitor._anomaly_v2 is not None
+    assert monitor._anomaly_v2.snapshot() == {}
 
 
 @pytest.mark.asyncio
@@ -154,10 +164,14 @@ async def test_v2_restart_restores_active_episode_and_deduplicates_confirmation(
                 START + timedelta(seconds=seconds),
                 state_at(START + timedelta(seconds=seconds)),
             )
+        assert monitor._anomaly_v2 is not None
+        persisted_v2 = monitor._anomaly_v2.snapshot()
 
     with SQLiteRuntimeStore(database) as store:
         restored = make_monitor(store=store)
         prime(restored)
+        assert restored._anomaly_v2 is not None
+        assert restored._anomaly_v2.snapshot() == persisted_v2
         alerts = await restored.evaluate(
             START + timedelta(seconds=70),
             state_at(START + timedelta(seconds=70)),
@@ -186,6 +200,9 @@ async def test_v2_missing_pair_expires_and_recovery_starts_new_episode(tmp_path)
         data_gap = await monitor.evaluate(START + timedelta(seconds=21), RadarState())
         assert data_gap == []
         assert monitor.active_anomaly_episodes == ()
+        assert monitor._anomaly_v2 is not None
+        assert monitor._anomaly_v2._trackers == {}
+        assert monitor._anomaly_v2.snapshot() == {}
         persisted = store.get_monitor_state("spread", "anomaly_episodes_v2")
         assert persisted == {}
         resolved = [
@@ -223,6 +240,118 @@ async def test_v2_unconfirmed_missing_pair_is_kept_then_abandoned(tmp_path):
             for event in store.list_opportunities(monitor_name="spread")
             if event["event_type"] == "anomaly_resolved"
         ]
+
+
+@pytest.mark.asyncio
+async def test_v2_unconfirmed_present_pair_basis_ineligible_is_abandoned(tmp_path):
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(store=store, confirmation_seconds=60)
+        prime(monitor)
+        await monitor.evaluate(START, state_at(START))
+        key = monitor.active_anomaly_episodes[0].episode.pair_key
+        monitor._basis_by_key[key].hydrate([])
+
+        alerts = await monitor.evaluate(
+            START + timedelta(seconds=10),
+            state_at(START + timedelta(seconds=10)),
+        )
+
+        assert alerts == []
+        assert monitor.active_anomaly_episodes == ()
+        assert monitor._anomaly_v2 is not None
+        assert monitor._anomaly_v2.snapshot() == {}
+        assert store.list_opportunities(monitor_name="spread") == []
+
+
+@pytest.mark.asyncio
+async def test_v2_data_gap_and_new_candidate_same_observation_stay_synchronized(tmp_path):
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(store=store, confirmation_seconds=0)
+        prime(monitor)
+        await monitor.evaluate(START, state_at(START))
+
+        alerts = await monitor.evaluate(
+            START + timedelta(seconds=30),
+            state_at(START + timedelta(seconds=30)),
+        )
+
+        assert [alert.payload["event_kind"] for alert in alerts] == [
+            "anomaly_initial"
+        ]
+        assert len(monitor.active_anomaly_episodes) == 1
+        assert monitor._anomaly_v2 is not None
+        assert len(monitor._anomaly_v2._trackers) == 1
+        assert (
+            monitor.active_anomaly_episodes[0].episode.candidate_started_at
+            == START + timedelta(seconds=30)
+        )
+        assert len(monitor._anomaly_v2.snapshot()) == 1
+        resolved = [
+            event
+            for event in store.list_opportunities(monitor_name="spread")
+            if event["event_type"] == "anomaly_resolved"
+        ]
+        assert len(resolved) == 1
+        assert resolved[0]["event"]["resolution_reason"] == "data_gap"
+
+
+@pytest.mark.asyncio
+async def test_v2_present_candidate_drop_clears_state_before_persisting(tmp_path):
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(store=store, confirmation_seconds=60)
+        prime(monitor)
+        first = await monitor.evaluate(START, state_at(START))
+        assert first == []
+        assert len(monitor.active_anomaly_episodes) == 1
+
+        second = await monitor.evaluate(
+            START + timedelta(seconds=10),
+            state_at(START + timedelta(seconds=10), spread_bps=114.0),
+        )
+        assert second == []
+        assert monitor.active_anomaly_episodes == ()
+        assert store.get_monitor_state("spread", "anomaly_episodes_v2") == {}
+        assert store.list_opportunities(monitor_name="spread") == []
+
+        third = await monitor.evaluate(
+            START + timedelta(seconds=20),
+            state_at(START + timedelta(seconds=20)),
+        )
+        assert third == []
+        assert len(monitor.active_anomaly_episodes) == 1
+        assert (
+            monitor.active_anomaly_episodes[0].episode.candidate_started_at
+            == START + timedelta(seconds=20)
+        )
+
+
+@pytest.mark.asyncio
+async def test_v2_snapshot_rejects_state_without_matching_tracker():
+    monitor = make_monitor()
+    prime(monitor)
+    await monitor.evaluate(START, state_at(START))
+    assert monitor._anomaly_v2 is not None
+    key = monitor.active_anomaly_episodes[0].episode.pair_key
+    del monitor._anomaly_v2._trackers[key]
+
+    with pytest.raises(RuntimeError, match="state/tracker invariant"):
+        monitor._anomaly_v2.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_v2_snapshot_rejects_active_tracker_without_state():
+    monitor = make_monitor()
+    prime(monitor)
+    await monitor.evaluate(START, state_at(START))
+    assert monitor._anomaly_v2 is not None
+    key = monitor.active_anomaly_episodes[0].episode.pair_key
+    del monitor._anomaly_v2._states[key]
+
+    with pytest.raises(RuntimeError, match="state/tracker invariant"):
+        monitor._anomaly_v2.snapshot()
 
 
 def test_anomaly_v2_disabled_keeps_legacy_mode():

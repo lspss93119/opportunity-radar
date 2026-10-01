@@ -63,6 +63,7 @@ class AnomalyV2Lifecycle:
         )
 
     def snapshot(self) -> dict[str, object]:
+        self._validate_active_state_invariants()
         return {
             state.episode.episode_id: {
                 "episode": state.episode.to_dict(),
@@ -75,6 +76,42 @@ class AnomalyV2Lifecycle:
             }
             for state in self._states.values()
         }
+
+    def _validate_active_state_invariants(self) -> None:
+        for key, state in self._states.items():
+            tracker = self._trackers.get(key)
+            if tracker is None:
+                raise RuntimeError(
+                    "anomaly v2 state/tracker invariant violated: "
+                    f"missing tracker for {key!r}"
+                )
+            active_episode = tracker.active_episode
+            if active_episode is None:
+                raise RuntimeError(
+                    "anomaly v2 state/tracker invariant violated: "
+                    f"state has no active tracker episode for {key!r}"
+                )
+            if tracker.pair_key != key or active_episode.pair_key != key:
+                raise RuntimeError(
+                    "anomaly v2 state/tracker invariant violated: "
+                    f"tracker pair mismatch for {key!r}"
+                )
+            if state.episode.pair_key != key or state.candidate.key != key:
+                raise RuntimeError(
+                    "anomaly v2 state/tracker invariant violated: "
+                    f"state pair mismatch for {key!r}"
+                )
+            if state.episode.episode_id != active_episode.episode_id:
+                raise RuntimeError(
+                    "anomaly v2 state/tracker invariant violated: "
+                    f"episode identity mismatch for {key!r}"
+                )
+        for key, tracker in self._trackers.items():
+            if tracker.active_episode is not None and key not in self._states:
+                raise RuntimeError(
+                    "anomaly v2 state/tracker invariant violated: "
+                    f"active tracker has no state for {key!r}"
+                )
 
     def restore(self, raw: object) -> None:
         if not isinstance(raw, dict):
@@ -113,6 +150,7 @@ class AnomalyV2Lifecycle:
                 )
             except (KeyError, TypeError, ValueError):
                 continue
+        self._validate_active_state_invariants()
 
     def evaluate(
         self,
@@ -218,6 +256,11 @@ class AnomalyV2Lifecycle:
                     alerts,
                     events,
                 )
+            else:
+                # An unconfirmed candidate can be abandoned by the tracker
+                # on a present observation without emitting a transition.
+                # Remove the wrapper state before inactive trackers are swept.
+                self._states.pop(key, None)
         for key, tracker in tuple(self._trackers.items()):
             if key in candidates:
                 continue
@@ -244,6 +287,7 @@ class AnomalyV2Lifecycle:
         for key, tracker in tuple(self._trackers.items()):
             if tracker.active_episode is None:
                 self._trackers.pop(key, None)
+        self._validate_active_state_invariants()
         return AnomalyV2Evaluation(tuple(alerts), tuple(events))
 
     def _ensure_state(
