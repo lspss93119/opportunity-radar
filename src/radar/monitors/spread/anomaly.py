@@ -84,10 +84,13 @@ class AnomalyEpisode:
     reference_std_bps: float
     current_spread_bps: float
     current_deviation_from_reference_bps: float
-    peak_spread_bps: float
-    peak_deviation_bps: float
-    peak_at: datetime
+    lifetime_peak_spread_bps: float
+    lifetime_peak_deviation_bps: float
+    lifetime_peak_at: datetime
     last_seen_at: datetime
+    post_confirmation_peak_spread_bps: float | None = None
+    post_confirmation_peak_deviation_bps: float | None = None
+    post_confirmation_peak_at: datetime | None = None
     confirmed_at: datetime | None = None
     confirmation_spread_bps: float | None = None
     confirmation_deviation_bps: float | None = None
@@ -105,16 +108,37 @@ class AnomalyEpisode:
         return self.confirmed_at is not None
 
     @property
+    def peak_spread_bps(self) -> float:
+        """Backward-compatible alias for the lifetime peak."""
+        return self.lifetime_peak_spread_bps
+
+    @property
+    def peak_deviation_bps(self) -> float:
+        """Backward-compatible alias for the lifetime peak."""
+        return self.lifetime_peak_deviation_bps
+
+    @property
+    def peak_at(self) -> datetime:
+        """Backward-compatible alias for the lifetime peak timestamp."""
+        return self.lifetime_peak_at
+
+    @property
     def post_confirmation_expansion_bps(self) -> float | None:
-        if self.confirmation_deviation_bps is None:
+        if (
+            self.confirmation_deviation_bps is None
+            or self.post_confirmation_peak_deviation_bps is None
+        ):
             return None
-        return self.peak_deviation_bps - self.confirmation_deviation_bps
+        return (
+            self.post_confirmation_peak_deviation_bps
+            - self.confirmation_deviation_bps
+        )
 
     @property
     def confirmation_to_peak_seconds(self) -> float | None:
-        if self.confirmed_at is None:
+        if self.confirmed_at is None or self.post_confirmation_peak_at is None:
             return None
-        return (self.peak_at - self.confirmed_at).total_seconds()
+        return (self.post_confirmation_peak_at - self.confirmed_at).total_seconds()
 
     @property
     def total_duration_seconds(self) -> float | None:
@@ -143,10 +167,13 @@ class AnomalyEpisode:
             "reference_std_bps": self.reference_std_bps,
             "current_spread_bps": self.current_spread_bps,
             "current_deviation_from_reference_bps": self.current_deviation_from_reference_bps,
-            "peak_spread_bps": self.peak_spread_bps,
-            "peak_deviation_bps": self.peak_deviation_bps,
-            "peak_at": self.peak_at.isoformat(),
+            "lifetime_peak_spread_bps": self.lifetime_peak_spread_bps,
+            "lifetime_peak_deviation_bps": self.lifetime_peak_deviation_bps,
+            "lifetime_peak_at": self.lifetime_peak_at.isoformat(),
             "last_seen_at": self.last_seen_at.isoformat(),
+            "post_confirmation_peak_spread_bps": self.post_confirmation_peak_spread_bps,
+            "post_confirmation_peak_deviation_bps": self.post_confirmation_peak_deviation_bps,
+            "post_confirmation_peak_at": _optional_time(self.post_confirmation_peak_at),
             "confirmed_at": _optional_time(self.confirmed_at),
             "confirmation_spread_bps": self.confirmation_spread_bps,
             "confirmation_deviation_bps": self.confirmation_deviation_bps,
@@ -180,10 +207,33 @@ class AnomalyEpisode:
             current_deviation_from_reference_bps=float(
                 payload["current_deviation_from_reference_bps"]
             ),
-            peak_spread_bps=float(payload["peak_spread_bps"]),
-            peak_deviation_bps=float(payload["peak_deviation_bps"]),
-            peak_at=_parse_time(payload["peak_at"]),
+            lifetime_peak_spread_bps=_payload_float(
+                payload, "lifetime_peak_spread_bps", "peak_spread_bps"
+            ),
+            lifetime_peak_deviation_bps=_payload_float(
+                payload, "lifetime_peak_deviation_bps", "peak_deviation_bps"
+            ),
+            lifetime_peak_at=_parse_time(
+                payload["lifetime_peak_at"]
+                if "lifetime_peak_at" in payload
+                else payload["peak_at"]
+            ),
             last_seen_at=_parse_time(payload["last_seen_at"]),
+            post_confirmation_peak_spread_bps=_legacy_or_optional_float(
+                payload,
+                "post_confirmation_peak_spread_bps",
+                "peak_spread_bps",
+            ),
+            post_confirmation_peak_deviation_bps=_legacy_or_optional_float(
+                payload,
+                "post_confirmation_peak_deviation_bps",
+                "peak_deviation_bps",
+            ),
+            post_confirmation_peak_at=_legacy_or_optional_time(
+                payload,
+                "post_confirmation_peak_at",
+                "peak_at",
+            ),
             confirmed_at=_parse_optional_time(payload.get("confirmed_at")),
             confirmation_spread_bps=_optional_float(payload.get("confirmation_spread_bps")),
             confirmation_deviation_bps=_optional_float(
@@ -343,9 +393,9 @@ class AnomalyTracker:
             reference_std_bps=observation.rolling_std_bps,
             current_spread_bps=observation.raw_spread_bps,
             current_deviation_from_reference_bps=current_deviation,
-            peak_spread_bps=observation.raw_spread_bps,
-            peak_deviation_bps=current_deviation,
-            peak_at=observation.sample_time,
+            lifetime_peak_spread_bps=observation.raw_spread_bps,
+            lifetime_peak_deviation_bps=current_deviation,
+            lifetime_peak_at=observation.sample_time,
             last_seen_at=observation.sample_time,
             current_live_mean_bps=observation.rolling_mean_bps,
             current_live_std_bps=observation.rolling_std_bps,
@@ -360,10 +410,29 @@ class AnomalyTracker:
         )
         episode.current_live_mean_bps = observation.rolling_mean_bps
         episode.current_live_std_bps = observation.rolling_std_bps
-        if episode.current_deviation_from_reference_bps > episode.peak_deviation_bps:
-            episode.peak_deviation_bps = episode.current_deviation_from_reference_bps
-            episode.peak_spread_bps = observation.raw_spread_bps
-            episode.peak_at = observation.sample_time
+        if (
+            episode.current_deviation_from_reference_bps
+            > episode.lifetime_peak_deviation_bps
+        ):
+            episode.lifetime_peak_deviation_bps = (
+                episode.current_deviation_from_reference_bps
+            )
+            episode.lifetime_peak_spread_bps = observation.raw_spread_bps
+            episode.lifetime_peak_at = observation.sample_time
+        if (
+            episode.confirmed_at is not None
+            and observation.sample_time > episode.confirmed_at
+            and (
+                episode.post_confirmation_peak_deviation_bps is None
+                or episode.current_deviation_from_reference_bps
+                > episode.post_confirmation_peak_deviation_bps
+            )
+        ):
+            episode.post_confirmation_peak_deviation_bps = (
+                episode.current_deviation_from_reference_bps
+            )
+            episode.post_confirmation_peak_spread_bps = observation.raw_spread_bps
+            episode.post_confirmation_peak_at = observation.sample_time
 
     @staticmethod
     def _confirm(episode: AnomalyEpisode, observation: AnomalyObservation) -> None:
@@ -372,6 +441,11 @@ class AnomalyTracker:
         episode.confirmation_deviation_bps = (
             observation.raw_spread_bps - episode.reference_mean_bps
         )
+        episode.post_confirmation_peak_spread_bps = observation.raw_spread_bps
+        episode.post_confirmation_peak_deviation_bps = (
+            episode.confirmation_deviation_bps
+        )
+        episode.post_confirmation_peak_at = observation.sample_time
         episode.confirmation_live_mean_bps = observation.rolling_mean_bps
         episode.confirmation_live_std_bps = observation.rolling_std_bps
 
@@ -432,3 +506,36 @@ def _optional_float(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ValueError("numeric field must be JSON-compatible")
     return float(value)
+
+
+def _payload_float(
+    payload: dict[str, Any],
+    field_name: str,
+    legacy_field_name: str,
+) -> float:
+    value = payload[field_name] if field_name in payload else payload[legacy_field_name]
+    return float(value)
+
+
+def _legacy_or_optional_float(
+    payload: dict[str, Any],
+    field_name: str,
+    legacy_field_name: str,
+) -> float | None:
+    if field_name in payload:
+        return _optional_float(payload.get(field_name))
+    if payload.get("confirmed_at") is None:
+        return None
+    return _optional_float(payload.get(legacy_field_name))
+
+
+def _legacy_or_optional_time(
+    payload: dict[str, Any],
+    field_name: str,
+    legacy_field_name: str,
+) -> datetime | None:
+    if field_name in payload:
+        return _parse_optional_time(payload.get(field_name))
+    if payload.get("confirmed_at") is None:
+        return None
+    return _parse_optional_time(payload.get(legacy_field_name))

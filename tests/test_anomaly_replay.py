@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from radar.config import MarketConfig, RadarConfig
+from radar.history import anomaly_replay
 from radar.history.anomaly_replay import ReplayParameters, replay_market_data
 from radar.models import MarketSnapshot
 from radar.storage.parquet import ParquetStorage
@@ -27,6 +28,11 @@ def make_config() -> RadarConfig:
                 venue_symbol="QQQ",
                 canonical_symbol="QQQ",
             ),
+            MarketConfig(
+                venue="other",
+                venue_symbol="QQQ",
+                canonical_symbol="QQQ",
+            ),
         ]
     )
 
@@ -37,12 +43,13 @@ def snapshot(
     venue_symbol: str,
     sample_time: datetime,
     raw_spread_bps: float,
+    observed_at: datetime | None = None,
 ) -> MarketSnapshot:
     long_side = venue == "arcus"
     price = 100.0 if long_side else 100.0 + raw_spread_bps / 100.0
     return MarketSnapshot(
         sample_time=sample_time,
-        observed_at=sample_time,
+        observed_at=sample_time if observed_at is None else observed_at,
         venue=venue,
         venue_symbol=venue_symbol,
         canonical_symbol="QQQ",
@@ -164,6 +171,75 @@ def test_replay_does_not_interpolate_a_missing_sample_gap(tmp_path):
     assert result.episodes[0].episode.ended_at == START
 
 
+def test_replay_accepts_observation_a_few_milliseconds_after_sample_time(tmp_path):
+    observed_at = START + timedelta(milliseconds=5)
+    write_market_data(
+        tmp_path,
+        baseline_snapshots()
+        + [
+            snapshot(
+                venue=venue,
+                venue_symbol=symbol,
+                sample_time=START,
+                observed_at=observed_at,
+                raw_spread_bps=12.0,
+            )
+            for venue, symbol in (("arcus", "QQQ-USD"), ("lighter_robinhood", "QQQ"))
+        ],
+    )
+
+    result = replay_market_data(
+        data_root=tmp_path / "data",
+        config=make_config(),
+        start=START,
+        end=START + timedelta(seconds=10),
+        parameters=ReplayParameters(confirmation_seconds=0),
+    )
+
+    assert len(result.episodes) == 1
+    assert result.episodes[0].episode.confirmation_deviation_bps == pytest.approx(12.0)
+
+
+def test_replay_keeps_latest_observed_row_for_same_feed_and_sample(tmp_path):
+    first_observed_at = START
+    latest_observed_at = START + timedelta(milliseconds=5)
+    write_market_data(
+        tmp_path,
+        baseline_snapshots()
+        + [
+            snapshot(
+                venue=venue,
+                venue_symbol=symbol,
+                sample_time=START,
+                observed_at=first_observed_at,
+                raw_spread_bps=12.0,
+            )
+            for venue, symbol in (("arcus", "QQQ-USD"), ("lighter_robinhood", "QQQ"))
+        ]
+        + [
+            snapshot(
+                venue=venue,
+                venue_symbol=symbol,
+                sample_time=START,
+                observed_at=latest_observed_at,
+                raw_spread_bps=14.0,
+            )
+            for venue, symbol in (("arcus", "QQQ-USD"), ("lighter_robinhood", "QQQ"))
+        ],
+    )
+
+    result = replay_market_data(
+        data_root=tmp_path / "data",
+        config=make_config(),
+        start=START,
+        end=START + timedelta(seconds=10),
+        parameters=ReplayParameters(confirmation_seconds=0),
+    )
+
+    assert len(result.episodes) == 1
+    assert result.episodes[0].episode.confirmation_deviation_bps == pytest.approx(14.0)
+
+
 def test_replay_can_filter_exact_direction(tmp_path):
     write_market_data(
         tmp_path,
@@ -192,3 +268,30 @@ def test_replay_can_filter_exact_direction(tmp_path):
     )
 
     assert result.episodes == ()
+
+
+def test_exact_direction_filters_prune_unneeded_feeds_before_query(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    def fake_iter_market_rows(**kwargs):
+        captured.update(kwargs)
+        yield from ()
+
+    monkeypatch.setattr(anomaly_replay, "_iter_market_rows", fake_iter_market_rows)
+
+    replay_market_data(
+        data_root=tmp_path / "data",
+        config=make_config(),
+        start=START,
+        end=START + timedelta(seconds=10),
+        parameters=ReplayParameters(confirmation_seconds=0),
+        symbol="QQQ",
+        long_venue="arcus",
+        long_venue_symbol="QQQ-USD",
+        short_venue="lighter_robinhood",
+        short_venue_symbol="QQQ",
+    )
+
+    assert captured["feeds_by_symbol"] == {
+        "QQQ": (("arcus", "QQQ-USD"), ("lighter_robinhood", "QQQ"))
+    }

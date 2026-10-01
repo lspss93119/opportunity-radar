@@ -89,15 +89,20 @@ class ReplayEpisode:
             "short_venue_symbol": episode.pair_key.short_venue_symbol,
             "candidate_started_at": episode.candidate_started_at.isoformat(),
             "confirmed_at": _time_string(episode.confirmed_at),
-            "peak_at": episode.peak_at.isoformat(),
+            "lifetime_peak_at": episode.lifetime_peak_at.isoformat(),
             "ended_at": _time_string(episode.ended_at),
             "resolution_reason": episode.resolution_reason,
             "reference_mean_bps": episode.reference_mean_bps,
             "reference_std_bps": episode.reference_std_bps,
             "confirmation_spread_bps": episode.confirmation_spread_bps,
             "confirmation_deviation_bps": episode.confirmation_deviation_bps,
-            "peak_spread_bps": episode.peak_spread_bps,
-            "peak_deviation_bps": episode.peak_deviation_bps,
+            "lifetime_peak_spread_bps": episode.lifetime_peak_spread_bps,
+            "lifetime_peak_deviation_bps": episode.lifetime_peak_deviation_bps,
+            "post_confirmation_peak_spread_bps": episode.post_confirmation_peak_spread_bps,
+            "post_confirmation_peak_deviation_bps": episode.post_confirmation_peak_deviation_bps,
+            "post_confirmation_peak_at": _time_string(
+                episode.post_confirmation_peak_at
+            ),
             "post_confirmation_expansion_bps": episode.post_confirmation_expansion_bps,
             "confirmation_to_peak_seconds": episode.confirmation_to_peak_seconds,
             "total_duration_seconds": episode.total_duration_seconds,
@@ -205,9 +210,9 @@ def replay_market_data(
 ) -> ReplayResult:
     """Replay configured exact directional pairs over ``[start, end)``.
 
-    One ordered streaming query supplies the selected feeds.  Replay keeps
-    only one canonical symbol's pair trackers and bounded rolling windows at a
-    time, rather than the full market cross-product.
+    Replay processes one canonical symbol at a time.  Each ordered query is
+    limited to that symbol's selected feeds, so pair trackers and rolling
+    windows stay bounded without a global cross-symbol sort.
     """
     started = time.perf_counter()
     start_utc = _as_utc(start, "start")
@@ -215,49 +220,47 @@ def replay_market_data(
     if end_utc <= start_utc:
         raise ValueError("end must be after start")
     anomaly_parameters = parameters.as_anomaly_parameters()
-    feeds_by_symbol = _configured_feeds(config, symbol=symbol)
+    feeds_by_symbol = _configured_feeds(
+        config,
+        symbol=symbol,
+        long_venue=long_venue,
+        long_venue_symbol=long_venue_symbol,
+        short_venue=short_venue,
+        short_venue_symbol=short_venue_symbol,
+    )
     all_replay_episodes: list[ReplayEpisode] = []
     warm_start = start_utc - timedelta(seconds=CONTEXT_WINDOW_SECONDS["48h"])
 
-    current_symbol: str | None = None
-    pair_states: dict[SpreadPairKey, _PairState] = {}
-    for canonical_symbol, sample_time, rows in _iter_market_rows(
-        data_root=data_root,
-        feeds_by_symbol=feeds_by_symbol,
-        start=warm_start,
-        end=end_utc,
-    ):
-        if canonical_symbol != current_symbol:
-            _collect_replay_episodes(
-                all_replay_episodes,
-                pair_states,
-                start=start_utc,
-                end=end_utc,
-            )
-            current_symbol = canonical_symbol
-            pair_states = _pair_states(
-                canonical_symbol,
-                feeds_by_symbol[canonical_symbol],
-                anomaly_parameters,
-                long_venue=long_venue,
-                long_venue_symbol=long_venue_symbol,
-                short_venue=short_venue,
-                short_venue_symbol=short_venue_symbol,
-            )
-        if pair_states:
+    for canonical_symbol in sorted(feeds_by_symbol):
+        pair_states = _pair_states(
+            canonical_symbol,
+            feeds_by_symbol[canonical_symbol],
+            anomaly_parameters,
+            long_venue=long_venue,
+            long_venue_symbol=long_venue_symbol,
+            short_venue=short_venue,
+            short_venue_symbol=short_venue_symbol,
+        )
+        for _canonical_symbol, sample_time, rows in _iter_market_rows(
+            data_root=data_root,
+            feeds_by_symbol={
+                canonical_symbol: feeds_by_symbol[canonical_symbol]
+            },
+            start=warm_start,
+            end=end_utc,
+        ):
             _process_sample(
                 sample_time,
                 rows,
                 pair_states,
                 stale_after_seconds=config.monitors.spread.stale_after_seconds,
             )
-
-    _collect_replay_episodes(
-        all_replay_episodes,
-        pair_states,
-        start=start_utc,
-        end=end_utc,
-    )
+        _collect_replay_episodes(
+            all_replay_episodes,
+            pair_states,
+            start=start_utc,
+            end=end_utc,
+        )
 
     all_replay_episodes.sort(
         key=lambda item: (
@@ -289,14 +292,54 @@ def _configured_feeds(
     config: RadarConfig,
     *,
     symbol: str | None,
+    long_venue: str | None,
+    long_venue_symbol: str | None,
+    short_venue: str | None,
+    short_venue_symbol: str | None,
 ) -> dict[str, tuple[tuple[str, str], ...]]:
-    feeds: dict[str, set[tuple[str, str]]] = {}
+    configured: dict[str, set[tuple[str, str]]] = {}
     for market in config.markets:
         if not market.enabled or (symbol is not None and market.canonical_symbol != symbol):
             continue
-        feeds.setdefault(market.canonical_symbol, set()).add(
+        configured.setdefault(market.canonical_symbol, set()).add(
             (market.venue, market.venue_symbol)
         )
+    feeds: dict[str, set[tuple[str, str]]]
+    if all(
+        value is None
+        for value in (
+            long_venue,
+            long_venue_symbol,
+            short_venue,
+            short_venue_symbol,
+        )
+    ):
+        feeds = configured
+    else:
+        feeds = {}
+        for canonical_symbol, configured_feeds in configured.items():
+            for long_venue_name, long_symbol in configured_feeds:
+                for short_venue_name, short_symbol in configured_feeds:
+                    if long_venue_name.lower() == short_venue_name.lower():
+                        continue
+                    key = SpreadPairKey(
+                        canonical_symbol=canonical_symbol,
+                        long_venue=long_venue_name,
+                        long_venue_symbol=long_symbol,
+                        short_venue=short_venue_name,
+                        short_venue_symbol=short_symbol,
+                    )
+                    if not _matches_filters(
+                        key,
+                        long_venue=long_venue,
+                        long_venue_symbol=long_venue_symbol,
+                        short_venue=short_venue,
+                        short_venue_symbol=short_venue_symbol,
+                    ):
+                        continue
+                    feeds.setdefault(canonical_symbol, set()).update(
+                        {(long_venue_name, long_symbol), (short_venue_name, short_symbol)}
+                    )
     return {
         canonical_symbol: tuple(sorted(symbols))
         for canonical_symbol, symbols in feeds.items()
@@ -390,24 +433,6 @@ def _iter_market_rows(
         for _ in feed_descriptors
     )
     query = f"""
-        WITH filtered AS (
-            SELECT
-                sample_time,
-                observed_at,
-                venue,
-                venue_symbol,
-                canonical_symbol,
-                buy_10k_vwap,
-                sell_10k_vwap,
-                row_number() OVER (
-                    PARTITION BY sample_time, venue, venue_symbol, canonical_symbol
-                    ORDER BY observed_at DESC
-                ) AS row_number
-            FROM read_parquet([{market_paths}])
-            WHERE sample_time >= ?
-              AND sample_time < ?
-              AND ({predicates})
-        )
         SELECT
             sample_time,
             observed_at,
@@ -416,8 +441,10 @@ def _iter_market_rows(
             canonical_symbol,
             buy_10k_vwap,
             sell_10k_vwap
-        FROM filtered
-        WHERE row_number = 1
+        FROM read_parquet([{market_paths}])
+        WHERE sample_time >= ?
+          AND sample_time < ?
+          AND ({predicates})
         ORDER BY canonical_symbol, sample_time, observed_at
     """
     parameters: list[object] = [start, end]
@@ -458,6 +485,9 @@ def _iter_market_rows(
                     current_symbol = canonical_symbol
                     current_sample = sample_time
                     current_rows = {}
+                # observed_at is ascending within a feed/sample group, so the
+                # final assignment preserves the latest-observation dedup
+                # semantics without a global window operation.
                 current_rows[feed_key] = row
         if current_symbol is not None and current_sample is not None:
             yield current_symbol, current_sample, current_rows
@@ -511,8 +541,8 @@ def _process_sample(
 ) -> None:
     valid: dict[tuple[str, str], tuple[float, float]] = {}
     for feed_key, (observed_at, buy_value, sell_value) in rows.items():
-        age_seconds = (sample_time - observed_at).total_seconds()
-        if age_seconds < 0 or age_seconds > stale_after_seconds:
+        skew_seconds = abs((sample_time - observed_at).total_seconds())
+        if skew_seconds > stale_after_seconds:
             continue
         buy_price = _positive_float(buy_value)
         sell_price = _positive_float(sell_value)

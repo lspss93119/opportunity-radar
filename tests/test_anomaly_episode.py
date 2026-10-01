@@ -138,16 +138,65 @@ def test_peak_updates_only_for_larger_reference_deviation_and_tracks_expansion()
 
     episode = instance.active_episode
     assert episode is not None
-    assert episode.peak_spread_bps == 120.0
-    assert episode.peak_deviation_bps == 20.0
-    assert episode.peak_at == START + timedelta(seconds=70)
+    assert episode.lifetime_peak_spread_bps == 120.0
+    assert episode.lifetime_peak_deviation_bps == 20.0
+    assert episode.lifetime_peak_at == START + timedelta(seconds=70)
+    assert episode.post_confirmation_peak_spread_bps == 120.0
+    assert episode.post_confirmation_peak_deviation_bps == 20.0
+    assert episode.post_confirmation_peak_at == START + timedelta(seconds=70)
     assert episode.post_confirmation_expansion_bps == pytest.approx(8.0)
     assert episode.confirmation_to_peak_seconds == pytest.approx(10.0)
 
     instance.observe(observation(80, raw=115.0))
     assert instance.active_episode is not None
-    assert instance.active_episode.peak_spread_bps == 120.0
-    assert instance.active_episode.peak_at == START + timedelta(seconds=70)
+    assert instance.active_episode.lifetime_peak_spread_bps == 120.0
+    assert instance.active_episode.lifetime_peak_at == START + timedelta(seconds=70)
+
+
+def test_lifetime_peak_before_confirmation_is_separate_from_later_post_confirmation_peak():
+    instance = tracker(max_gap=120)
+    instance.observe(observation(0, raw=130.0))
+    instance.observe(observation(60, raw=112.0))
+    instance.observe(observation(70, raw=115.0))
+
+    episode = instance.active_episode
+    assert episode is not None
+    assert episode.lifetime_peak_spread_bps == 130.0
+    assert episode.lifetime_peak_deviation_bps == 30.0
+    assert episode.lifetime_peak_at == START
+    assert episode.post_confirmation_peak_spread_bps == 115.0
+    assert episode.post_confirmation_peak_deviation_bps == 15.0
+    assert episode.post_confirmation_peak_at == START + timedelta(seconds=70)
+    assert episode.post_confirmation_expansion_bps == pytest.approx(3.0)
+    assert episode.confirmation_to_peak_seconds == pytest.approx(10.0)
+
+
+def test_post_confirmation_peak_has_no_expansion_when_confirmation_is_the_peak():
+    instance = tracker(max_gap=120)
+    instance.observe(observation(0, raw=130.0))
+    instance.observe(observation(60, raw=112.0))
+    instance.observe(observation(70, raw=111.0))
+
+    episode = instance.active_episode
+    assert episode is not None
+    assert episode.lifetime_peak_deviation_bps == 30.0
+    assert episode.post_confirmation_peak_deviation_bps == 12.0
+    assert episode.post_confirmation_peak_at == START + timedelta(seconds=60)
+    assert episode.post_confirmation_expansion_bps == pytest.approx(0.0)
+    assert episode.confirmation_to_peak_seconds == pytest.approx(0.0)
+
+
+def test_post_confirmation_peak_is_initialized_at_immediate_confirmation():
+    instance = tracker(confirmation=0, max_gap=120)
+    transitions = instance.observe(observation(0, raw=112.0))
+
+    episode = transitions[-1].episode
+    assert episode.confirmed_at == START
+    assert episode.post_confirmation_peak_spread_bps == 112.0
+    assert episode.post_confirmation_peak_deviation_bps == 12.0
+    assert episode.post_confirmation_peak_at == START
+    assert episode.post_confirmation_expansion_bps == pytest.approx(0.0)
+    assert episode.confirmation_to_peak_seconds == pytest.approx(0.0)
 
 
 def test_return_band_and_crossing_reference_mean_resolve_episode():
@@ -218,6 +267,8 @@ def test_episode_serialization_round_trip_is_json_compatible():
     restored = type(episode).from_dict(payload)
 
     assert restored == episode
+    assert payload["lifetime_peak_deviation_bps"] == 20.0
+    assert payload["post_confirmation_peak_deviation_bps"] == 20.0
     assert payload["candidate_started_at"].endswith("+00:00")
     assert payload["pair_key"] == {
         "canonical_symbol": "QQQ",
