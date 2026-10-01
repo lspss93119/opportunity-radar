@@ -371,15 +371,11 @@ def _iter_symbol_rows(
     start: datetime,
     end: datetime,
 ) -> Iterator[tuple[datetime, dict[tuple[str, str], tuple[datetime, object, object]]]]:
-    market_files = tuple(
-        path
-        for path in data_root.glob("market/date=*/part-*.parquet")
-        if path.is_file()
-    )
+    market_files = _market_files_for_window(data_root, start=start, end=end)
     if not market_files:
         return
-    market_glob = str(data_root / "market" / "date=*" / "part-*.parquet").replace(
-        "'", "''"
+    market_paths = ", ".join(
+        "'" + str(path).replace("'", "''") + "'" for path in market_files
     )
     predicates = " OR ".join(
         "(venue = ? AND venue_symbol = ?)" for _ in feeds
@@ -398,7 +394,7 @@ def _iter_symbol_rows(
                     PARTITION BY sample_time, venue, venue_symbol, canonical_symbol
                     ORDER BY observed_at DESC
                 ) AS row_number
-            FROM read_parquet('{market_glob}')
+            FROM read_parquet([{market_paths}])
             WHERE sample_time >= ?
               AND sample_time < ?
               AND canonical_symbol = ?
@@ -447,6 +443,25 @@ def _iter_symbol_rows(
                 current_rows[feed_key] = row
         if current_sample is not None:
             yield current_sample, current_rows
+
+
+def _market_files_for_window(
+    data_root: Path,
+    *,
+    start: datetime,
+    end: datetime,
+) -> tuple[Path, ...]:
+    first_date = start.date()
+    last_date = (end - timedelta(microseconds=1)).date()
+    files: list[Path] = []
+    current_date = first_date
+    while current_date <= last_date:
+        partition = data_root / "market" / f"date={current_date.isoformat()}"
+        files.extend(
+            path for path in sorted(partition.glob("part-*.parquet")) if path.is_file()
+        )
+        current_date += timedelta(days=1)
+    return tuple(files)
 
 
 def _process_sample(
