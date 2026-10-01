@@ -205,9 +205,9 @@ def replay_market_data(
 ) -> ReplayResult:
     """Replay configured exact directional pairs over ``[start, end)``.
 
-    The query is executed one canonical symbol at a time.  Each symbol owns
-    only its pair trackers and bounded rolling windows, rather than the full
-    market cross-product.
+    One ordered streaming query supplies the selected feeds.  Replay keeps
+    only one canonical symbol's pair trackers and bounded rolling windows at a
+    time, rather than the full market cross-product.
     """
     started = time.perf_counter()
     start_utc = _as_utc(start, "start")
@@ -219,25 +219,32 @@ def replay_market_data(
     all_replay_episodes: list[ReplayEpisode] = []
     warm_start = start_utc - timedelta(seconds=CONTEXT_WINDOW_SECONDS["48h"])
 
-    for canonical_symbol, feeds in sorted(feeds_by_symbol.items()):
-        pair_states = _pair_states(
-            canonical_symbol,
-            feeds,
-            anomaly_parameters,
-            long_venue=long_venue,
-            long_venue_symbol=long_venue_symbol,
-            short_venue=short_venue,
-            short_venue_symbol=short_venue_symbol,
-        )
-        if not pair_states:
-            continue
-        for sample_time, rows in _iter_symbol_rows(
-            data_root=data_root,
-            canonical_symbol=canonical_symbol,
-            feeds=feeds,
-            start=warm_start,
-            end=end_utc,
-        ):
+    current_symbol: str | None = None
+    pair_states: dict[SpreadPairKey, _PairState] = {}
+    for canonical_symbol, sample_time, rows in _iter_market_rows(
+        data_root=data_root,
+        feeds_by_symbol=feeds_by_symbol,
+        start=warm_start,
+        end=end_utc,
+    ):
+        if canonical_symbol != current_symbol:
+            _collect_replay_episodes(
+                all_replay_episodes,
+                pair_states,
+                start=start_utc,
+                end=end_utc,
+            )
+            current_symbol = canonical_symbol
+            pair_states = _pair_states(
+                canonical_symbol,
+                feeds_by_symbol[canonical_symbol],
+                anomaly_parameters,
+                long_venue=long_venue,
+                long_venue_symbol=long_venue_symbol,
+                short_venue=short_venue,
+                short_venue_symbol=short_venue_symbol,
+            )
+        if pair_states:
             _process_sample(
                 sample_time,
                 rows,
@@ -245,17 +252,12 @@ def replay_market_data(
                 stale_after_seconds=config.monitors.spread.stale_after_seconds,
             )
 
-        for state in pair_states.values():
-            state.tracker.finalize()
-            for episode in state.tracker.confirmed_episodes:
-                if not _intersects_window(episode, start_utc, end_utc):
-                    continue
-                context = state.confirmation_contexts.get(episode.episode_id)
-                if context is None:
-                    raise RuntimeError(
-                        "confirmed episode is missing its confirmation context"
-                    )
-                all_replay_episodes.append(ReplayEpisode(episode, context))
+    _collect_replay_episodes(
+        all_replay_episodes,
+        pair_states,
+        start=start_utc,
+        end=end_utc,
+    )
 
     all_replay_episodes.sort(
         key=lambda item: (
@@ -363,22 +365,29 @@ def _matches_filters(
     )
 
 
-def _iter_symbol_rows(
+def _iter_market_rows(
     *,
     data_root: Path,
-    canonical_symbol: str,
-    feeds: tuple[tuple[str, str], ...],
+    feeds_by_symbol: dict[str, tuple[tuple[str, str], ...]],
     start: datetime,
     end: datetime,
-) -> Iterator[tuple[datetime, dict[tuple[str, str], tuple[datetime, object, object]]]]:
+) -> Iterator[
+    tuple[str, datetime, dict[tuple[str, str], tuple[datetime, object, object]]]
+]:
     market_files = _market_files_for_window(data_root, start=start, end=end)
     if not market_files:
         return
     market_paths = ", ".join(
         "'" + str(path).replace("'", "''") + "'" for path in market_files
     )
+    feed_descriptors = [
+        (canonical_symbol, venue, venue_symbol)
+        for canonical_symbol, feeds in sorted(feeds_by_symbol.items())
+        for venue, venue_symbol in feeds
+    ]
     predicates = " OR ".join(
-        "(venue = ? AND venue_symbol = ?)" for _ in feeds
+        "(canonical_symbol = ? AND venue = ? AND venue_symbol = ?)"
+        for _ in feed_descriptors
     )
     query = f"""
         WITH filtered AS (
@@ -397,7 +406,6 @@ def _iter_symbol_rows(
             FROM read_parquet([{market_paths}])
             WHERE sample_time >= ?
               AND sample_time < ?
-              AND canonical_symbol = ?
               AND ({predicates})
         )
         SELECT
@@ -410,20 +418,22 @@ def _iter_symbol_rows(
             sell_10k_vwap
         FROM filtered
         WHERE row_number = 1
-        ORDER BY sample_time, observed_at
+        ORDER BY canonical_symbol, sample_time, observed_at
     """
-    parameters: list[object] = [start, end, canonical_symbol]
-    for venue, venue_symbol in feeds:
-        parameters.extend((venue, venue_symbol))
+    parameters: list[object] = [start, end]
+    for descriptor in feed_descriptors:
+        parameters.extend(descriptor)
 
     with duckdb.connect() as connection:
         result = connection.execute(query, parameters)
         reader = result.to_arrow_reader(batch_size=QUERY_BATCH_SIZE)
+        current_symbol: str | None = None
         current_sample: datetime | None = None
         current_rows: dict[tuple[str, str], tuple[datetime, object, object]] = {}
         for batch in reader:
             columns = batch.to_pydict()
             for index in range(batch.num_rows):
+                canonical_symbol = str(columns["canonical_symbol"][index])
                 sample_time = _as_utc(columns["sample_time"][index], "sample_time")
                 row = (
                     _as_utc(columns["observed_at"][index], "observed_at"),
@@ -434,15 +444,23 @@ def _iter_symbol_rows(
                     str(columns["venue"][index]),
                     str(columns["venue_symbol"][index]),
                 )
+                if current_symbol is None:
+                    current_symbol = canonical_symbol
                 if current_sample is None:
                     current_sample = sample_time
-                if sample_time != current_sample:
-                    yield current_sample, current_rows
+                if (
+                    canonical_symbol != current_symbol
+                    or sample_time != current_sample
+                ):
+                    assert current_symbol is not None
+                    assert current_sample is not None
+                    yield current_symbol, current_sample, current_rows
+                    current_symbol = canonical_symbol
                     current_sample = sample_time
                     current_rows = {}
                 current_rows[feed_key] = row
-        if current_sample is not None:
-            yield current_sample, current_rows
+        if current_symbol is not None and current_sample is not None:
+            yield current_symbol, current_sample, current_rows
 
 
 def _market_files_for_window(
@@ -462,6 +480,26 @@ def _market_files_for_window(
         )
         current_date += timedelta(days=1)
     return tuple(files)
+
+
+def _collect_replay_episodes(
+    output: list[ReplayEpisode],
+    states: dict[SpreadPairKey, _PairState],
+    *,
+    start: datetime,
+    end: datetime,
+) -> None:
+    for state in states.values():
+        state.tracker.finalize()
+        for episode in state.tracker.confirmed_episodes:
+            if not _intersects_window(episode, start, end):
+                continue
+            context = state.confirmation_contexts.get(episode.episode_id)
+            if context is None:
+                raise RuntimeError(
+                    "confirmed episode is missing its confirmation context"
+                )
+            output.append(ReplayEpisode(episode, context))
 
 
 def _process_sample(
