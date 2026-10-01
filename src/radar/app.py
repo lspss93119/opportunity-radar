@@ -582,6 +582,9 @@ def build_application(
         telegram,
         candidate_net_bps=config.monitors.spread.candidate_net_bps,
         alert_net_bps=config.monitors.spread.alert_net_bps,
+        anomaly_v2_config=config.monitors.spread.anomaly_v2,
+        runtime_store=runtime_store,
+        stale_after_seconds=config.monitors.spread.stale_after_seconds,
     )
     alert_worker = AlertWorker(
         queue,

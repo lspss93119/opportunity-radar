@@ -12,7 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 
-from radar.alerts.models import SpreadAlertDetails
+from radar.alerts.models import AnomalyAlertDetails, SpreadAlertDetails
 from radar.history.spread import HistoricalSpreadContext, HistoricalSpreadPoint
 
 MAX_CHART_POINTS = 500
@@ -284,6 +284,97 @@ def render_spread_chart(
             fontsize=8,
             bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
         )
+        axis.set_title(
+            f"{details.canonical_symbol} | {details.long_venue} → "
+            f"{details.short_venue} | ${details.primary_size_usd:,}",
+            fontsize=11,
+        )
+        axis.set_xlabel("Time (UTC)", fontsize=9)
+        axis.set_ylabel("Raw spread (bps)", fontsize=9)
+        axis.tick_params(axis="both", labelsize=8)
+        axis.grid(axis="y", alpha=0.25)
+        axis.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz="UTC"))
+        figure.subplots_adjust(right=0.98, bottom=0.22)
+        figure.autofmt_xdate(rotation=30, ha="right")
+        output = BytesIO()
+        figure.savefig(output, format="png", dpi=120, bbox_inches="tight")
+        return output.getvalue()
+    finally:
+        plt.close(figure)
+
+
+def render_anomaly_chart(
+    details: AnomalyAlertDetails,
+    context: HistoricalSpreadContext,
+) -> bytes | None:
+    """Render the v2 lifecycle without legacy median/threshold clutter."""
+    all_points = tuple(sorted(context.points_7d, key=lambda point: point.sample_time))
+    if len(all_points) < 2:
+        return None
+    rolling_means = _rolling_mean_series(all_points)
+    display_points = _downsample_points(_recent_points(all_points))
+    figure, axis = plt.subplots(figsize=(9, 4.5))
+    try:
+        axis.plot(
+            mdates.date2num([point.sample_time for point in display_points]),
+            [point.raw_spread_bps for point in display_points],
+            color="tab:blue",
+            linewidth=1.2,
+            label="Raw spread",
+        )
+        mean_points = [
+            point for point in display_points if point.sample_time in rolling_means
+        ]
+        if mean_points:
+            axis.plot(
+                mdates.date2num([point.sample_time for point in mean_points]),
+                [rolling_means[point.sample_time] for point in mean_points],
+                color="tab:orange",
+                linewidth=1.0,
+                label="Prior-only 24h mean",
+            )
+        axis.axhline(
+            details.reference_mean_bps,
+            color="tab:green",
+            linestyle="--",
+            linewidth=1.0,
+        )
+        _label_reference_line(
+            axis,
+            details.reference_mean_bps,
+            "Reference",
+            "tab:green",
+        )
+        point_by_time = {point.sample_time: point for point in all_points}
+        markers = (
+            (details.candidate_started_at, "Candidate", "tab:purple", "o"),
+            (details.confirmed_at, "Confirmed", "tab:red", "D"),
+            (details.post_confirmation_peak_at, "Peak", "tab:pink", "^"),
+            (details.ended_at or details.sample_time, "Current/return", "black", "X"),
+        )
+        for timestamp, label, color, marker in markers:
+            if timestamp is None:
+                continue
+            point = point_by_time.get(timestamp)
+            if point is None:
+                continue
+            axis.scatter(
+                [mdates.date2num(point.sample_time)],
+                [point.raw_spread_bps],
+                color=color,
+                marker=marker,
+                s=38,
+                zorder=6,
+            )
+            axis.annotate(
+                label,
+                (mdates.date2num(point.sample_time), point.raw_spread_bps),
+                xytext=(4, 5),
+                textcoords="offset points",
+                fontsize=7,
+                color=color,
+            )
         axis.set_title(
             f"{details.canonical_symbol} | {details.long_venue} → "
             f"{details.short_venue} | ${details.primary_size_usd:,}",
