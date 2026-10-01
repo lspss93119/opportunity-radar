@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 import csv
-from collections import deque
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 import math
 from pathlib import Path
 import resource
+from statistics import median, quantiles
 import time
-from typing import Iterator
+from collections.abc import Iterator, Mapping
+from typing import Any
 
 import duckdb  # type: ignore[import-untyped]
 
@@ -50,6 +53,28 @@ class ReplayParameters:
             return_band_bps=self.return_band_bps,
             max_gap_seconds=self.max_gap_seconds,
         )
+
+
+RESEARCH_PARAMETER_SETS = {
+    "A": ReplayParameters(
+        anomaly_deviation_bps=10.0,
+        confirmation_seconds=60,
+        return_band_bps=5.0,
+        max_gap_seconds=20,
+    ),
+    "B": ReplayParameters(
+        anomaly_deviation_bps=10.0,
+        confirmation_seconds=120,
+        return_band_bps=5.0,
+        max_gap_seconds=20,
+    ),
+    "C": ReplayParameters(
+        anomaly_deviation_bps=15.0,
+        confirmation_seconds=60,
+        return_band_bps=5.0,
+        max_gap_seconds=20,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -133,41 +158,74 @@ class ReplayResult:
     elapsed_seconds: float
     peak_rss_bytes: int
     processed_symbols: tuple[str, ...]
+    processed_pairs: int = 0
 
 
-class _PriorWindow:
-    def __init__(self, window_seconds: int) -> None:
-        self.window_seconds = window_seconds
-        self.expected_count = window_seconds // EXPECTED_INTERVAL_SECONDS
-        self.minimum_count = math.ceil(self.expected_count * 0.8)
-        self._values: deque[tuple[datetime, float]] = deque()
-        self._sum = 0.0
-        self._sum_squares = 0.0
+@dataclass(frozen=True)
+class ReplayMultiResult:
+    results: Mapping[str, ReplayResult]
+    elapsed_seconds: float
+    peak_rss_bytes: int
+    processed_symbols: tuple[str, ...]
+    processed_pairs: int
 
-    def stats_before(self, sample_time: datetime) -> ReplayWindowStats:
-        cutoff = sample_time - timedelta(seconds=self.window_seconds)
-        while self._values and self._values[0][0] < cutoff:
-            _timestamp, value = self._values.popleft()
-            self._sum -= value
-            self._sum_squares -= value * value
 
-        values = [value for _timestamp, value in self._values]
-        count = len(values)
+class _ContextHistory:
+    """One bounded 48-hour history with lazy prior-window statistics."""
+
+    def __init__(self, max_window_seconds: int = CONTEXT_WINDOW_SECONDS["48h"]) -> None:
+        self.max_window_seconds = max_window_seconds
+        self._times = array("q")
+        self._values = array("d")
+        self._start_index = 0
+
+    def append(self, sample_time: datetime, value: float) -> None:
+        timestamp = _as_utc(sample_time, "sample_time")
+        timestamp_us = _epoch_microseconds(timestamp)
+        if self._times and timestamp_us < self._times[-1]:
+            raise ValueError("sample_time must not move backwards")
+        self._prune(timestamp_us - self.max_window_seconds * 1_000_000)
+        self._times.append(timestamp_us)
+        self._values.append(float(value))
+
+    def stats_before(self, sample_time: datetime, window_seconds: int) -> ReplayWindowStats:
+        timestamp = _as_utc(sample_time, "sample_time")
+        timestamp_us = _epoch_microseconds(timestamp)
+        if window_seconds <= 0 or window_seconds > self.max_window_seconds:
+            raise ValueError("window_seconds must fit the context history")
+        cutoff_us = timestamp_us - window_seconds * 1_000_000
+        count = 0
+        total = 0.0
+        total_squares = 0.0
         mean: float | None = None
         std: float | None = None
         minimum: float | None = None
         maximum: float | None = None
-        if values:
-            mean = self._sum / count
-            std = math.sqrt(max(0.0, self._sum_squares / count - mean * mean))
-            minimum = min(values)
-            maximum = max(values)
-        coverage = count / self.expected_count
-        has_full_window_anchor = bool(values) and self._values[0][0] <= cutoff
+        has_anchor = False
+        for index in range(self._start_index, len(self._times)):
+            value_time = self._times[index]
+            value = self._values[index]
+            if value_time >= timestamp_us:
+                break
+            if value_time < cutoff_us:
+                continue
+            count += 1
+            total += value
+            total_squares += value * value
+            minimum = value if minimum is None else min(minimum, value)
+            maximum = value if maximum is None else max(maximum, value)
+            if value_time == cutoff_us:
+                has_anchor = True
+        if count:
+            mean = total / count
+            std = math.sqrt(max(0.0, total_squares / count - mean * mean))
+        expected_count = window_seconds // EXPECTED_INTERVAL_SECONDS
+        minimum_count = math.ceil(expected_count * 0.8)
+        coverage = count / expected_count
         eligible = (
-            count >= self.minimum_count
+            count >= minimum_count
             and coverage >= 0.8
-            and has_full_window_anchor
+            and has_anchor
             and mean is not None
             and std is not None
         )
@@ -180,19 +238,38 @@ class _PriorWindow:
             eligible=eligible,
         )
 
-    def append(self, sample_time: datetime, value: float) -> None:
-        self._values.append((sample_time, value))
-        self._sum += value
-        self._sum_squares += value * value
+    @property
+    def expected_count(self) -> int:
+        return self.max_window_seconds // EXPECTED_INTERVAL_SECONDS
+
+    @property
+    def point_count(self) -> int:
+        return len(self._times) - self._start_index
+
+    def _prune(self, cutoff_us: int) -> None:
+        while (
+            self._start_index < len(self._times)
+            and self._times[self._start_index] < cutoff_us
+        ):
+            self._start_index += 1
+        if self._start_index >= 4_096 and self._start_index * 2 >= len(self._times):
+            self._times = self._times[self._start_index :]
+            self._values = self._values[self._start_index :]
+            self._start_index = 0
+
+
+@dataclass
+class _TrackerState:
+    tracker: AnomalyTracker
+    confirmation_contexts: dict[str, ConfirmationContext]
 
 
 @dataclass
 class _PairState:
     key: SpreadPairKey
-    tracker: AnomalyTracker
     basis: RollingBasis
-    windows: dict[str, _PriorWindow]
-    confirmation_contexts: dict[str, ConfirmationContext]
+    context_history: _ContextHistory
+    trackers: dict[str, _TrackerState]
 
 
 def replay_market_data(
@@ -208,18 +285,47 @@ def replay_market_data(
     short_venue: str | None = None,
     short_venue_symbol: str | None = None,
 ) -> ReplayResult:
-    """Replay configured exact directional pairs over ``[start, end)``.
+    """Replay one configuration using the shared multi-configuration path."""
+    result = replay_market_data_multi(
+        data_root=data_root,
+        config=config,
+        start=start,
+        end=end,
+        parameter_sets={"default": parameters},
+        symbol=symbol,
+        long_venue=long_venue,
+        long_venue_symbol=long_venue_symbol,
+        short_venue=short_venue,
+        short_venue_symbol=short_venue_symbol,
+    )
+    return result.results["default"]
 
-    Replay processes one canonical symbol at a time.  Each ordered query is
-    limited to that symbol's selected feeds, so pair trackers and rolling
-    windows stay bounded without a global cross-symbol sort.
-    """
+
+def replay_market_data_multi(
+    *,
+    data_root: Path,
+    config: RadarConfig,
+    start: datetime,
+    end: datetime,
+    parameter_sets: Mapping[str, ReplayParameters],
+    symbol: str | None = None,
+    long_venue: str | None = None,
+    long_venue_symbol: str | None = None,
+    short_venue: str | None = None,
+    short_venue_symbol: str | None = None,
+) -> ReplayMultiResult:
+    """Replay independent configurations over one shared market-data stream."""
     started = time.perf_counter()
     start_utc = _as_utc(start, "start")
     end_utc = _as_utc(end, "end")
     if end_utc <= start_utc:
         raise ValueError("end must be after start")
-    anomaly_parameters = parameters.as_anomaly_parameters()
+    if not parameter_sets:
+        raise ValueError("parameter_sets must not be empty")
+    anomaly_parameters = {
+        name: parameters.as_anomaly_parameters()
+        for name, parameters in parameter_sets.items()
+    }
     feeds_by_symbol = _configured_feeds(
         config,
         symbol=symbol,
@@ -228,51 +334,68 @@ def replay_market_data(
         short_venue=short_venue,
         short_venue_symbol=short_venue_symbol,
     )
-    all_replay_episodes: list[ReplayEpisode] = []
-    warm_start = start_utc - timedelta(seconds=CONTEXT_WINDOW_SECONDS["48h"])
-
-    for canonical_symbol in sorted(feeds_by_symbol):
-        pair_states = _pair_states(
+    states_by_symbol = {
+        canonical_symbol: _pair_states(
             canonical_symbol,
-            feeds_by_symbol[canonical_symbol],
+            feeds,
             anomaly_parameters,
             long_venue=long_venue,
             long_venue_symbol=long_venue_symbol,
             short_venue=short_venue,
             short_venue_symbol=short_venue_symbol,
         )
-        for _canonical_symbol, sample_time, rows in _iter_market_rows(
-            data_root=data_root,
-            feeds_by_symbol={
-                canonical_symbol: feeds_by_symbol[canonical_symbol]
-            },
-            start=warm_start,
-            end=end_utc,
-        ):
+        for canonical_symbol, feeds in feeds_by_symbol.items()
+    }
+    warm_start = start_utc - timedelta(seconds=CONTEXT_WINDOW_SECONDS["48h"])
+    for canonical_symbol, sample_time, rows in _iter_market_rows(
+        data_root=data_root,
+        feeds_by_symbol=feeds_by_symbol,
+        start=warm_start,
+        end=end_utc,
+    ):
+        pair_states = states_by_symbol.get(canonical_symbol)
+        if pair_states:
             _process_sample(
                 sample_time,
                 rows,
                 pair_states,
                 stale_after_seconds=config.monitors.spread.stale_after_seconds,
             )
-        _collect_replay_episodes(
-            all_replay_episodes,
-            pair_states,
-            start=start_utc,
-            end=end_utc,
-        )
 
-    all_replay_episodes.sort(
-        key=lambda item: (
-            item.episode.confirmed_at or item.episode.candidate_started_at,
-            item.episode.episode_id,
+    elapsed_seconds = time.perf_counter() - started
+    peak_rss_bytes = _peak_rss_bytes()
+    processed_symbols = tuple(sorted(feeds_by_symbol))
+    processed_pairs = sum(len(states) for states in states_by_symbol.values())
+    results: dict[str, ReplayResult] = {}
+    for name in parameter_sets:
+        episodes: list[ReplayEpisode] = []
+        for pair_states in states_by_symbol.values():
+            _collect_replay_episodes(
+                episodes,
+                pair_states,
+                configuration=name,
+                start=start_utc,
+                end=end_utc,
+            )
+        episodes.sort(
+            key=lambda item: (
+                item.episode.confirmed_at or item.episode.candidate_started_at,
+                item.episode.episode_id,
+            )
         )
-    )
-    return ReplayResult(
-        episodes=tuple(all_replay_episodes),
-        elapsed_seconds=time.perf_counter() - started,
-        peak_rss_bytes=_peak_rss_bytes(),
-        processed_symbols=tuple(sorted(feeds_by_symbol)),
+        results[name] = ReplayResult(
+            episodes=tuple(episodes),
+            elapsed_seconds=elapsed_seconds,
+            peak_rss_bytes=peak_rss_bytes,
+            processed_symbols=processed_symbols,
+            processed_pairs=processed_pairs,
+        )
+    return ReplayMultiResult(
+        results=results,
+        elapsed_seconds=elapsed_seconds,
+        peak_rss_bytes=peak_rss_bytes,
+        processed_symbols=processed_symbols,
+        processed_pairs=processed_pairs,
     )
 
 
@@ -349,7 +472,7 @@ def _configured_feeds(
 def _pair_states(
     canonical_symbol: str,
     feeds: tuple[tuple[str, str], ...],
-    parameters: AnomalyParameters,
+    parameter_sets: Mapping[str, AnomalyParameters],
     *,
     long_venue: str | None,
     long_venue_symbol: str | None,
@@ -378,13 +501,15 @@ def _pair_states(
                 continue
             states[key] = _PairState(
                 key=key,
-                tracker=AnomalyTracker(key, parameters),
                 basis=RollingBasis(),
-                windows={
-                    name: _PriorWindow(seconds)
-                    for name, seconds in CONTEXT_WINDOW_SECONDS.items()
+                context_history=_ContextHistory(),
+                trackers={
+                    name: _TrackerState(
+                        tracker=AnomalyTracker(key, parameters),
+                        confirmation_contexts={},
+                    )
+                    for name, parameters in parameter_sets.items()
                 },
-                confirmation_contexts={},
             )
     return states
 
@@ -417,80 +542,103 @@ def _iter_market_rows(
 ) -> Iterator[
     tuple[str, datetime, dict[tuple[str, str], tuple[datetime, object, object]]]
 ]:
-    market_files = _market_files_for_window(data_root, start=start, end=end)
-    if not market_files:
+    market_partitions = _market_partitions_for_window(data_root, start=start, end=end)
+    if not market_partitions:
         return
-    market_paths = ", ".join(
-        "'" + str(path).replace("'", "''") + "'" for path in market_files
-    )
     feed_descriptors = [
         (canonical_symbol, venue, venue_symbol)
         for canonical_symbol, feeds in sorted(feeds_by_symbol.items())
         for venue, venue_symbol in feeds
     ]
+    if not feed_descriptors:
+        return
     predicates = " OR ".join(
         "(canonical_symbol = ? AND venue = ? AND venue_symbol = ?)"
         for _ in feed_descriptors
     )
-    query = f"""
-        SELECT
-            sample_time,
-            observed_at,
-            venue,
-            venue_symbol,
-            canonical_symbol,
-            buy_10k_vwap,
-            sell_10k_vwap
-        FROM read_parquet([{market_paths}])
-        WHERE sample_time >= ?
-          AND sample_time < ?
-          AND ({predicates})
-        ORDER BY canonical_symbol, sample_time, observed_at
-    """
-    parameters: list[object] = [start, end]
-    for descriptor in feed_descriptors:
-        parameters.extend(descriptor)
 
     with duckdb.connect() as connection:
-        result = connection.execute(query, parameters)
-        reader = result.to_arrow_reader(batch_size=QUERY_BATCH_SIZE)
         current_symbol: str | None = None
         current_sample: datetime | None = None
         current_rows: dict[tuple[str, str], tuple[datetime, object, object]] = {}
-        for batch in reader:
-            columns = batch.to_pydict()
-            for index in range(batch.num_rows):
-                canonical_symbol = str(columns["canonical_symbol"][index])
-                sample_time = _as_utc(columns["sample_time"][index], "sample_time")
-                row = (
-                    _as_utc(columns["observed_at"][index], "observed_at"),
-                    columns["buy_10k_vwap"][index],
-                    columns["sell_10k_vwap"][index],
-                )
-                feed_key = (
-                    str(columns["venue"][index]),
-                    str(columns["venue_symbol"][index]),
-                )
-                if current_symbol is None:
-                    current_symbol = canonical_symbol
-                if current_sample is None:
-                    current_sample = sample_time
-                if (
-                    canonical_symbol != current_symbol
-                    or sample_time != current_sample
-                ):
-                    assert current_symbol is not None
-                    assert current_sample is not None
-                    yield current_symbol, current_sample, current_rows
-                    current_symbol = canonical_symbol
-                    current_sample = sample_time
-                    current_rows = {}
-                # observed_at is ascending within a feed/sample group, so the
-                # final assignment preserves the latest-observation dedup
-                # semantics without a global window operation.
-                current_rows[feed_key] = row
+        for market_files in market_partitions:
+            market_paths = ", ".join(
+                "'" + str(path).replace("'", "''") + "'" for path in market_files
+            )
+            query = f"""
+                SELECT
+                    sample_time,
+                    observed_at,
+                    venue,
+                    venue_symbol,
+                    canonical_symbol,
+                    buy_10k_vwap,
+                    sell_10k_vwap
+                FROM read_parquet([{market_paths}])
+                WHERE sample_time >= ?
+                  AND sample_time < ?
+                  AND ({predicates})
+                ORDER BY canonical_symbol, sample_time, observed_at
+            """
+            parameters: list[object] = [start, end]
+            for descriptor in feed_descriptors:
+                parameters.extend(descriptor)
+            result = connection.execute(query, parameters)
+            reader = result.to_arrow_reader(batch_size=QUERY_BATCH_SIZE)
+            for batch in reader:
+                columns = batch.to_pydict()
+                for index in range(batch.num_rows):
+                    canonical_symbol = str(columns["canonical_symbol"][index])
+                    sample_time = _as_utc(columns["sample_time"][index], "sample_time")
+                    row = (
+                        _as_utc(columns["observed_at"][index], "observed_at"),
+                        columns["buy_10k_vwap"][index],
+                        columns["sell_10k_vwap"][index],
+                    )
+                    feed_key = (
+                        str(columns["venue"][index]),
+                        str(columns["venue_symbol"][index]),
+                    )
+                    if current_symbol is None:
+                        current_symbol = canonical_symbol
+                    if current_sample is None:
+                        current_sample = sample_time
+                    if (
+                        canonical_symbol != current_symbol
+                        or sample_time != current_sample
+                    ):
+                        assert current_symbol is not None
+                        assert current_sample is not None
+                        yield current_symbol, current_sample, current_rows
+                        current_symbol = canonical_symbol
+                        current_sample = sample_time
+                        current_rows = {}
+                    # observed_at is ascending within a feed/sample group, so
+                    # the final assignment preserves latest-observation dedup.
+                    current_rows[feed_key] = row
         if current_symbol is not None and current_sample is not None:
             yield current_symbol, current_sample, current_rows
+
+
+def _market_partitions_for_window(
+    data_root: Path,
+    *,
+    start: datetime,
+    end: datetime,
+) -> tuple[tuple[Path, ...], ...]:
+    first_date = start.date()
+    last_date = (end - timedelta(microseconds=1)).date()
+    partitions: list[tuple[Path, ...]] = []
+    current_date = first_date
+    while current_date <= last_date:
+        partition = data_root / "market" / f"date={current_date.isoformat()}"
+        files = tuple(
+            path for path in sorted(partition.glob("part-*.parquet")) if path.is_file()
+        )
+        if files:
+            partitions.append(files)
+        current_date += timedelta(days=1)
+    return tuple(partitions)
 
 
 def _market_files_for_window(
@@ -499,32 +647,28 @@ def _market_files_for_window(
     start: datetime,
     end: datetime,
 ) -> tuple[Path, ...]:
-    first_date = start.date()
-    last_date = (end - timedelta(microseconds=1)).date()
-    files: list[Path] = []
-    current_date = first_date
-    while current_date <= last_date:
-        partition = data_root / "market" / f"date={current_date.isoformat()}"
-        files.extend(
-            path for path in sorted(partition.glob("part-*.parquet")) if path.is_file()
-        )
-        current_date += timedelta(days=1)
-    return tuple(files)
+    return tuple(
+        path
+        for partition in _market_partitions_for_window(data_root, start=start, end=end)
+        for path in partition
+    )
 
 
 def _collect_replay_episodes(
     output: list[ReplayEpisode],
     states: dict[SpreadPairKey, _PairState],
     *,
+    configuration: str,
     start: datetime,
     end: datetime,
 ) -> None:
     for state in states.values():
-        state.tracker.finalize()
-        for episode in state.tracker.confirmed_episodes:
+        tracker_state = state.trackers[configuration]
+        tracker_state.tracker.finalize()
+        for episode in tracker_state.tracker.confirmed_episodes:
             if not _intersects_window(episode, start, end):
                 continue
-            context = state.confirmation_contexts.get(episode.episode_id)
+            context = tracker_state.confirmation_contexts.get(episode.episode_id)
             if context is None:
                 raise RuntimeError(
                     "confirmed episode is missing its confirmation context"
@@ -559,30 +703,34 @@ def _process_sample(
         if not math.isfinite(raw_spread_bps):
             continue
         basis_stats = state.basis.observe(sample_time, raw_spread_bps)
-        context_stats = {
-            name: window.stats_before(sample_time)
-            for name, window in state.windows.items()
-        }
-        for window in state.windows.values():
-            window.append(sample_time, raw_spread_bps)
-        transitions = state.tracker.observe(
-            AnomalyObservation(
-                sample_time=sample_time,
-                raw_spread_bps=raw_spread_bps,
-                rolling_mean_bps=basis_stats.mean_bps,
-                rolling_std_bps=basis_stats.std_bps,
-                basis_eligible=basis_stats.eligible,
-            )
+        observation = AnomalyObservation(
+            sample_time=sample_time,
+            raw_spread_bps=raw_spread_bps,
+            rolling_mean_bps=basis_stats.mean_bps,
+            rolling_std_bps=basis_stats.std_bps,
+            basis_eligible=basis_stats.eligible,
         )
-        for transition in transitions:
-            if transition.kind == "confirmed":
-                state.confirmation_contexts[transition.episode.episode_id] = (
-                    ConfirmationContext(
-                        stats_12h=context_stats["12h"],
-                        stats_24h=context_stats["24h"],
-                        stats_48h=context_stats["48h"],
+        confirmation_context: ConfirmationContext | None = None
+        for tracker_state in state.trackers.values():
+            transitions = tracker_state.tracker.observe(observation)
+            for transition in transitions:
+                if transition.kind == "confirmed":
+                    if confirmation_context is None:
+                        confirmation_context = ConfirmationContext(
+                            stats_12h=state.context_history.stats_before(
+                                sample_time, CONTEXT_WINDOW_SECONDS["12h"]
+                            ),
+                            stats_24h=state.context_history.stats_before(
+                                sample_time, CONTEXT_WINDOW_SECONDS["24h"]
+                            ),
+                            stats_48h=state.context_history.stats_before(
+                                sample_time, CONTEXT_WINDOW_SECONDS["48h"]
+                            ),
+                        )
+                    tracker_state.confirmation_contexts[transition.episode.episode_id] = (
+                        confirmation_context
                     )
-                )
+        state.context_history.append(sample_time, raw_spread_bps)
 
 
 def _positive_float(value: object) -> float | None:
@@ -610,6 +758,10 @@ def _as_utc(value: datetime, field_name: str) -> datetime:
     return value.astimezone(UTC)
 
 
+def _epoch_microseconds(value: datetime) -> int:
+    return int(value.timestamp() * 1_000_000)
+
+
 def _time_string(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
 
@@ -617,6 +769,110 @@ def _time_string(value: datetime | None) -> str | None:
 def _peak_rss_bytes() -> int:
     value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     return value if __import__("sys").platform == "darwin" else value * 1024
+
+
+def _research_summary(result: ReplayResult) -> dict[str, Any]:
+    episodes = list(result.episodes)
+    total_durations = [
+        value
+        for episode in episodes
+        if (value := episode.episode.total_duration_seconds) is not None
+    ]
+    post_alive = [
+        value
+        for episode in episodes
+        if (value := episode.episode.post_confirmation_alive_seconds) is not None
+    ]
+    expansions = [
+        value
+        for episode in episodes
+        if (value := episode.episode.post_confirmation_expansion_bps) is not None
+    ]
+    confirmed_per_day = Counter(
+        episode.episode.confirmed_at.date().isoformat()
+        for episode in episodes
+        if episode.episode.confirmed_at is not None
+    )
+    reasons = Counter(episode.episode.resolution_reason for episode in episodes)
+
+    def percentile75(values: list[float]) -> float | None:
+        if not values:
+            return None
+        return values[0] if len(values) == 1 else quantiles(values, n=4, method="inclusive")[2]
+
+    def representative_row(replay_episode: ReplayEpisode) -> dict[str, object]:
+        episode = replay_episode.episode
+        return {
+            "symbol": episode.pair_key.canonical_symbol,
+            "direction": (
+                f"{episode.pair_key.long_venue}:{episode.pair_key.long_venue_symbol}"
+                f" -> {episode.pair_key.short_venue}:{episode.pair_key.short_venue_symbol}"
+            ),
+            "confirmation_time": _time_string(episode.confirmed_at),
+            "reference_mean_bps": episode.reference_mean_bps,
+            "confirmation_deviation_bps": episode.confirmation_deviation_bps,
+            "post_confirmation_peak_deviation_bps": (
+                episode.post_confirmation_peak_deviation_bps
+            ),
+            "post_confirmation_expansion_bps": episode.post_confirmation_expansion_bps,
+            "post_confirmation_alive_seconds": episode.post_confirmation_alive_seconds,
+            "resolution_reason": episode.resolution_reason,
+        }
+
+    longest = sorted(
+        episodes,
+        key=lambda item: (
+            -(item.episode.total_duration_seconds or 0.0),
+            item.episode.episode_id,
+        ),
+    )[:10]
+    shortest = sorted(
+        episodes,
+        key=lambda item: (
+            item.episode.total_duration_seconds or 0.0,
+            item.episode.episode_id,
+        ),
+    )[:10]
+    largest_expansion = sorted(
+        episodes,
+        key=lambda item: (
+            -(item.episode.post_confirmation_expansion_bps or 0.0),
+            item.episode.episode_id,
+        ),
+    )[:10]
+    return {
+        "confirmed_episode_count": len(episodes),
+        "confirmed_episodes_per_day": dict(sorted(confirmed_per_day.items())),
+        "median_total_episode_duration_seconds": median(total_durations)
+        if total_durations
+        else None,
+        "median_post_confirmation_alive_seconds": median(post_alive) if post_alive else None,
+        "post_confirmation_alive_at_least_5m_pct": (
+            100.0 * sum(value >= 300 for value in post_alive) / len(post_alive)
+            if post_alive
+            else None
+        ),
+        "post_confirmation_alive_at_least_10m_pct": (
+            100.0 * sum(value >= 600 for value in post_alive) / len(post_alive)
+            if post_alive
+            else None
+        ),
+        "median_post_confirmation_expansion_bps": median(expansions)
+        if expansions
+        else None,
+        "p75_post_confirmation_expansion_bps": percentile75(expansions),
+        "returned_to_mean_band_count": reasons.get("returned_to_mean_band", 0),
+        "data_gap_count": reasons.get("data_gap", 0),
+        "open_at_end_count": reasons.get("open_at_end", 0),
+        "longest": [representative_row(item) for item in longest],
+        "shortest": [representative_row(item) for item in shortest],
+        "largest_expansion": [representative_row(item) for item in largest_expansion],
+    }
+
+
+def _print_research_summary(name: str, result: ReplayResult) -> None:
+    summary = _research_summary(result)
+    print(f"[{name}] {summary}")
 
 
 def _parse_boundary(value: str, *, end: bool) -> datetime:
@@ -643,17 +899,46 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--return-band-bps", type=float, default=5.0)
     parser.add_argument("--max-gap-seconds", type=int, default=20)
     parser.add_argument("--output-csv", type=Path)
+    parser.add_argument(
+        "--research-abc",
+        action="store_true",
+        help="run A/B/C research configurations through one shared replay",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     config = load_config(args.config)
-    result = replay_market_data(
+    start = _parse_boundary(args.start, end=False)
+    end = _parse_boundary(args.end, end=True)
+    if args.research_abc:
+        if args.output_csv is not None:
+            raise SystemExit("--output-csv cannot be combined with --research-abc")
+        multi_result = replay_market_data_multi(
+            data_root=args.data_root,
+            config=config,
+            start=start,
+            end=end,
+            parameter_sets=RESEARCH_PARAMETER_SETS,
+            symbol=args.symbol,
+            long_venue=args.long_venue,
+            long_venue_symbol=args.long_venue_symbol,
+            short_venue=args.short_venue,
+            short_venue_symbol=args.short_venue_symbol,
+        )
+        print(f"symbols={len(multi_result.processed_symbols)}")
+        print(f"directional_pairs={multi_result.processed_pairs}")
+        print(f"elapsed_seconds={multi_result.elapsed_seconds:.3f}")
+        print(f"peak_rss_mb={multi_result.peak_rss_bytes / 1024 / 1024:.1f}")
+        for name in RESEARCH_PARAMETER_SETS:
+            _print_research_summary(name, multi_result.results[name])
+        return 0
+    single_result = replay_market_data(
         data_root=args.data_root,
         config=config,
-        start=_parse_boundary(args.start, end=False),
-        end=_parse_boundary(args.end, end=True),
+        start=start,
+        end=end,
         parameters=ReplayParameters(
             anomaly_deviation_bps=args.deviation_bps,
             confirmation_seconds=args.confirmation_seconds,
@@ -667,12 +952,13 @@ def main(argv: list[str] | None = None) -> int:
         short_venue_symbol=args.short_venue_symbol,
     )
     if args.output_csv is not None:
-        write_replay_csv(args.output_csv, result)
-    print(f"symbols={len(result.processed_symbols)}")
-    print(f"episodes={len(result.episodes)}")
-    print(f"elapsed_seconds={result.elapsed_seconds:.3f}")
-    print(f"peak_rss_mb={result.peak_rss_bytes / 1024 / 1024:.1f}")
-    for replay_episode in result.episodes:
+        write_replay_csv(args.output_csv, single_result)
+    print(f"symbols={len(single_result.processed_symbols)}")
+    print(f"directional_pairs={single_result.processed_pairs}")
+    print(f"episodes={len(single_result.episodes)}")
+    print(f"elapsed_seconds={single_result.elapsed_seconds:.3f}")
+    print(f"peak_rss_mb={single_result.peak_rss_bytes / 1024 / 1024:.1f}")
+    for replay_episode in single_result.episodes:
         print(replay_episode.to_row())
     if args.output_csv is not None:
         print(f"csv={args.output_csv}")
