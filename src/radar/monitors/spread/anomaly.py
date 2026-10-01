@@ -279,6 +279,49 @@ class AnomalyTracker:
     def confirmed_episodes(self) -> tuple[AnomalyEpisode, ...]:
         return tuple(self._confirmed_episodes)
 
+    def restore(
+        self,
+        *,
+        active_episode: AnomalyEpisode | None,
+        last_sample_time: datetime | None,
+    ) -> None:
+        """Restore persisted state without reaching into tracker internals.
+
+        The monitor owns the serialized wrapper state, while this method keeps
+        the pure lifecycle's invariants in one place.  Historical confirmed
+        episodes are intentionally not restored: the live monitor only needs
+        the active episode to continue the current lifecycle.
+        """
+        if active_episode is not None and active_episode.pair_key != self.pair_key:
+            raise ValueError("active episode pair does not match tracker")
+        if last_sample_time is not None:
+            last_sample_time = _as_utc(last_sample_time, "last_sample_time")
+        if (
+            active_episode is not None
+            and last_sample_time is not None
+            and last_sample_time < active_episode.last_seen_at
+        ):
+            raise ValueError("last_sample_time precedes active episode")
+        self._active_episode = (
+            None
+            if active_episode is None
+            else AnomalyEpisode.from_dict(active_episode.to_dict())
+        )
+        self._last_sample_time = last_sample_time
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return the minimal JSON-compatible state needed for restart."""
+        return {
+            "active_episode": (
+                None if self._active_episode is None else self._active_episode.to_dict()
+            ),
+            "last_sample_time": (
+                None
+                if self._last_sample_time is None
+                else self._last_sample_time.isoformat()
+            ),
+        }
+
     def observe(self, observation: AnomalyObservation) -> tuple[AnomalyTransition, ...]:
         sample_time = observation.sample_time
         if self._last_sample_time is not None and sample_time < self._last_sample_time:

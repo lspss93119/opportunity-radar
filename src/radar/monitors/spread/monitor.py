@@ -19,6 +19,7 @@ from radar.monitors.spread.basis import (
     RollingBasis,
     RollingBasisStats,
 )
+from radar.monitors.spread.anomaly_v2 import AnomalyV2Lifecycle
 from radar.monitors.spread.models import (
     SpreadCandidate,
     SpreadPairKey,
@@ -94,10 +95,19 @@ class SpreadMonitor:
         self._basis_expected_interval_seconds = basis_expected_interval_seconds
         self._episodes: dict[SpreadPairKey, SpreadEpisode] = {}
         self._basis_by_key: dict[SpreadPairKey, RollingBasis] = {}
+        self._anomaly_v2 = (
+            AnomalyV2Lifecycle(config.anomaly_v2, primary_size_usd=config.primary_size_usd)
+            if config.anomaly_v2.enabled
+            else None
+        )
         if runtime_store is not None:
             self._episodes = self._load_episodes(
                 runtime_store.get_monitor_state(self.name, "episodes")
             )
+            if self._anomaly_v2 is not None:
+                self._anomaly_v2.restore(
+                    runtime_store.get_monitor_state(self.name, "anomaly_episodes_v2")
+                )
 
     @property
     def active_episodes(self) -> tuple[SpreadEpisode, ...]:
@@ -105,6 +115,13 @@ class SpreadMonitor:
             self._episodes[key]
             for key in sorted(self._episodes, key=_pair_sort_key)
         )
+
+    @property
+    def active_anomaly_episodes(self) -> tuple[object, ...]:
+        """Read-only view of active v2 wrappers for diagnostics/tests."""
+        if self._anomaly_v2 is None:
+            return ()
+        return self._anomaly_v2.active_states
 
     def hydrate_history(
         self,
@@ -139,6 +156,8 @@ class SpreadMonitor:
         state: RadarState,
     ) -> list[AlertRequest]:
         current_time = _as_utc(now, "now")
+        if self._anomaly_v2 is not None:
+            return await self._evaluate_anomaly_v2(current_time, state)
         candidates = build_spread_candidates(
             state.markets,
             current_time,
@@ -278,6 +297,50 @@ class SpreadMonitor:
                 self._basis_by_key = previous_basis
             raise
         return alerts
+
+    async def _evaluate_anomaly_v2(
+        self,
+        current_time: datetime,
+        state: RadarState,
+    ) -> list[AlertRequest]:
+        candidates = build_spread_candidates(
+            state.markets,
+            current_time,
+            primary_size_usd=self.config.primary_size_usd,
+            stale_after_seconds=self.config.stale_after_seconds,
+            fees_bps=self._fees_bps,
+            require_fees=False,
+        )
+        candidate_by_key = {candidate.key: candidate for candidate in candidates}
+        previous_basis = (
+            deepcopy(self._basis_by_key) if self._runtime_store is not None else None
+        )
+        previous_v2 = (
+            deepcopy(self._anomaly_v2) if self._runtime_store is not None else None
+        )
+        basis_stats: dict[SpreadPairKey, RollingBasisStats] = {}
+        for candidate in candidates:
+            basis = self._basis_by_key.setdefault(candidate.key, self._new_basis())
+            basis_stats[candidate.key] = basis.observe(
+                candidate.sample_time,
+                candidate.raw_spread_bps,
+            )
+        assert self._anomaly_v2 is not None
+        result = self._anomaly_v2.evaluate(
+            candidates=candidate_by_key,
+            basis_stats=basis_stats,
+            state=state,
+            now=current_time,
+        )
+        try:
+            self._persist_anomaly_v2(current_time, result.events)
+        except Exception:
+            if previous_basis is not None:
+                self._basis_by_key = previous_basis
+            if previous_v2 is not None:
+                self._anomaly_v2 = previous_v2
+            raise
+        return list(result.alerts)
 
     def _start_episode(
         self,
@@ -493,6 +556,21 @@ class SpreadMonitor:
                 episode.episode_id: self._serialize_episode(episode)
                 for episode in self._episodes.values()
             },
+            updated_at=now,
+            opportunities=events,
+        )
+
+    def _persist_anomaly_v2(
+        self,
+        now: datetime,
+        events: tuple[OpportunityEvent, ...],
+    ) -> None:
+        if self._runtime_store is None or self._anomaly_v2 is None:
+            return
+        self._runtime_store.set_monitor_state_and_append_opportunities(
+            self.name,
+            "anomaly_episodes_v2",
+            self._anomaly_v2.snapshot(),
             updated_at=now,
             opportunities=events,
         )

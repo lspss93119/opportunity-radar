@@ -21,6 +21,20 @@ class MarketConfig(BaseModel):
     enabled: bool = True
 
 
+class AnomalyV2Config(BaseModel):
+    """Configuration for the opt-in positive-deviation anomaly lifecycle."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    deviation_bps: float = Field(default=15.0, ge=0, allow_inf_nan=False)
+    confirmation_seconds: int = Field(default=60, ge=0)
+    return_band_bps: float = Field(default=5.0, ge=0, allow_inf_nan=False)
+    max_gap_seconds: int = Field(default=20, gt=0)
+    mean_alignment_max_bps: float = Field(default=5.0, ge=0, allow_inf_nan=False)
+    expansion_notify_step_bps: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+
+
 class SpreadMonitorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -33,6 +47,7 @@ class SpreadMonitorConfig(BaseModel):
     alert_net_bps: float = Field(default=20.0, ge=0, allow_inf_nan=False)
     alert_duration_seconds: int = Field(default=120, ge=0)
     stale_after_seconds: int = Field(default=30, gt=0)
+    anomaly_v2: AnomalyV2Config = Field(default_factory=AnomalyV2Config)
 
 
 class MonitorConfig(BaseModel):

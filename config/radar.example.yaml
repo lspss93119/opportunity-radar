@@ -643,3 +643,11 @@ monitors:
     alert_net_bps: 20
     alert_duration_seconds: 120
     stale_after_seconds: 30
+    anomaly_v2:
+      enabled: false
+      deviation_bps: 15
+      confirmation_seconds: 60
+      return_band_bps: 5
+      max_gap_seconds: 20
+      mean_alignment_max_bps: 5
+      expansion_notify_step_bps: 5
