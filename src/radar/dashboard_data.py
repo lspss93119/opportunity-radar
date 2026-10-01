@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, cast
 
 import duckdb  # type: ignore[import-untyped]
 
@@ -77,6 +77,27 @@ def _positive_float(value: object) -> float | None:
 
 def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+ExactIdentity = tuple[str, str, str, str, str]
+
+
+def _parse_identity(value: object) -> ExactIdentity | None:
+    if isinstance(value, dict):
+        values = (
+            value.get("canonical_symbol"),
+            value.get("long_venue"),
+            value.get("long_venue_symbol"),
+            value.get("short_venue"),
+            value.get("short_venue_symbol"),
+        )
+    elif isinstance(value, (tuple, list)):
+        values = tuple(value)
+    else:
+        return None
+    if len(values) != 5 or any(not isinstance(item, str) or not item for item in values):
+        return None
+    return cast(ExactIdentity, tuple(values))
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -497,10 +518,10 @@ class DashboardQueryService:
     ) -> None:
         for observation in self._build_pair_observations(rows, now):
             if observation.key not in mutable_state_keys:
-                previous = model.pair_states.get(observation.key)
+                previous_state = model.pair_states.get(observation.key)
                 state = (
-                    copy.deepcopy(previous)
-                    if previous is not None
+                    copy.deepcopy(previous_state)
+                    if previous_state is not None
                     else _PairScannerState(points=deque())
                 )
                 model.pair_states[observation.key] = state
@@ -512,11 +533,14 @@ class DashboardQueryService:
                 observation.raw_spread_bps,
                 valid_for_history=observation.valid_for_history,
             )
-            previous = state.latest
-            if previous is None or (
+            previous_observation = state.latest
+            if previous_observation is None or (
                 observation.sample_time,
                 observation.observed_at,
-            ) >= (previous.sample_time, previous.observed_at):
+            ) >= (
+                previous_observation.sample_time,
+                previous_observation.observed_at,
+            ):
                 state.latest = observation
             state.prune(
                 int(observation.sample_time.timestamp()) - ROLLING_WINDOW_SECONDS
@@ -590,6 +614,68 @@ class DashboardQueryService:
             current_time,
             lambda: self._compute_opportunities(filters, current_time),
         )
+
+    def get_anomalies(
+        self,
+        *,
+        symbol: str | None = None,
+        long_venue: str | None = None,
+        short_venue: str | None = None,
+        eligible_only: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        current_time = _as_utc(self._clock() if now is None else now, "now")
+        key = ("anomalies", symbol, long_venue, short_venue, eligible_only)
+        return self._cached(
+            key,
+            current_time,
+            lambda: self._compute_anomalies(
+                current_time,
+                symbol=symbol,
+                long_venue=long_venue,
+                short_venue=short_venue,
+                eligible_only=eligible_only,
+            ),
+        )
+
+    def _compute_anomalies(
+        self,
+        now: datetime,
+        *,
+        symbol: str | None,
+        long_venue: str | None,
+        short_venue: str | None,
+        eligible_only: bool,
+    ) -> dict[str, object]:
+        active, _by_key, _notifications, _events, errors = self._read_v2_runtime(now)
+        rows = [
+            row
+            for row in active
+            if (symbol is None or row.get("symbol") == symbol.upper())
+            and (long_venue is None or row.get("long_venue") == long_venue.lower())
+            and (short_venue is None or row.get("short_venue") == short_venue.lower())
+            and (not eligible_only or row.get("tg_eligible") is True)
+        ]
+        def anomaly_sort_key(row: dict[str, object]) -> tuple[int, float, str, str, str, str, str]:
+            deviation = _finite_float(row.get("current_deviation_bps"))
+            return (
+                0 if row.get("tg_eligible") is True else 1,
+                -(deviation if deviation is not None else 0.0),
+                str(row.get("symbol") or ""),
+                str(row.get("long_venue") or ""),
+                str(row.get("long_venue_symbol") or ""),
+                str(row.get("short_venue") or ""),
+                str(row.get("short_venue_symbol") or ""),
+            )
+
+        rows.sort(key=anomaly_sort_key)
+        return {
+            "generated_at": now.isoformat(),
+            "data_as_of": _iso(now),
+            "status": "degraded" if errors else "healthy",
+            "rows": rows,
+            "errors": errors,
+        }
 
     def get_pair(
         self,
@@ -678,7 +764,8 @@ class DashboardQueryService:
         data_as_of = snapshot.data_as_of
         scanner_data_as_of = snapshot.scanner_data_as_of
         runtime = self._read_runtime(now)
-        errors = [*market_errors, *runtime.errors]
+        v2_active, _v2_by_key, _v2_notifications, _v2_events, v2_errors = self._read_v2_runtime(now)
+        errors = [*market_errors, *runtime.errors, *v2_errors]
         expected = self._expected_feeds()
 
         feeds: list[dict[str, object]] = []
@@ -732,7 +819,9 @@ class DashboardQueryService:
                 "status": overall_status,
                 "heartbeat_age_seconds": heartbeat_age,
                 "configured_feeds": len(feeds),
-                "latest_feeds": sum(entry["latest"] for entry in per_venue.values()),
+                "latest_feeds": sum(
+                    1 for entry in per_venue.values() if entry.get("latest") == 1
+                ),
                 "healthy_feeds": healthy_feeds,
                 "primary_vwap_ready": primary_vwap_ready,
                 "active_episodes": len(runtime.episodes),
@@ -742,6 +831,14 @@ class DashboardQueryService:
                 ),
                 "active_alerted_episodes": sum(
                     episode.get("alerted") is True for episode in runtime.episodes
+                ),
+                "active_anomaly_candidates": 0,
+                "active_confirmed_anomalies": len(v2_active),
+                "anomaly_tg_eligible": sum(
+                    row.get("tg_eligible") is True for row in v2_active
+                ),
+                "anomaly_tg_suppressed": sum(
+                    row.get("tg_eligible") is False for row in v2_active
                 ),
             },
             "feeds": feeds,
@@ -853,6 +950,8 @@ class DashboardQueryService:
         ).get(key)
         runtime = self._read_runtime(now)
         errors.extend(runtime.errors)
+        active_v2, v2_by_key, _notifications, v2_events, v2_errors = self._read_v2_runtime(now)
+        errors.extend(v2_errors)
         basis = self._basis_payload_for(observations, current_observation)
         if current_observation is None:
             errors.append("current exact pair observation unavailable")
@@ -887,6 +986,9 @@ class DashboardQueryService:
         ]
         rolling_mean_series = self._rolling_mean_series(observations, display_points)
         lifecycle = self._lifecycle_for(key, runtime.episodes_by_key, now)
+        v2_lifecycle = self._anomaly_lifecycle_for(key, v2_by_key, v2_events, now)
+        if v2_lifecycle["available"]:
+            lifecycle = v2_lifecycle
         current_payload = (
             self._current_payload(current_observation, basis, lifecycle)
             if current_observation is not None
@@ -906,6 +1008,7 @@ class DashboardQueryService:
             "current": current_payload,
             "basis": basis,
             "lifecycle": lifecycle,
+            "anomaly_markers": self._anomaly_markers_for(key, v2_events),
             "history": history,
             "rolling_mean_series": rolling_mean_series,
             "errors": errors,
@@ -1051,11 +1154,19 @@ class DashboardQueryService:
         query, identity_params = self._market_query(files, expected)
         try:
             with duckdb.connect() as connection:
-                data_as_of = connection.execute(
+                data_as_of_row = connection.execute(
                     f"SELECT max(sample_time) FROM read_parquet([{path_list}]) "
                     "WHERE sample_time >= ? AND sample_time <= ?",
                     [start, end],
-                ).fetchone()[0]
+                ).fetchone()
+                data_as_of_value = (
+                    data_as_of_row[0] if data_as_of_row is not None else None
+                )
+                data_as_of = (
+                    data_as_of_value
+                    if isinstance(data_as_of_value, datetime)
+                    else None
+                )
                 result = connection.execute(
                     query, [start, end, *identity_params]
                 ).fetchall()
@@ -1179,13 +1290,17 @@ class DashboardQueryService:
                     "max_observation_age_seconds": None,
                 },
             )
-            entry["expected"] = int(entry["expected"]) + 1
+            expected = entry.get("expected")
+            entry["expected"] = (expected if isinstance(expected, int) else 0) + 1
             if feed["sample_time"] is not None:
-                entry["available"] = int(entry["available"]) + 1
+                available = entry.get("available")
+                entry["available"] = (available if isinstance(available, int) else 0) + 1
             if data_as_of is not None and feed["sample_time"] == _iso(data_as_of):
-                entry["latest"] = int(entry["latest"]) + 1
+                latest = entry.get("latest")
+                entry["latest"] = (latest if isinstance(latest, int) else 0) + 1
             else:
-                entry["missing"] = int(entry["missing"]) + 1
+                missing = entry.get("missing")
+                entry["missing"] = (missing if isinstance(missing, int) else 0) + 1
             age = feed["age_seconds"]
             if isinstance(age, (int, float)):
                 previous_age = entry["max_observation_age_seconds"]
@@ -1524,7 +1639,7 @@ class DashboardQueryService:
             "updated_at": None,
             "age_seconds": None,
         }
-        unavailable = {"status": "unavailable"}
+        unavailable: dict[str, object] = {"status": "unavailable"}
         try:
             connection = sqlite3.connect(
                 self.runtime_db.resolve().as_uri() + "?mode=ro",
@@ -1623,17 +1738,10 @@ class DashboardQueryService:
             if not isinstance(raw_key, dict) or not isinstance(candidate, dict):
                 errors.append("invalid episode state ignored")
                 continue
-            identity_values = (
-                raw_key.get("canonical_symbol"),
-                raw_key.get("long_venue"),
-                raw_key.get("long_venue_symbol"),
-                raw_key.get("short_venue"),
-                raw_key.get("short_venue_symbol"),
-            )
-            if any(not isinstance(value, str) or not value for value in identity_values):
+            identity = _parse_identity(raw_key)
+            if identity is None:
                 errors.append("invalid episode identity ignored")
                 continue
-            identity = tuple(identity_values)
             condition_since = _parse_timestamp(raw_episode.get("alert_condition_since"))
             last_seen_at = _parse_timestamp(raw_episode.get("last_seen_at"))
             first_seen_at = _parse_timestamp(raw_episode.get("first_seen_at"))
@@ -1732,6 +1840,168 @@ class DashboardQueryService:
             )
         return events
 
+    def _read_v2_runtime(
+        self,
+        now: datetime,
+    ) -> tuple[
+        list[dict[str, object]],
+        dict[tuple[str, str, str, str, str], dict[str, object]],
+        dict[str, dict[str, object]],
+        list[dict[str, object]],
+        list[str],
+    ]:
+        if not self.config.monitors.spread.anomaly_v2.enabled:
+            return [], {}, {}, [], []
+        try:
+            connection = sqlite3.connect(
+                self.runtime_db.resolve().as_uri() + "?mode=ro",
+                uri=True,
+                timeout=0.2,
+            )
+        except sqlite3.Error as error:
+            return [], {}, {}, [], [
+                f"anomaly state read failed: {type(error).__name__}: {error}"
+            ]
+        errors: list[str] = []
+        active: list[dict[str, object]] = []
+        by_key: dict[tuple[str, str, str, str, str], dict[str, object]] = {}
+        notifications: dict[str, dict[str, object]] = {}
+        events: list[dict[str, object]] = []
+        try:
+            state_rows = connection.execute(
+                """
+                SELECT state_key, state_json
+                FROM monitor_state
+                WHERE monitor_name = 'spread'
+                  AND state_key IN ('anomaly_episodes_v2', 'anomaly_notifications_v2')
+                """
+            ).fetchall()
+            raw_episode_state: object = {}
+            raw_notification_state: object = {}
+            for state_key, state_json in state_rows:
+                try:
+                    parsed = json.loads(state_json)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    errors.append(f"invalid {state_key} JSON ignored")
+                    continue
+                if state_key == "anomaly_episodes_v2":
+                    raw_episode_state = parsed
+                else:
+                    raw_notification_state = parsed
+            if isinstance(raw_notification_state, dict):
+                notifications = {
+                    str(key): dict(value)
+                    for key, value in raw_notification_state.items()
+                    if isinstance(value, dict)
+                }
+            if isinstance(raw_episode_state, dict):
+                for raw_wrapper in raw_episode_state.values():
+                    try:
+                        if not isinstance(raw_wrapper, dict):
+                            raise TypeError("wrapper")
+                        episode = raw_wrapper["episode"]
+                        candidate = raw_wrapper["candidate"]
+                        if not isinstance(episode, dict) or not isinstance(candidate, dict):
+                            raise TypeError("episode")
+                        pair = episode["pair_key"]
+                        if not isinstance(pair, dict):
+                            raise TypeError("pair")
+                        identity_values = _parse_identity(pair)
+                        if identity_values is None:
+                            raise ValueError("identity")
+                        confirmed_at = _parse_timestamp(episode.get("confirmed_at"))
+                        ended_at = _parse_timestamp(episode.get("ended_at"))
+                        if confirmed_at is None or ended_at is not None:
+                            continue
+                        episode_id = episode["episode_id"]
+                        notification = notifications.get(str(episode_id), {})
+                        context = notification.get("context")
+                        context_values = context if isinstance(context, dict) else {}
+                        entry: dict[str, object] = {
+                            "episode_id": episode_id,
+                            "key": identity_values,
+                            "symbol": identity_values[0],
+                            "canonical_symbol": identity_values[0],
+                            "long_venue": identity_values[1],
+                            "long_venue_symbol": identity_values[2],
+                            "short_venue": identity_values[3],
+                            "short_venue_symbol": identity_values[4],
+                            "candidate_started_at": episode.get("candidate_started_at"),
+                            "confirmed_at": episode.get("confirmed_at"),
+                            "last_seen_at": episode.get("last_seen_at"),
+                            "reference_mean_bps": _finite_float(episode.get("reference_mean_bps")),
+                            "reference_std_bps": _finite_float(episode.get("reference_std_bps")),
+                            "current_spread_bps": _finite_float(episode.get("current_spread_bps")),
+                            "current_deviation_bps": _finite_float(episode.get("current_deviation_from_reference_bps")),
+                            "confirmation_deviation_bps": _finite_float(episode.get("confirmation_deviation_bps")),
+                            "post_confirmation_peak_deviation_bps": _finite_float(episode.get("post_confirmation_peak_deviation_bps")),
+                            "post_confirmation_peak_at": episode.get("post_confirmation_peak_at"),
+                            "long_buy_vwap": _finite_float(candidate.get("long_buy_vwap")),
+                            "short_sell_vwap": _finite_float(candidate.get("short_sell_vwap")),
+                            "raw_spread_bps": _finite_float(candidate.get("raw_spread_bps")),
+                            "long_fee_bps": _finite_float(candidate.get("long_fee_bps")),
+                            "short_fee_bps": _finite_float(candidate.get("short_fee_bps")),
+                            "tg_eligible": notification.get("eligibility"),
+                            "eligibility_reason": notification.get("eligibility_reason"),
+                            "mean_alignment_bps": notification.get("mean_alignment_bps"),
+                            "initial_sent_at": notification.get("initial_sent_at"),
+                            "mean_12h_bps": context_values.get("12h_mean_bps"),
+                            "mean_24h_bps": context_values.get("24h_mean_bps"),
+                            "mean_48h_bps": context_values.get("48h_mean_bps"),
+                        }
+                        identity = identity_values
+                        active.append(entry)
+                        if identity in by_key:
+                            by_key.pop(identity, None)
+                            errors.append("ambiguous anomaly pair identity ignored")
+                        else:
+                            by_key[identity] = entry
+                    except (KeyError, TypeError, ValueError):
+                        errors.append("invalid anomaly episode state ignored")
+            event_rows = connection.execute(
+                """
+                SELECT event_id, event_type, event_json, occurred_at
+                FROM opportunity_log
+                WHERE monitor_name = 'spread' AND event_type LIKE 'anomaly_%'
+                ORDER BY occurred_at DESC, event_id DESC
+                LIMIT 200
+                """
+            ).fetchall()
+            for event_id, event_type, event_json, occurred_at in event_rows:
+                try:
+                    payload = json.loads(event_json)
+                    if not isinstance(payload, dict):
+                        raise ValueError("event")
+                    event_identity = _parse_identity(payload)
+                    if event_identity is None:
+                        continue
+                    events.append(
+                        {
+                            "event_id": event_id,
+                            "event_type": event_type,
+                            "payload": payload,
+                            "occurred_at": occurred_at,
+                            "identity": event_identity,
+                        }
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    errors.append("invalid anomaly event ignored")
+        except sqlite3.Error as error:
+            errors.append(f"anomaly state read failed: {type(error).__name__}: {error}")
+            active, by_key, notifications, events = [], {}, {}, []
+        finally:
+            connection.close()
+        active.sort(
+            key=lambda row: (
+                str(row.get("symbol") or ""),
+                str(row.get("long_venue") or ""),
+                str(row.get("long_venue_symbol") or ""),
+                str(row.get("short_venue") or ""),
+                str(row.get("short_venue_symbol") or ""),
+            )
+        )
+        return active, by_key, notifications, events, errors
+
     @staticmethod
     def _identity_payload(key: SpreadPairKey) -> dict[str, str]:
         return {
@@ -1786,6 +2056,108 @@ class DashboardQueryService:
             "last_seen_at": episode.get("last_seen_at"),
             "episode_id": episode.get("episode_id"),
         }
+
+    def _anomaly_lifecycle_for(
+        self,
+        key: SpreadPairKey,
+        episodes_by_key: Mapping[tuple[str, str, str, str, str], dict[str, object]],
+        events: list[dict[str, object]],
+        now: datetime,
+    ) -> dict[str, object]:
+        identity = (
+            key.canonical_symbol,
+            key.long_venue,
+            key.long_venue_symbol,
+            key.short_venue,
+            key.short_venue_symbol,
+        )
+        episode = episodes_by_key.get(identity)
+        if episode is not None:
+            confirmed = _parse_timestamp(episode.get("confirmed_at"))
+            started = _parse_timestamp(episode.get("candidate_started_at"))
+            duration = None
+            if confirmed is not None:
+                duration = max(0, int((now - confirmed).total_seconds()))
+            eligible = episode.get("tg_eligible")
+            if eligible is True:
+                tg_status = "Eligible / sent" if episode.get("initial_sent_at") else "Eligible / pending"
+            elif episode.get("eligibility_reason") == "mean_alignment":
+                tg_status = "Suppressed: alignment"
+            elif episode.get("eligibility_reason") == "context_unavailable":
+                tg_status = "Suppressed: context unavailable"
+            else:
+                tg_status = "Pending"
+            return {
+                **episode,
+                "available": True,
+                "active": True,
+                "candidate_confirmed": True,
+                "alerted": episode.get("initial_sent_at") is not None,
+                "signal_duration_seconds": duration,
+                "alert_condition_since": _iso(confirmed),
+                "last_seen_at": episode.get("last_seen_at"),
+                "duration_seconds": duration,
+                "episode_age_seconds": (
+                    max(0, int((now - started).total_seconds()))
+                    if started is not None
+                    else None
+                ),
+                "tg_status": tg_status,
+            }
+        for event in events:
+            if event.get("event_type") != "anomaly_resolved":
+                continue
+            if _parse_identity(event.get("identity")) != identity:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            return {
+                "available": True,
+                "active": False,
+                "candidate_confirmed": True,
+                "alerted": False,
+                "signal_duration_seconds": None,
+                "alert_condition_since": None,
+                "last_seen_at": payload.get("ended_at"),
+                "episode_id": payload.get("episode_id"),
+                "resolution_reason": payload.get("resolution_reason"),
+                "candidate_started_at": payload.get("candidate_started_at"),
+                "confirmed_at": payload.get("confirmed_at"),
+                "ended_at": payload.get("ended_at"),
+                "reference_mean_bps": payload.get("reference_mean_bps"),
+                "current_spread_bps": payload.get("current_spread_bps"),
+                "current_deviation_bps": payload.get("current_deviation_bps"),
+                "confirmation_deviation_bps": payload.get("confirmation_deviation_bps"),
+                "post_confirmation_peak_deviation_bps": payload.get(
+                    "post_confirmation_peak_deviation_bps"
+                ),
+                "post_confirmation_peak_at": payload.get("post_confirmation_peak_at"),
+                "tg_status": "Resolved",
+            }
+        return {"available": False, "active": False, "episode_id": None}
+
+    @staticmethod
+    def _anomaly_markers_for(
+        key: SpreadPairKey,
+        events: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        identity = (
+            key.canonical_symbol,
+            key.long_venue,
+            key.long_venue_symbol,
+            key.short_venue,
+            key.short_venue_symbol,
+        )
+        return [
+            {
+                "event_type": event.get("event_type"),
+                "occurred_at": event.get("occurred_at"),
+                "payload": event.get("payload"),
+            }
+            for event in events
+            if _parse_identity(event.get("identity")) == identity
+        ]
 
     @staticmethod
     def _matches_filters(row: dict[str, object], filters: OpportunitiesFilters) -> bool:
@@ -1910,7 +2282,12 @@ class DashboardQueryService:
                     and latest_prior_observed_at >= point.observed_at
                     else self._basis_stats_payload(stats)
                 )
-                means[point.sample_time] = payload["mean_bps"]
+                mean_value = payload.get("mean_bps")
+                means[point.sample_time] = (
+                    float(mean_value)
+                    if isinstance(mean_value, (int, float)) and not isinstance(mean_value, bool)
+                    else None
+                )
             if valid:
                 prior_points.append(point)
                 latest_prior_observed_at = max(

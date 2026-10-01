@@ -9,6 +9,7 @@ from collections.abc import Callable
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import cast
 from urllib.parse import parse_qsl, urlparse
 
 from radar.config import RadarConfig, load_config
@@ -61,6 +62,23 @@ class DashboardStatusService:
         self, filters: OpportunitiesFilters, *, now: datetime | None = None
     ) -> dict[str, object]:
         return self._query_service.get_opportunities(filters, now=now)
+
+    def get_anomalies(
+        self,
+        *,
+        symbol: str | None = None,
+        long_venue: str | None = None,
+        short_venue: str | None = None,
+        eligible_only: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        return self._query_service.get_anomalies(
+            symbol=symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            eligible_only=eligible_only,
+            now=now,
+        )
 
     def get_pair(
         self, *, canonical_symbol: str, long_venue: str, long_venue_symbol: str,
@@ -156,6 +174,28 @@ def parse_opportunities_filters(query: str) -> OpportunitiesFilters:
     )
 
 
+def parse_anomaly_query(query: str) -> dict[str, object]:
+    allowed = {"symbol", "long_venue", "short_venue", "eligible_only"}
+    values: dict[str, str] = {}
+    for name, value in parse_qsl(
+        query, keep_blank_values=True, strict_parsing=True, errors="strict", max_num_fields=8
+    ):
+        if name not in allowed or name in values:
+            raise ValueError("invalid anomaly filter")
+        if not value.strip() or any(ord(character) < 32 for character in value):
+            raise ValueError(f"{name} must be non-empty text")
+        values[name] = value.strip()
+    eligible = values.get("eligible_only", "false")
+    if eligible not in ("true", "false"):
+        raise ValueError("eligible_only must be true or false")
+    return {
+        "symbol": values.get("symbol", "").upper() or None,
+        "long_venue": values.get("long_venue", "").lower() or None,
+        "short_venue": values.get("short_venue", "").lower() or None,
+        "eligible_only": eligible == "true",
+    }
+
+
 HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -197,9 +237,10 @@ td small { display: block; color: #94a3b8; margin-top: 3px; }
 .degraded { color: #fcd34d; }
 .down, .error { color: #fca5a5; }
 .error { margin: 8px 0; overflow-wrap: anywhere; font-size: .82rem; }
-[data-view="opportunities"] #status-view, [data-view="opportunities"] #pair-view,
-[data-view="status"] #opportunities-view, [data-view="status"] #pair-view,
-[data-view="pair"] #opportunities-view, [data-view="pair"] #status-view { display: none; }
+[data-view="opportunities"] #status-view, [data-view="opportunities"] #pair-view, [data-view="opportunities"] #anomalies-view,
+[data-view="status"] #opportunities-view, [data-view="status"] #pair-view, [data-view="status"] #anomalies-view,
+[data-view="pair"] #opportunities-view, [data-view="pair"] #status-view, [data-view="pair"] #anomalies-view,
+[data-view="anomalies"] #opportunities-view, [data-view="anomalies"] #status-view, [data-view="anomalies"] #pair-view { display: none; }
 select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; border: 1px solid #4b5563; border-radius: 5px; }
 #pair-chart svg { display: block; width: 100%; height: auto; }
 .chart-legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0; font-size: .8rem; }
@@ -210,9 +251,14 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 <body data-view="__VIEW__">
 <main>
 <header><h1>OPPORTUNITY RADAR</h1><span class="muted">Read-only · $10k executable VWAP</span></header>
-<nav aria-label="Dashboard"><a id="nav-opportunities" href="/opportunities">Opportunities</a><a id="nav-status" href="/status">Status</a></nav>
+<nav aria-label="Dashboard"><a id="nav-anomalies" href="/anomalies">Anomalies</a><a id="nav-opportunities" href="/opportunities">All Pairs</a><a id="nav-status" href="/status">Status</a></nav>
 <div class="summary" aria-live="polite"><span id="overall">Loading…</span><span id="data-as-of" class="muted">Data as of: Unavailable</span><span id="refreshed" class="muted"></span></div>
 <div id="errors" role="alert"></div>
+<section id="anomalies-view">
+<h2>Active Anomalies</h2>
+<p class="muted">Confirmed v2 episodes only · lifecycle and Telegram state come from read-only SQLite.</p>
+<div class="table-wrap"><table aria-label="Active anomalies"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>Current</th><th>Reference</th><th>Deviation</th><th>Age</th><th>Peak</th><th>12h / 24h / 48h</th><th>Alignment</th><th>Telegram</th></tr></thead><tbody id="anomaly-rows"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody></table></div>
+</section>
 <section id="opportunities-view">
 <form id="filters">
 <label>Symbol<input id="symbol" name="symbol" placeholder="All symbols"></label>
@@ -266,7 +312,8 @@ const cell = value => '<td>' + esc(value) + '</td>';
 const filterNames = ['symbol','long_venue','short_venue','max_std','min_deviation','min_duration','limit'];
 const isStatus = location.pathname === '/status';
 const isPair = location.pathname === '/pair';
-if (!isPair) byId(isStatus ? 'nav-status' : 'nav-opportunities').setAttribute?.('aria-current', 'page');
+const isAnomalies = location.pathname === '/anomalies';
+if (!isPair) byId(isAnomalies ? 'nav-anomalies' : isStatus ? 'nav-status' : 'nav-opportunities').setAttribute?.('aria-current', 'page');
 function restoreFilters() {
   const query = new URLSearchParams(location.search);
   for (const name of filterNames) byId(name).value = query.get(name) ?? '';
@@ -304,6 +351,17 @@ function renderOpportunities(data) {
     cell(age(row.signal_duration_seconds)) + cell(number(row.round_trip_fee_bps)) + cell(number(row.theoretical_edge_bps)) +
     cell(age(row.observed_at_skew_seconds)) + '<td title="' + esc(row.sample_time) + '">' + esc(age(row.freshness_seconds)) + '</td></tr>'
   ).join('') || emptyRow(12, data.status === 'healthy' ? 'No matching opportunities' : 'No matching rows — degraded or unavailable data');
+}
+function renderAnomalies(data) {
+  byId('anomaly-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
+    pairCell({...row, canonical_symbol: row.symbol}, 'symbol') +
+    cell((row.long_venue ?? 'Unavailable') + ' · ' + (row.long_venue_symbol ?? 'Unavailable')) +
+    cell((row.short_venue ?? 'Unavailable') + ' · ' + (row.short_venue_symbol ?? 'Unavailable')) +
+    cell(number(row.current_spread_bps)) + cell(number(row.reference_mean_bps)) +
+    cell(number(row.current_deviation_bps)) + cell(age(row.episode_age_seconds)) +
+    cell(number(row.post_confirmation_peak_deviation_bps)) +
+    cell((row.mean_12h_bps ?? '—') + ' / ' + (row.mean_24h_bps ?? '—') + ' / ' + (row.mean_48h_bps ?? '—')) +
+    cell(number(row.mean_alignment_bps)) + cell(row.tg_status ?? 'Pending') + '</tr>').join('') || emptyRow(11, 'No active confirmed anomalies');
 }
 function renderStatus(data) {
   const overall = data.overall || {}, heartbeat = data.heartbeat || {};
@@ -347,6 +405,14 @@ function renderPair(data) {
     ['Sample time (UTC)',current.sample_time ?? 'Unavailable'],
     ['Lifecycle (persisted)',lifecycle.available ? 'Active · confirmed: ' + (lifecycle.candidate_confirmed ? 'yes' : 'no') + ' · alerted: ' + (lifecycle.alerted ? 'yes' : 'no') + ' · ' + (lifecycle.episode_id ?? 'Unavailable') : 'Inactive / unavailable']
   ];
+  if (lifecycle.reference_mean_bps !== undefined) {
+    metrics.push(
+      ['V2 reference mean (bps)', number(lifecycle.reference_mean_bps)],
+      ['V2 confirmation deviation (bps)', number(lifecycle.confirmation_deviation_bps)],
+      ['V2 post-confirm peak (bps)', number(lifecycle.post_confirmation_peak_deviation_bps)],
+      ['V2 Telegram', lifecycle.tg_status ?? 'Pending']
+    );
+  }
   byId('pair-summary').innerHTML = metrics.map(([label,value]) => '<div class="card"><div class="metric-label">' + esc(label) + '</div><div class="metric-value">' + esc(value) + '</div></div>').join('');
   text('pair-coverage', (basis.eligible ? '24h basis available' : '24h basis unavailable') + ' · prior samples: ' +
     (basis.sample_count ?? 'Unavailable') + ' · coverage: ' + (typeof basis.coverage === 'number' ? number(basis.coverage * 100) + '%' : 'Unavailable'));
@@ -357,9 +423,12 @@ function renderPairChart(data) {
   const points = (data.history || []).filter(p => finite(p.raw_spread_bps) && Number.isFinite(Date.parse(p.sample_time)));
   const means = data.rolling_mean_series || [];
   const current = data.current;
+  const lifecycle = data.lifecycle || {};
   if (!points.length) { text('pair-chart', 'History unavailable'); return; }
   const values = points.map(p => p.raw_spread_bps).concat(means.filter(p => finite(p.rolling_mean_bps)).map(p => p.rolling_mean_bps));
   if (current && finite(current.raw_spread_bps)) values.push(current.raw_spread_bps);
+  const v2Reference = finite(lifecycle.reference_mean_bps) ? lifecycle.reference_mean_bps : null;
+  if (v2Reference !== null) values.push(v2Reference);
   const start = Date.parse(points[0].sample_time), end = Date.parse(points.at(-1).sample_time);
   let low = Math.min(...values), high = Math.max(...values);
   const pad = Math.max((high - low) * .08, 1); low -= pad; high += pad;
@@ -383,8 +452,33 @@ function renderPairChart(data) {
     svg += '<line x1="70" x2="910" y1="' + py + '" y2="' + py + '" stroke="#374151"/><text x="60" y="' + py + '" text-anchor="end" fill="#94a3b8" font-size="11">' + number(value) + '</text>';
   }
   svg += series(points, 'raw_spread_bps', 'raw', '#93c5fd') + series(means, 'rolling_mean_bps', 'mean', '#fcd34d');
+  if (v2Reference !== null) {
+    const py = y(v2Reference).toFixed(2);
+    svg += '<line data-marker="reference" x1="70" x2="910" y1="' + py + '" y2="' + py + '" stroke="#c084fc" stroke-dasharray="5 4"/>';
+    svg += '<text x="905" y="' + (Number(py) - 4) + '" text-anchor="end" fill="#c084fc" font-size="11">Reference</text>';
+  }
   if (current && finite(current.raw_spread_bps) && Date.parse(current.sample_time) >= start && Date.parse(current.sample_time) <= end) {
-    svg += '<circle data-series="current" cx="' + x(current.sample_time).toFixed(2) + '" cy="' + y(current.raw_spread_bps).toFixed(2) + '" r="5" fill="#6ee7b7"><title>Current · ' + esc(current.sample_time) + ' · ' + number(current.raw_spread_bps) + ' bps</title></circle>';
+    svg += '<circle data-series="current" data-marker="current" cx="' + x(current.sample_time).toFixed(2) + '" cy="' + y(current.raw_spread_bps).toFixed(2) + '" r="5" fill="#6ee7b7"><title>Current · ' + esc(current.sample_time) + ' · ' + number(current.raw_spread_bps) + ' bps</title></circle>';
+  }
+  if (v2Reference !== null) {
+    const rawAt = timestamp => {
+      const point = points.find(item => item.sample_time === timestamp);
+      return point && finite(point.raw_spread_bps) ? point.raw_spread_bps : null;
+    };
+    const markers = [
+      ['candidate', lifecycle.candidate_started_at, rawAt(lifecycle.candidate_started_at), '#fbbf24'],
+      ['confirmation', lifecycle.confirmed_at, rawAt(lifecycle.confirmed_at), '#fb923c'],
+      ['peak', lifecycle.post_confirmation_peak_at, rawAt(lifecycle.post_confirmation_peak_at), '#f87171'],
+      ['return', lifecycle.active === false ? lifecycle.ended_at : null, lifecycle.active === false ? lifecycle.current_spread_bps : null, '#4ade80'],
+    ];
+    for (const [label, timestamp, value, color] of markers) {
+      if (typeof timestamp !== 'string' || !finite(value)) continue;
+      const time = Date.parse(timestamp);
+      if (!Number.isFinite(time) || time < start || time > end) continue;
+      const px = x(timestamp).toFixed(2), py = y(value).toFixed(2);
+      svg += '<circle data-marker="' + label + '" cx="' + px + '" cy="' + py + '" r="4" fill="' + color + '"><title>' + esc(label) + ' · ' + esc(timestamp) + ' · ' + number(value) + ' bps</title></circle>';
+      svg += '<text x="' + px + '" y="' + (Number(py) - 7) + '" text-anchor="middle" fill="' + color + '" font-size="10">' + label + '</text>';
+    }
   }
   svg += '<text x="70" y="320" fill="#94a3b8" font-size="11">' + esc(points[0].sample_time) + '</text><text x="910" y="338" text-anchor="end" fill="#94a3b8" font-size="11">' + esc(points.at(-1).sample_time) + '</text></svg>';
   byId('pair-chart').innerHTML = svg;
@@ -395,7 +489,7 @@ async function refresh(query = new URLSearchParams(location.search)) {
   const sequence = ++requestSequence;
   requestInFlight = true;
   try {
-    const response = await fetch(isStatus ? '/api/status' : (isPair ? '/api/pair?' : '/api/opportunities?') + query.toString(), {cache:'no-store'});
+    const response = await fetch(isStatus ? '/api/status' : isAnomalies ? '/api/anomalies?' + query.toString() : (isPair ? '/api/pair?' : '/api/opportunities?') + query.toString(), {cache:'no-store'});
     const data = await response.json();
     if (sequence !== requestSequence) return;
     const status = isStatus ? data.overall?.status : data.status;
@@ -404,7 +498,7 @@ async function refresh(query = new URLSearchParams(location.search)) {
     text('data-as-of', 'Data as of: ' + (data.data_as_of ?? 'Unavailable'));
     text('refreshed', 'Fetched ' + new Date().toLocaleTimeString() + ' · Generated ' + (data.generated_at ?? 'Unavailable'));
     byId('errors').innerHTML = (data.errors || []).map(error => '<div class="error">' + esc(error) + '</div>').join('');
-    if (isStatus) renderStatus(data); else if (isPair) renderPair(data); else renderOpportunities(data);
+    if (isStatus) renderStatus(data); else if (isPair) renderPair(data); else if (isAnomalies) renderAnomalies(data); else renderOpportunities(data);
   } catch (error) {
     if (sequence !== requestSequence) return;
     text('overall', 'DEGRADED — dashboard request failed');
@@ -412,7 +506,7 @@ async function refresh(query = new URLSearchParams(location.search)) {
     text('data-as-of', 'Data as of: Unavailable');
     text('refreshed', 'Request failed at ' + new Date().toLocaleTimeString());
     byId('errors').innerHTML = '<div class="error">' + esc(error) + '</div>';
-    if (isStatus) renderStatus({}); else if (isPair) renderPair({}); else byId('opportunity-rows').innerHTML = emptyRow(12, 'Data unavailable');
+    if (isStatus) renderStatus({}); else if (isPair) renderPair({}); else if (isAnomalies) byId('anomaly-rows').innerHTML = emptyRow(11, 'Data unavailable'); else byId('opportunity-rows').innerHTML = emptyRow(12, 'Data unavailable');
   } finally {
     if (sequence === requestSequence) requestInFlight = false;
   }
@@ -452,13 +546,21 @@ def _handler_for(
         def do_GET(self) -> None:  # noqa: N802
             request = urlparse(self.path)
             path = request.path
-            if path in ("/", "/opportunities", "/status", "/pair"):
-                view = "pair" if path == "/pair" else "status" if path == "/status" else "opportunities"
+            if path in ("/", "/anomalies", "/opportunities", "/status", "/pair"):
+                view = (
+                    "pair" if path == "/pair" else
+                    "status" if path == "/status" else
+                    "opportunities" if path in ("/", "/opportunities") else
+                    "anomalies"
+                )
                 self._send(200, "text/html; charset=utf-8", HTML.replace("__VIEW__", view).encode("utf-8"))
                 return
             if path == "/api/pair":
-                empty = {"status": "degraded", "data_as_of": None, "current": None,
-                         "basis": None, "lifecycle": None, "history": [], "rolling_mean_series": []}
+                empty: dict[str, object] = {
+                    "status": "degraded", "data_as_of": None, "current": None,
+                    "basis": None, "lifecycle": None, "history": [],
+                    "rolling_mean_series": [],
+                }
                 try:
                     pair = parse_pair_query(request.query)
                 except ValueError as error:
@@ -473,7 +575,14 @@ def _handler_for(
                     self._json(404, {**empty, "errors": ["pair identity is not an enabled configured mapping"]})
                     return
                 try:
-                    payload = service.get_pair(**pair)
+                    payload = service.get_pair(
+                        canonical_symbol=pair["canonical_symbol"],
+                        long_venue=pair["long_venue"],
+                        long_venue_symbol=pair["long_venue_symbol"],
+                        short_venue=pair["short_venue"],
+                        short_venue_symbol=pair["short_venue_symbol"],
+                        range_name=cast(PairRange, pair["range_name"]),
+                    )
                     if payload.get("errors") and payload.get("status") == "down":
                         payload = {**payload, "status": "degraded"}
                     body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -485,20 +594,49 @@ def _handler_for(
                     return
                 self._send(200, "application/json; charset=utf-8", body)
                 return
+            if path == "/api/anomalies":
+                try:
+                    filters = parse_anomaly_query(request.query)
+                    payload = service.get_anomalies(
+                        symbol=cast(str | None, filters["symbol"]),
+                        long_venue=cast(str | None, filters["long_venue"]),
+                        short_venue=cast(str | None, filters["short_venue"]),
+                        eligible_only=cast(bool, filters["eligible_only"]),
+                    )
+                    body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                except ValueError as error:
+                    self._json(400, {"status": "degraded", "rows": [], "errors": [str(error)]})
+                    return
+                except Exception as error:  # noqa: BLE001
+                    self._json(200, {
+                        "status": "degraded", "rows": [],
+                        "errors": [f"dashboard query failed: {type(error).__name__}: {error}"],
+                    })
+                    return
+                self._send(200, "application/json; charset=utf-8", body)
+                return
             if path in ("/api/status", "/api/opportunities"):
-                filters = None
+                opportunity_filters: OpportunitiesFilters | None = None
                 if path == "/api/opportunities":
                     try:
-                        filters = parse_opportunities_filters(request.query)
+                        opportunity_filters = parse_opportunities_filters(request.query)
                     except ValueError as error:
                         self._json(400, {"status": "degraded", "data_as_of": None, "rows": [], "errors": [str(error)]})
                         return
                 try:
-                    payload = service.get_status() if filters is None else service.get_opportunities(filters)
+                    payload = (
+                        service.get_status()
+                        if opportunity_filters is None
+                        else service.get_opportunities(opportunity_filters)
+                    )
                     # A failed storage read is a dashboard degradation, never
                     # evidence that Radar itself is down. Status retains the
                     # heartbeat-authoritative compatibility contract.
-                    if filters is not None and payload.get("errors") and payload.get("status") == "down":
+                    if (
+                        opportunity_filters is not None
+                        and payload.get("errors")
+                        and payload.get("status") == "down"
+                    ):
                         payload = {**payload, "status": "degraded"}
                     body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
                 except Exception as error:  # noqa: BLE001
