@@ -97,15 +97,40 @@ class SQLiteRuntimeStore:
         *,
         updated_at: datetime | None = None,
         opportunities: Sequence[tuple[str, str, object, datetime | None]] = (),
+        additional_states: Sequence[tuple[str, str, object, datetime | None]] = (),
     ) -> None:
         """Commit one runtime-state update and its events as one transaction."""
-        monitor_name = _require_text(monitor_name, "monitor_name")
-        state_key = _require_text(state_key, "state_key")
-        state_json = _json_text(state)
-        updated_iso = _utc_iso(updated_at, "updated_at")
+        self.set_monitor_states_and_append_opportunities(
+            ((monitor_name, state_key, state, updated_at), *additional_states),
+            opportunity_monitor_name=monitor_name,
+            opportunities=opportunities,
+        )
+
+    def set_monitor_states_and_append_opportunities(
+        self,
+        states: Sequence[tuple[str, str, object, datetime | None]],
+        *,
+        opportunity_monitor_name: str | None = None,
+        opportunities: Sequence[tuple[str, str, object, datetime | None]] = (),
+    ) -> None:
+        """Commit multiple runtime states and their events atomically."""
+        if not states:
+            raise ValueError("states must not be empty")
+        event_monitor_name = _require_text(
+            opportunity_monitor_name or states[0][0],
+            "opportunity_monitor_name",
+        )
+        state_rows = [
+            (
+                _require_text(monitor_name, "monitor_name"),
+                _require_text(state_key, "state_key"),
+                _json_text(state),
+                _utc_iso(updated_at, "updated_at"),
+            )
+            for monitor_name, state_key, state, updated_at in states
+        ]
         event_rows = [
             (
-                monitor_name,
                 _require_text(event_id, "event_id"),
                 _require_text(event_type, "event_type"),
                 _json_text(event),
@@ -114,7 +139,7 @@ class SQLiteRuntimeStore:
             for event_id, event_type, event, occurred_at in opportunities
         ]
         with self._connection:
-            self._connection.execute(
+            self._connection.executemany(
                 """
                 INSERT INTO monitor_state (monitor_name, state_key, state_json, updated_at)
                 VALUES (?, ?, ?, ?)
@@ -122,7 +147,7 @@ class SQLiteRuntimeStore:
                     state_json = excluded.state_json,
                     updated_at = excluded.updated_at
                 """,
-                (monitor_name, state_key, state_json, updated_iso),
+                state_rows,
             )
             self._connection.executemany(
                 """
@@ -130,7 +155,10 @@ class SQLiteRuntimeStore:
                     (monitor_name, event_id, event_type, event_json, occurred_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                event_rows,
+                [
+                    (event_monitor_name, event_id, event_type, event_json, occurred_at)
+                    for event_id, event_type, event_json, occurred_at in event_rows
+                ],
             )
 
     def get_monitor_state(self, monitor_name: str, state_key: str) -> object | None:

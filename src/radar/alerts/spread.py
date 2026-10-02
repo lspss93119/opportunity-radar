@@ -4,7 +4,8 @@ import asyncio
 import logging
 import math
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 from radar.alerts.chart import render_anomaly_chart, render_spread_chart
 from radar.alerts.models import AnomalyAlertDetails, FundingContext, SpreadAlertDetails
@@ -23,6 +24,12 @@ SUPPORTED_SIZES = frozenset({1_000, 5_000, 10_000})
 LOGGER = logging.getLogger(__name__)
 ANOMALY_CONTEXT_QUERY_ATTEMPTS = 3
 ANOMALY_CONTEXT_QUERY_DELAY_SECONDS = 0.05
+ANOMALY_NOTIFICATION_STATE_KEY = "anomaly_notifications_v2"
+ANOMALY_NOTIFICATION_CLUSTERS_STATE_KEY = "anomaly_notification_clusters_v2"
+
+
+def _notification_event_id(source_event_id: str, suffix: str) -> str:
+    return f"{source_event_id}:anomaly_notification:{suffix}:{uuid4().hex}"
 
 
 def _require_text(payload: Mapping[str, JSONValue], field_name: str) -> str:
@@ -548,13 +555,25 @@ def _context_from_payload(payload: Mapping[str, object]) -> AnomalyConfirmationC
     return AnomalyConfirmationContext(*stats)
 
 
+def _persisted_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
 class AnomalyNotificationStore:
     """Small persisted delivery-state wrapper for v2 notifications."""
 
     def __init__(self, runtime_store: SQLiteRuntimeStore | None) -> None:
         self._runtime_store = runtime_store
         raw = (
-            runtime_store.get_monitor_state("spread", "anomaly_notifications_v2")
+            runtime_store.get_monitor_state("spread", ANOMALY_NOTIFICATION_STATE_KEY)
             if runtime_store is not None
             else None
         )
@@ -563,19 +582,193 @@ class AnomalyNotificationStore:
             for key, value in raw.items()
             if isinstance(raw, dict) and isinstance(value, dict)
         } if isinstance(raw, dict) else {}
+        raw_clusters = (
+            runtime_store.get_monitor_state(
+                "spread", ANOMALY_NOTIFICATION_CLUSTERS_STATE_KEY
+            )
+            if runtime_store is not None
+            else None
+        )
+        self._clusters: dict[str, dict[str, JSONValue]] = {
+            str(key): dict(value)
+            for key, value in raw_clusters.items()
+            if isinstance(raw_clusters, dict) and isinstance(value, dict)
+        } if isinstance(raw_clusters, dict) else {}
 
     def get(self, episode_id: str) -> dict[str, JSONValue]:
         return dict(self._state.get(episode_id, {}))
 
     def set(self, episode_id: str, value: Mapping[str, JSONValue], *, now: datetime) -> None:
-        self._state[episode_id] = dict(value)
+        next_state = dict(self._state)
+        next_state[episode_id] = dict(value)
         if self._runtime_store is not None:
             self._runtime_store.set_monitor_state(
                 "spread",
-                "anomaly_notifications_v2",
-                self._state,
+                ANOMALY_NOTIFICATION_STATE_KEY,
+                next_state,
                 updated_at=now,
             )
+        self._state = next_state
+
+    def active_cooldown(
+        self,
+        symbol: str,
+        *,
+        now: datetime,
+        cooldown_seconds: int,
+    ) -> tuple[datetime, dict[str, JSONValue]] | None:
+        if cooldown_seconds <= 0:
+            return None
+        entry = self._clusters.get(symbol)
+        if entry is None:
+            return None
+        sent_at = _persisted_timestamp(entry.get("last_nonreturn_sent_at"))
+        if sent_at is None:
+            return None
+        until = sent_at + timedelta(seconds=cooldown_seconds)
+        if now >= until:
+            return None
+        return until, dict(entry)
+
+    def record_suppression(
+        self,
+        episode_id: str,
+        notification: Mapping[str, JSONValue],
+        *,
+        symbol: str,
+        lifecycle_event_kind: str,
+        delivery_kind: str,
+        source_event_id: str,
+        suppressing_episode_id: str | None,
+        suppressing_event_id: str | None,
+        suppressed_at: datetime,
+        suppressed_until: datetime,
+        event_id: str,
+    ) -> None:
+        next_notification = dict(notification)
+        next_notification.update(
+            {
+                "suppression_reason": "symbol_cooldown",
+                "suppressed_at": suppressed_at.isoformat(),
+                "suppressed_until": suppressed_until.isoformat(),
+                "suppressed_delivery_kind": delivery_kind,
+                "suppressing_episode_id": suppressing_episode_id,
+                "suppressing_event_id": suppressing_event_id,
+            }
+        )
+        next_state = dict(self._state)
+        next_state[episode_id] = next_notification
+        event: dict[str, JSONValue] = {
+            "source_event_id": source_event_id,
+            "episode_id": episode_id,
+            "symbol": symbol,
+            "lifecycle_event_kind": lifecycle_event_kind,
+            "requested_delivery_kind": delivery_kind,
+            "reason": "symbol_cooldown",
+            "suppressed_at": suppressed_at.isoformat(),
+            "suppressed_until": suppressed_until.isoformat(),
+            "suppressing_episode_id": suppressing_episode_id,
+            "suppressing_event_id": suppressing_event_id,
+        }
+        if self._runtime_store is not None:
+            self._runtime_store.set_monitor_state_and_append_opportunities(
+                "spread",
+                ANOMALY_NOTIFICATION_STATE_KEY,
+                next_state,
+                updated_at=suppressed_at,
+                opportunities=(
+                    (
+                        event_id,
+                        "anomaly_notification_suppressed",
+                        event,
+                        suppressed_at,
+                    ),
+                ),
+            )
+        self._state = next_state
+
+    def commit_success(
+        self,
+        episode_id: str,
+        notification: Mapping[str, JSONValue],
+        *,
+        symbol: str,
+        lifecycle_event_kind: str,
+        delivery_kind: str,
+        completed_at: datetime,
+        cooldown_seconds: int,
+        source_event_id: str,
+        attempt_event_id: str,
+        result_event_id: str,
+        delivery_channel: str,
+    ) -> None:
+        next_state = dict(self._state)
+        next_state[episode_id] = dict(notification)
+        next_clusters = self._pruned_clusters(
+            completed_at,
+            cooldown_seconds=cooldown_seconds,
+        )
+        if delivery_kind != "anomaly_return" and cooldown_seconds > 0:
+            next_clusters[symbol] = {
+                "last_nonreturn_sent_at": completed_at.isoformat(),
+                "episode_id": episode_id,
+                "event_id": source_event_id,
+                "delivery_kind": delivery_kind,
+            }
+        success_event: dict[str, JSONValue] = {
+            "source_event_id": source_event_id,
+            "attempt_event_id": attempt_event_id,
+            "episode_id": episode_id,
+            "symbol": symbol,
+            "lifecycle_event_kind": lifecycle_event_kind,
+            "delivery_kind": delivery_kind,
+            "delivery_channel": delivery_channel,
+            "outcome": "success",
+            "completed_at": completed_at.isoformat(),
+        }
+        if self._runtime_store is not None:
+            self._runtime_store.set_monitor_state_and_append_opportunities(
+                "spread",
+                ANOMALY_NOTIFICATION_STATE_KEY,
+                next_state,
+                updated_at=completed_at,
+                opportunities=(
+                    (
+                        result_event_id,
+                        "anomaly_delivery_result",
+                        success_event,
+                        completed_at,
+                    ),
+                ),
+                additional_states=(
+                    (
+                        "spread",
+                        ANOMALY_NOTIFICATION_CLUSTERS_STATE_KEY,
+                        next_clusters,
+                        completed_at,
+                    ),
+                ),
+            )
+        self._state = next_state
+        self._clusters = next_clusters
+
+    def _pruned_clusters(
+        self,
+        now: datetime,
+        *,
+        cooldown_seconds: int,
+    ) -> dict[str, dict[str, JSONValue]]:
+        if cooldown_seconds <= 0:
+            return {}
+        return {
+            symbol: entry
+            for symbol, entry in self._clusters.items()
+            if (
+                (sent_at := _persisted_timestamp(entry.get("last_nonreturn_sent_at")))
+                is not None
+                and now < sent_at + timedelta(seconds=cooldown_seconds)
+            )
+        }
 
 
 class SpreadAlertProcessor:
@@ -592,6 +785,7 @@ class SpreadAlertProcessor:
         anomaly_v2_config: AnomalyV2Config | None = None,
         runtime_store: SQLiteRuntimeStore | None = None,
         stale_after_seconds: int = 30,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._history = history
         self._telegram = telegram
@@ -603,6 +797,8 @@ class SpreadAlertProcessor:
             else anomaly_v2_config
         )
         self._anomaly_notifications = AnomalyNotificationStore(runtime_store)
+        self._runtime_store = runtime_store
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._stale_after_seconds = stale_after_seconds
         if chart_renderer is None:
             self._chart_renderer = lambda details, context: render_spread_chart(
@@ -726,6 +922,42 @@ class SpreadAlertProcessor:
         if details.event_kind == "anomaly_return" and notification.get("return_sent_at") is not None:
             return
 
+        if details.event_kind != "anomaly_return":
+            processing_time = self._now()
+            cooldown = self._anomaly_notifications.active_cooldown(
+                details.canonical_symbol,
+                now=processing_time,
+                cooldown_seconds=(
+                    self._anomaly_v2_config.notification_symbol_cooldown_seconds
+                ),
+            )
+            if cooldown is not None:
+                suppressed_until, suppressing = cooldown
+                suppressing_episode_id = suppressing.get("episode_id")
+                suppressing_event_id = suppressing.get("event_id")
+                self._anomaly_notifications.record_suppression(
+                    details.episode_id,
+                    notification,
+                    symbol=details.canonical_symbol,
+                    lifecycle_event_kind=details.event_kind,
+                    delivery_kind=delivery_kind,
+                    source_event_id=alert.event_id,
+                    suppressing_episode_id=(
+                        suppressing_episode_id
+                        if isinstance(suppressing_episode_id, str)
+                        else None
+                    ),
+                    suppressing_event_id=(
+                        suppressing_event_id
+                        if isinstance(suppressing_event_id, str)
+                        else None
+                    ),
+                    suppressed_at=processing_time,
+                    suppressed_until=suppressed_until,
+                    event_id=_notification_event_id(alert.event_id, "suppressed"),
+                )
+                return
+
         message = format_anomaly_alert(details, context, event_kind=delivery_kind)
         chart_png: bytes | None = None
         try:
@@ -746,18 +978,137 @@ class SpreadAlertProcessor:
             )
         except Exception:  # noqa: BLE001
             LOGGER.error("anomaly chart rendering failed for alert_id=%s", alert.event_id)
-        if chart_png is None or len(message) > 1_024:
-            await self._telegram.send_text(message)
-        else:
-            await self._telegram.send_chart(chart_png, message)
+        delivery_channel = "text" if chart_png is None or len(message) > 1_024 else "chart"
+        attempted_at = self._now()
+        attempt_event_id = self._record_delivery_attempt(
+            alert,
+            details,
+            delivery_kind=delivery_kind,
+            delivery_channel=delivery_channel,
+            attempted_at=attempted_at,
+        )
+        try:
+            if delivery_channel == "text":
+                await self._telegram.send_text(message)
+            else:
+                assert chart_png is not None
+                await self._telegram.send_chart(chart_png, message)
+        except Exception as error:  # noqa: BLE001
+            try:
+                self._record_delivery_result(
+                    alert,
+                    details,
+                    delivery_kind=delivery_kind,
+                    delivery_channel=delivery_channel,
+                    attempt_event_id=attempt_event_id,
+                    outcome="transport_error",
+                    completed_at=self._now(),
+                    error=error,
+                )
+            except Exception:  # noqa: BLE001
+                LOGGER.exception(
+                    "anomaly delivery error result persistence failed for alert_id=%s",
+                    alert.event_id,
+                )
+            raise
 
+        completed_at = self._now()
+        next_notification = dict(notification)
         if delivery_kind == "anomaly_initial":
-            notification["initial_sent_at"] = current_time.isoformat()
+            next_notification["initial_sent_at"] = completed_at.isoformat()
         elif delivery_kind == "anomaly_expansion":
-            notification["last_expansion_peak_bps"] = details.post_confirmation_peak_deviation_bps
+            next_notification["last_expansion_peak_bps"] = (
+                details.post_confirmation_peak_deviation_bps
+            )
         elif delivery_kind == "anomaly_return":
-            notification["return_sent_at"] = current_time.isoformat()
-        self._anomaly_notifications.set(details.episode_id, notification, now=current_time)
+            next_notification["return_sent_at"] = completed_at.isoformat()
+        self._anomaly_notifications.commit_success(
+            details.episode_id,
+            next_notification,
+            symbol=details.canonical_symbol,
+            lifecycle_event_kind=details.event_kind,
+            delivery_kind=delivery_kind,
+            completed_at=completed_at,
+            cooldown_seconds=(
+                self._anomaly_v2_config.notification_symbol_cooldown_seconds
+            ),
+            source_event_id=alert.event_id,
+            attempt_event_id=attempt_event_id,
+            result_event_id=_notification_event_id(alert.event_id, "result"),
+            delivery_channel=delivery_channel,
+        )
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("alert clock must return a timezone-aware datetime")
+        return value.astimezone(UTC)
+
+    def _record_delivery_attempt(
+        self,
+        alert: AlertRequest,
+        details: AnomalyAlertDetails,
+        *,
+        delivery_kind: str,
+        delivery_channel: str,
+        attempted_at: datetime,
+    ) -> str:
+        event_id = _notification_event_id(alert.event_id, "attempt")
+        if self._runtime_store is not None:
+            self._runtime_store.append_opportunity(
+                "spread",
+                event_id,
+                "anomaly_delivery_attempt",
+                {
+                    "source_event_id": alert.event_id,
+                    "episode_id": details.episode_id,
+                    "symbol": details.canonical_symbol,
+                    "lifecycle_event_kind": details.event_kind,
+                    "delivery_kind": delivery_kind,
+                    "delivery_channel": delivery_channel,
+                    "attempted_at": attempted_at.isoformat(),
+                },
+                occurred_at=attempted_at,
+            )
+        return event_id
+
+    def _record_delivery_result(
+        self,
+        alert: AlertRequest,
+        details: AnomalyAlertDetails,
+        *,
+        delivery_kind: str,
+        delivery_channel: str,
+        attempt_event_id: str,
+        outcome: str,
+        completed_at: datetime,
+        error: Exception | None = None,
+    ) -> None:
+        if self._runtime_store is None:
+            return
+        payload: dict[str, JSONValue] = {
+            "source_event_id": alert.event_id,
+            "attempt_event_id": attempt_event_id,
+            "episode_id": details.episode_id,
+            "symbol": details.canonical_symbol,
+            "lifecycle_event_kind": details.event_kind,
+            "delivery_kind": delivery_kind,
+            "delivery_channel": delivery_channel,
+            "outcome": outcome,
+            "completed_at": completed_at.isoformat(),
+        }
+        if error is not None:
+            payload["exception_class"] = type(error).__name__
+            status_code = getattr(error, "status_code", None)
+            if isinstance(status_code, int) and not isinstance(status_code, bool):
+                payload["status_code"] = status_code
+        self._runtime_store.append_opportunity(
+            "spread",
+            _notification_event_id(alert.event_id, "result"),
+            "anomaly_delivery_result",
+            payload,
+            occurred_at=completed_at,
+        )
 
     async def _query_anomaly_context_with_retry(
         self,

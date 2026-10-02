@@ -33,6 +33,7 @@ class AnomalyV2Config(BaseModel):
     max_gap_seconds: int = Field(default=20, gt=0)
     mean_alignment_max_bps: float = Field(default=5.0, ge=0, allow_inf_nan=False)
     expansion_notify_step_bps: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    notification_symbol_cooldown_seconds: int = Field(default=300, ge=0)
 
 
 class SpreadMonitorConfig(BaseModel):

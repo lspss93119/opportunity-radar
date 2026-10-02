@@ -117,3 +117,34 @@ def test_state_and_opportunity_events_commit_atomically(tmp_path):
         ] == [
             "alert"
         ]
+
+
+def test_multiple_states_and_opportunity_events_commit_atomically(tmp_path):
+    database = tmp_path / "runtime.sqlite3"
+    occurred_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+
+    with SQLiteRuntimeStore(database) as store:
+        store.set_monitor_states_and_append_opportunities(
+            (
+                ("spread", "notifications", {"episode": {"sent": True}}, occurred_at),
+                ("spread", "clusters", {"QQQ": {"sent_at": occurred_at.isoformat()}}, occurred_at),
+            ),
+            opportunities=(
+                (
+                    "delivery-result-1",
+                    "anomaly_delivery_result",
+                    {"outcome": "success"},
+                    occurred_at,
+                ),
+            ),
+        )
+
+        assert store.get_monitor_state("spread", "notifications") == {
+            "episode": {"sent": True}
+        }
+        assert store.get_monitor_state("spread", "clusters") == {
+            "QQQ": {"sent_at": occurred_at.isoformat()}
+        }
+        assert store.list_opportunities(monitor_name="spread")[-1]["event_type"] == (
+            "anomaly_delivery_result"
+        )
