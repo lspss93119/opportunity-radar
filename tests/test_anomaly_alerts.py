@@ -8,6 +8,7 @@ import pytest
 from radar.alerts.chart import render_anomaly_chart
 from radar.alerts.spread import format_anomaly_alert
 from radar.alerts.spread import SpreadAlertProcessor
+from radar.alerts.telegram import TelegramTransportError
 from radar.config import AnomalyV2Config
 from radar.history.spread import (
     AnomalyConfirmationContext,
@@ -115,17 +116,27 @@ class FlakyContextHistory(FakeHistory):
 
 
 class FakeTelegram:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        error: Exception | None = None,
+    ) -> None:
         self.fail = fail
+        self.error = error
         self.texts: list[str] = []
         self.charts: list[str] = []
 
     async def send_text(self, message: str) -> None:
+        if self.error is not None:
+            raise self.error
         if self.fail:
             raise RuntimeError("transport failed")
         self.texts.append(message)
 
     async def send_chart(self, chart: bytes, caption: str) -> None:
+        if self.error is not None:
+            raise self.error
         if self.fail:
             raise RuntimeError("transport failed")
         self.charts.append(caption)
@@ -420,6 +431,34 @@ async def test_transport_error_is_audited_without_consuming_cooldown(tmp_path):
         assert "message" not in events[1]["event"]
         event_ids = [event["event_id"] for event in events]
         assert len(event_ids) == len(set(event_ids))
+
+
+@pytest.mark.asyncio
+async def test_telegram_transport_error_audit_is_structured_and_sanitized(tmp_path):
+    telegram = FakeTelegram(
+        error=TelegramTransportError(
+            error_kind="read_timeout",
+            status_code=None,
+        )
+    )
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite3") as store:
+        processor = SpreadAlertProcessor(
+            FakeHistory(context(10.0, 10.0, 10.0)),
+            telegram,
+            runtime_store=store,
+        )
+        with pytest.raises(TelegramTransportError):
+            await processor.process(route_alert(episode_id="episode-1"))
+
+        state = store.get_monitor_state("spread", "anomaly_notifications_v2")
+        assert "initial_sent_at" not in state["episode-1"]
+        events = store.list_opportunities(monitor_name="spread")
+        result = events[-1]["event"]
+        assert result["outcome"] == "transport_error"
+        assert result["exception_class"] == "TelegramTransportError"
+        assert result["error_kind"] == "read_timeout"
+        assert result["status_code"] is None
+        assert "message" not in result
 
 
 @pytest.mark.asyncio

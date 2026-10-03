@@ -85,6 +85,14 @@ class FakeRuntimeStore:
         self.closed = True
 
 
+class FakeTelegramTransport:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def aclose(self) -> None:
+        self.events.append("telegram.close")
+
+
 class FakeStorage:
     pending_count = 1
 
@@ -213,6 +221,7 @@ class RecordingProcessor:
 def make_smoke_application(
     pipeline: SmokePipelineWithEvents,
     events: list[str],
+    telegram: FakeTelegramTransport | None = None,
 ):
     from radar.app import RadarApplication
 
@@ -226,6 +235,7 @@ def make_smoke_application(
         storage=FakeStorage(),  # type: ignore[arg-type]
         runtime_store=FakeRuntimeStore(events),  # type: ignore[arg-type]
         processor=RecordingProcessor(events),  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
         clock=lambda: NOW,
     )
 
@@ -555,6 +565,7 @@ async def test_shutdown_waits_for_periodic_flush_before_final_flush_and_close():
     runner.state = pipeline.state
     worker = FakeWorker(events)
     runtime = FakeRuntimeStore(events)
+    telegram = FakeTelegramTransport(events)
     stop_event = asyncio.Event()
     app = OneCycleApplication(
         pipeline=pipeline,  # type: ignore[arg-type]
@@ -563,6 +574,7 @@ async def test_shutdown_waits_for_periodic_flush_before_final_flush_and_close():
         storage=FakeStorage(),  # type: ignore[arg-type]
         runtime_store=runtime,  # type: ignore[arg-type]
         processor=object(),  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
         clock=lambda: NOW,
     )
     app._last_flush_at = NOW - timedelta(seconds=60)
@@ -673,6 +685,7 @@ async def test_application_shutdown_orders_pipeline_flush_worker_and_runtime(cap
     runner.state = pipeline.state
     worker = FakeWorker(events)
     runtime = FakeRuntimeStore(events)
+    telegram = FakeTelegramTransport(events)
     stop_event = asyncio.Event()
     pipeline.shutdown_event = stop_event
     app = OneCycleApplication(
@@ -682,6 +695,7 @@ async def test_application_shutdown_orders_pipeline_flush_worker_and_runtime(cap
         storage=FakeStorage(),  # type: ignore[arg-type]
         runtime_store=runtime,  # type: ignore[arg-type]
         processor=object(),  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
         clock=lambda: NOW,
     )
 
@@ -694,6 +708,7 @@ async def test_application_shutdown_orders_pipeline_flush_worker_and_runtime(cap
         "pipeline.stop",
         "flush",
         "worker.stop",
+        "telegram.close",
         "runtime.close",
     ]
     messages = [record.getMessage() for record in caplog.records]
@@ -855,7 +870,9 @@ async def test_telegram_smoke_starts_waits_samples_and_stops_pipeline(monkeypatc
         )
     )
     pipeline = SmokePipelineWithEvents(state, batch, events)
-    application = make_smoke_application(pipeline, events)
+    application = make_smoke_application(
+        pipeline, events, telegram=FakeTelegramTransport(events)
+    )
 
     real_build_alert = app_module.build_telegram_smoke_alert
 
@@ -875,6 +892,7 @@ async def test_telegram_smoke_starts_waits_samples_and_stops_pipeline(monkeypatc
         "stop",
         "flush",
         "process",
+        "telegram.close",
         "runtime.close",
     ]
 
@@ -898,7 +916,9 @@ async def test_telegram_smoke_cleanup_runs_when_readiness_fails():
     state = RadarState()
     batch = CollectorBatch()
     pipeline = FailingReadinessPipeline(state, batch, events)
-    application = make_smoke_application(pipeline, events)
+    application = make_smoke_application(
+        pipeline, events, telegram=FakeTelegramTransport(events)
+    )
 
     with pytest.raises(TimeoutError, match="readiness timeout"):
         await run_telegram_smoke(
@@ -913,6 +933,7 @@ async def test_telegram_smoke_cleanup_runs_when_readiness_fails():
         "wait_for_market_feeds:BTC",
         "stop",
         "flush",
+        "telegram.close",
         "runtime.close",
     ]
 

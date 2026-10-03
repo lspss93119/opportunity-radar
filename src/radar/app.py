@@ -90,6 +90,7 @@ class RadarApplication:
         storage: ParquetStorage,
         runtime_store: SQLiteRuntimeStore,
         processor: SpreadAlertProcessor,
+        telegram: TelegramTransport | None = None,
         config: RadarConfig | None = None,
         clock: Callable[[], datetime] = utc_now,
         flush_interval_seconds: int = DEFAULT_PARQUET_FLUSH_SECONDS,
@@ -103,6 +104,7 @@ class RadarApplication:
         self.storage = storage
         self.runtime_store = runtime_store
         self.processor = processor
+        self.telegram = telegram
         self.config = RadarConfig() if config is None else config
         self.clock = clock
         self.flush_interval_seconds = flush_interval_seconds
@@ -185,6 +187,10 @@ class RadarApplication:
         if task is None:
             return
         await task
+
+    async def _close_telegram(self) -> None:
+        if self.telegram is not None:
+            await self.telegram.aclose()
 
     async def flush_now(self, now: datetime | None = None) -> int:
         current_time = _as_utc(
@@ -315,7 +321,12 @@ class RadarApplication:
                 LOGGER.error("shutdown Parquet flush failed", exc_info=error)
             worker_task.cancel()
             await asyncio.gather(worker_task, return_exceptions=True)
-            self.runtime_store.close()
+            try:
+                await self._close_telegram()
+            except Exception as error:  # noqa: BLE001
+                LOGGER.error("Telegram transport close failed", exc_info=error)
+            finally:
+                self.runtime_store.close()
             LOGGER.info(
                 "radar pilot shutdown cycles=%d collector_failures=%d "
                 "monitor_errors=%d alert_errors=%d parquet_flushes=%d queue_size=%d",
@@ -509,7 +520,12 @@ async def run_telegram_smoke(
             if alert is not None:
                 await application.processor.process(alert)
         finally:
-            application.runtime_store.close()
+            try:
+                await application._close_telegram()
+            except Exception as error:  # noqa: BLE001
+                LOGGER.error("Telegram transport close failed", exc_info=error)
+            finally:
+                application.runtime_store.close()
 
 
 def build_application(
@@ -605,6 +621,7 @@ def build_application(
         storage=storage,
         runtime_store=runtime_store,
         processor=processor,
+        telegram=telegram,
         config=config,
         clock=clock,
         stats=stats,

@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from radar.alerts.chart import render_anomaly_chart, render_spread_chart
 from radar.alerts.models import AnomalyAlertDetails, FundingContext, SpreadAlertDetails
-from radar.alerts.telegram import TelegramTransport
+from radar.alerts.telegram import TelegramTransport, TelegramTransportError
 from radar.config import AnomalyV2Config
 from radar.history.spread import (
     AnomalyConfirmationContext,
@@ -1102,6 +1102,9 @@ class SpreadAlertProcessor:
             status_code = getattr(error, "status_code", None)
             if isinstance(status_code, int) and not isinstance(status_code, bool):
                 payload["status_code"] = status_code
+            if isinstance(error, TelegramTransportError):
+                payload["error_kind"] = error.error_kind
+                payload["status_code"] = error.status_code
         self._runtime_store.append_opportunity(
             "spread",
             _notification_event_id(alert.event_id, "result"),
