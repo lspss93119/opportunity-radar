@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Literal
 
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -749,23 +750,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    try:
-        result = run_daily(
-            data_root=args.data_root,
-            output_root=args.output_root,
-            remote=args.remote,
-            rclone=args.rclone,
-            lookback_days=args.lookback_days,
-            min_coverage_pct=args.min_coverage_pct,
-        )
-    except (OSError, ValueError) as error:
-        print(f"outcome=error error={error}")
-        return 2
+def _format_utc_timestamp(timestamp: datetime) -> str:
+    return timestamp.astimezone(UTC).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
 
-    print(result.summary())
-    return 0 if result.outcome != "error" else 1
+
+def main(argv: Sequence[str] | None = None) -> int:
+    started_at = datetime.now(UTC)
+    started_monotonic = monotonic()
+    print(f"run_started_at={_format_utc_timestamp(started_at)}")
+    try:
+        args = build_parser().parse_args(argv)
+        try:
+            result = run_daily(
+                data_root=args.data_root,
+                output_root=args.output_root,
+                remote=args.remote,
+                rclone=args.rclone,
+                lookback_days=args.lookback_days,
+                min_coverage_pct=args.min_coverage_pct,
+            )
+        except (OSError, ValueError) as error:
+            print(f"outcome=error error={error}")
+            return 2
+
+        print(result.summary())
+        return 0 if result.outcome != "error" else 1
+    finally:
+        finished_at = datetime.now(UTC)
+        duration_seconds = max(0.0, monotonic() - started_monotonic)
+        print(f"run_finished_at={_format_utc_timestamp(finished_at)}")
+        print(f"run_duration_seconds={duration_seconds:.6f}")
 
 
 if __name__ == "__main__":

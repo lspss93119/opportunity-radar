@@ -9,6 +9,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from radar import analysis_daily
+from radar.analysis_daily import DailyRunResult
 from radar.analysis_export import ExportError, ExportResult, RemoteMismatchError
 from radar.storage.parquet import DATASET_SCHEMAS
 
@@ -884,3 +885,92 @@ def test_bundle_summary_includes_source_rows_and_dataset_results(
     assert "dataset=hourly_context" in summary
     assert "dataset=quoted_market" in summary
     assert "source_rows=" in summary
+
+
+def _main_args(tmp_path: Path) -> list[str]:
+    return [
+        "--data-root",
+        str(tmp_path / "data"),
+        "--output-root",
+        str(tmp_path / "analysis"),
+        "--remote",
+        "opportunity-drive-own",
+        "--rclone",
+        "/opt/homebrew/bin/rclone",
+        "--lookback-days",
+        "1",
+    ]
+
+
+def _timing_values(output: str) -> tuple[datetime, datetime, float]:
+    values = dict(
+        line.split("=", 1)
+        for line in output.splitlines()
+        if line.startswith(("run_started_at=", "run_finished_at=", "run_duration_seconds="))
+    )
+    started = datetime.fromisoformat(values["run_started_at"].replace("Z", "+00:00"))
+    finished = datetime.fromisoformat(values["run_finished_at"].replace("Z", "+00:00"))
+    return started, finished, float(values["run_duration_seconds"])
+
+
+def test_main_emits_timing_and_preserves_summary_for_no_work(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = analysis_daily.main(_main_args(tmp_path))
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    started, finished, duration = _timing_values(output)
+    assert started.tzinfo is not None
+    assert finished.tzinfo is not None
+    assert finished >= started
+    assert duration >= 0
+    assert "current_utc_date=" in output
+    assert "outcome=incomplete_only" in output
+
+
+def test_main_emits_finish_timing_for_handled_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(**kwargs: object) -> DailyRunResult:
+        raise ValueError("synthetic failure")
+
+    monkeypatch.setattr(analysis_daily, "run_daily", fail)
+
+    exit_code = analysis_daily.main(_main_args(tmp_path))
+
+    assert exit_code == 2
+    output = capsys.readouterr().out
+    started, finished, duration = _timing_values(output)
+    assert finished >= started
+    assert duration >= 0
+    assert "outcome=error error=synthetic failure" in output
+
+
+def test_main_preserves_result_error_exit_code(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error_result = DailyRunResult(
+        current_date=date(2026, 9, 30),
+        lookback_days=1,
+        min_coverage_pct=99.8,
+        inspections=(),
+        outcome="error",
+        error="runner error",
+    )
+    monkeypatch.setattr(analysis_daily, "run_daily", lambda **kwargs: error_result)
+
+    exit_code = analysis_daily.main(_main_args(tmp_path))
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    started, finished, duration = _timing_values(output)
+    assert finished >= started
+    assert duration >= 0
+    assert "outcome=error" in output
+    assert "error=runner error" in output
