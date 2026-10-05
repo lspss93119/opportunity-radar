@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from radar.config import MarketConfig, RadarConfig, load_config
+from radar.monitors.spread.factory import create_spread_monitor
 
 
 def test_example_config_loads():
@@ -13,7 +14,24 @@ def test_example_config_loads():
     assert cfg.fees_bps["trade_xyz"] == 9.0
     assert cfg.fees_bps["entropy"] == 9.0
     assert cfg.fees_bps["arcus"] == 2.25
-    assert cfg.fees_bps["backpack"] == 5.0
+    assert cfg.fees_bps == {
+        "lighter": 0.0,
+        "lighter_robinhood": 0.0,
+        "hyperliquid": 4.5,
+        "trade_xyz": 9.0,
+        "entropy": 9.0,
+        "arcus": 2.25,
+        "backpack": 4.0,
+    }
+    assert cfg.maker_fees_bps == {
+        "lighter": 0.0,
+        "lighter_robinhood": 0.0,
+        "hyperliquid": 1.5,
+        "trade_xyz": 3.0,
+        "entropy": 3.0,
+        "arcus": 0.0,
+        "backpack": 1.8,
+    }
     assert cfg.fees_bps["lighter_robinhood"] == 0.0
     assert {m.venue for m in cfg.markets} == {
         "lighter",
@@ -289,6 +307,61 @@ def test_boolean_fee_is_rejected():
                 "monitors": {"spread": {"enabled": False}},
             }
         )
+
+
+def test_maker_fees_default_to_an_empty_mapping():
+    config = RadarConfig(monitors={"spread": {"enabled": False}})
+
+    assert config.maker_fees_bps == {}
+
+
+def test_negative_maker_fee_is_rejected():
+    with pytest.raises(ValidationError):
+        RadarConfig.model_validate(
+            {
+                "sampling_seconds": 10,
+                "maker_fees_bps": {"lighter": -1},
+                "markets": [],
+                "monitors": {"spread": {"enabled": False}},
+            }
+        )
+
+
+@pytest.mark.parametrize("invalid_fee", [float("nan"), float("inf"), -float("inf")])
+def test_non_finite_maker_fee_is_rejected(invalid_fee):
+    with pytest.raises(ValidationError):
+        RadarConfig.model_validate(
+            {
+                "sampling_seconds": 10,
+                "maker_fees_bps": {"lighter": invalid_fee},
+                "markets": [],
+                "monitors": {"spread": {"enabled": False}},
+            }
+        )
+
+
+def test_boolean_maker_fee_is_rejected():
+    with pytest.raises(ValidationError):
+        RadarConfig.model_validate(
+            {
+                "sampling_seconds": 10,
+                "maker_fees_bps": {"lighter": True},
+                "markets": [],
+                "monitors": {"spread": {"enabled": False}},
+            }
+        )
+
+
+def test_spread_monitor_consumes_taker_fees_only():
+    config = RadarConfig(
+        fees_bps={"lighter": 1.0, "arcus": 2.0},
+        maker_fees_bps={"lighter": 99.0, "arcus": 88.0},
+        monitors={"spread": {"enabled": False}},
+    )
+
+    monitor = create_spread_monitor(config)
+
+    assert monitor._fees_bps == config.fees_bps
 
 
 @pytest.mark.parametrize("field_name", ["candidate_net_bps", "alert_net_bps"])

@@ -62,6 +62,7 @@ class RadarConfig(BaseModel):
 
     sampling_seconds: int = Field(default=10, gt=0)
     fees_bps: dict[str, float] = Field(default_factory=dict)
+    maker_fees_bps: dict[str, float] = Field(default_factory=dict)
     markets: list[MarketConfig] = Field(default_factory=list)
     quoted_markets: list[MarketConfig] = Field(default_factory=list)
     monitors: MonitorConfig = Field(default_factory=MonitorConfig)
@@ -85,6 +86,22 @@ class RadarConfig(BaseModel):
     def fees_must_not_be_boolean(cls, value: object) -> object:
         if isinstance(value, dict) and any(isinstance(fee, bool) for fee in value.values()):
             raise ValueError("fees_bps values must be numeric, not boolean")
+        return value
+
+    @field_validator("maker_fees_bps")
+    @classmethod
+    def maker_fees_must_be_non_negative(
+        cls, value: dict[str, float]
+    ) -> dict[str, float]:
+        if any(not math.isfinite(fee) or fee < 0 for fee in value.values()):
+            raise ValueError("maker_fees_bps must contain finite non-negative values")
+        return value
+
+    @field_validator("maker_fees_bps", mode="before")
+    @classmethod
+    def maker_fees_must_not_be_boolean(cls, value: object) -> object:
+        if isinstance(value, dict) and any(isinstance(fee, bool) for fee in value.values()):
+            raise ValueError("maker_fees_bps values must be numeric, not boolean")
         return value
 
     @field_validator("quoted_markets")
