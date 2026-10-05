@@ -209,8 +209,8 @@ def replay_manual_opportunity(
     if end_utc <= start_utc:
         raise ValueError("end must be after start")
     warmup_start = start_utc - timedelta(days=3)
-    market_glob = _dataset_glob(data_root, "market")
-    if market_glob is None:
+    market_root = _dataset_root(data_root, "market")
+    if market_root is None:
         raise FileNotFoundError("market Parquet dataset is missing")
     context_glob = _dataset_glob(data_root, "hourly_context")
     allowed_feeds = {
@@ -371,7 +371,7 @@ def replay_manual_opportunity(
                     counters["persistence_broken"] += 1
 
     _stream_market_rows(
-        market_glob,
+        market_root,
         warmup_start,
         end_utc,
         process_slot,
@@ -458,69 +458,94 @@ def replay_manual_opportunity(
     return result
 
 
-def _dataset_glob(data_root: Path, dataset: str) -> str | None:
-    files = tuple((Path(data_root) / dataset).glob("date=*/part-*.parquet"))
+def _dataset_root(data_root: Path, dataset: str) -> Path | None:
+    root = Path(data_root) / dataset
+    files = tuple(root.glob("date=*/part-*.parquet"))
     if not files:
         return None
-    return str(Path(data_root) / dataset / "date=*" / "part-*.parquet").replace(
-        "'", "''"
-    )
+    return root
+
+
+def _dataset_glob(data_root: Path, dataset: str) -> str | None:
+    root = _dataset_root(data_root, dataset)
+    if root is None:
+        return None
+    return str(root / "date=*" / "part-*.parquet").replace("'", "''")
 
 
 def _stream_market_rows(
-    market_glob: str,
+    market_root: Path,
     start: datetime,
     end: datetime,
     process_slot: Any,
 ) -> None:
-    query = f"""
-        WITH ranked AS (
-            SELECT
-                sample_time,
-                observed_at,
-                venue,
-                venue_symbol,
-                canonical_symbol,
-                best_bid,
-                best_ask,
-                row_number() OVER (
-                    PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
-                    ORDER BY observed_at DESC
-                ) AS row_number
-            FROM read_parquet('{market_glob}')
-            WHERE sample_time >= ? AND sample_time < ?
-        )
-        SELECT sample_time, observed_at, venue, venue_symbol, canonical_symbol,
-               best_bid, best_ask
-        FROM ranked
-        WHERE row_number = 1
-        ORDER BY sample_time, canonical_symbol, venue, venue_symbol
-    """
-    with duckdb.connect() as connection:
-        reader = connection.execute(query, [start, end]).to_arrow_reader(
-            batch_size=50_000
-        )
-        slot_time: datetime | None = None
-        slot_rows: list[_ReplayMarketRow] = []
-        for batch in reader:
-            for row in batch.to_pylist():
-                parsed = _parse_market_row(row)
-                if parsed is None:
-                    continue
-                if slot_time is None:
-                    slot_time = parsed.sample_time
-                if parsed.sample_time != slot_time:
-                    completed_slot = slot_time
-                    process_slot(slot_rows)
-                    missing_slot = completed_slot + timedelta(seconds=10)
-                    while missing_slot < parsed.sample_time:
-                        process_slot([], missing_slot)
-                        missing_slot += timedelta(seconds=10)
-                    slot_rows = []
-                    slot_time = parsed.sample_time
-                slot_rows.append(parsed)
-        if slot_rows:
-            process_slot(slot_rows)
+    """Stream one UTC date partition at a time to bound sort memory."""
+    slot_time: datetime | None = None
+    slot_rows: list[_ReplayMarketRow] = []
+    current_date = start.date()
+    last_date = (end - timedelta(microseconds=1)).date()
+    while current_date <= last_date:
+        partition = market_root / f"date={current_date.isoformat()}"
+        files = tuple(partition.glob("part-*.parquet"))
+        if files:
+            day_start = datetime(
+                current_date.year,
+                current_date.month,
+                current_date.day,
+                tzinfo=UTC,
+            )
+            day_end = day_start + timedelta(days=1)
+            query_start = max(start, day_start)
+            query_end = min(end, day_end)
+            path_glob = str(partition / "part-*.parquet").replace("'", "''")
+            query = f"""
+                WITH ranked AS (
+                    SELECT
+                        sample_time,
+                        observed_at,
+                        venue,
+                        venue_symbol,
+                        canonical_symbol,
+                        best_bid,
+                        best_ask,
+                        row_number() OVER (
+                            PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
+                            ORDER BY observed_at DESC
+                        ) AS row_number
+                    FROM read_parquet('{path_glob}')
+                    WHERE sample_time >= ? AND sample_time < ?
+                )
+                SELECT sample_time, observed_at, venue, venue_symbol, canonical_symbol,
+                       best_bid, best_ask
+                FROM ranked
+                WHERE row_number = 1
+                ORDER BY sample_time, canonical_symbol, venue, venue_symbol
+            """
+            with duckdb.connect() as connection:
+                connection.execute("PRAGMA memory_limit='2GB'")
+                reader = connection.execute(
+                    query, [query_start, query_end]
+                ).to_arrow_reader(batch_size=50_000)
+                for batch in reader:
+                    for row in batch.to_pylist():
+                        parsed = _parse_market_row(row)
+                        if parsed is None:
+                            continue
+                        if slot_time is None:
+                            slot_time = parsed.sample_time
+                        if parsed.sample_time != slot_time:
+                            completed_slot = slot_time
+                            process_slot(slot_rows)
+                            missing_slot = completed_slot + timedelta(seconds=10)
+                            while missing_slot < parsed.sample_time:
+                                process_slot([], missing_slot)
+                                missing_slot += timedelta(seconds=10)
+                            slot_rows = []
+                            slot_time = parsed.sample_time
+                        slot_rows.append(parsed)
+        current_date += timedelta(days=1)
+    if slot_rows:
+        process_slot(slot_rows)
 
 
 def _parse_market_row(row: Mapping[str, object]) -> _ReplayMarketRow | None:
