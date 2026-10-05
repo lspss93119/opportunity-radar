@@ -266,6 +266,14 @@ class ManualOpportunityLifecycle:
             for key in sorted(self._episodes, key=self._sort_key)
         )
 
+    @property
+    def active_keys(self) -> tuple[SpreadPairKey, ...]:
+        """Return active route keys without copying or sorting episode objects."""
+        return tuple(self._episodes)
+
+    def is_active(self, key: SpreadPairKey) -> bool:
+        return key in self._episodes
+
     def evaluate(self, observation: ManualOpportunityObservation) -> list[AlertRequest]:
         observation = self._with_configured_fees(observation)
         snapshot = deepcopy(self._episodes) if self._runtime_store is not None else None

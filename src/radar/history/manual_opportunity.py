@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -182,6 +183,12 @@ class _ReplayVolume:
     volume_24h: float | None
 
 
+@dataclass(frozen=True)
+class _ReplayVolumeSeries:
+    observed_times: tuple[datetime, ...]
+    values: tuple[_ReplayVolume, ...]
+
+
 def replay_manual_opportunity(
     *,
     data_root: Path,
@@ -248,8 +255,8 @@ def replay_manual_opportunity(
         nonlocal largest_abs_spread, invalid_bbo_rows
         if not rows:
             if empty_sample_time is not None and empty_sample_time >= requested_start:
-                for episode in lifecycle.active_episodes:
-                    lifecycle.observe_gap(episode.key, empty_sample_time)
+                for key in lifecycle.active_keys:
+                    lifecycle.observe_gap(key, empty_sample_time)
                     counters["data_gap"] += 1
                     counters["persistence_broken"] += 1
             return
@@ -326,13 +333,9 @@ def replay_manual_opportunity(
                     )
                     if reason is not None:
                         counters[reason] = counters.get(reason, 0) + 1
-                    was_active = any(
-                        episode.key == key for episode in lifecycle.active_episodes
-                    )
+                    was_active = lifecycle.is_active(key)
                     alerts = lifecycle.evaluate(observation)
-                    if was_active and reason is not None and not any(
-                        episode.key == key for episode in lifecycle.active_episodes
-                    ):
+                    if was_active and reason is not None and not lifecycle.is_active(key):
                         counters["persistence_broken"] += 1
                     for alert in alerts:
                         alert_payloads.append(dict(alert.payload))
@@ -361,9 +364,9 @@ def replay_manual_opportunity(
                         )
 
         if sample_time >= requested_start:
-            for episode in lifecycle.active_episodes:
-                if episode.key not in current_keys:
-                    lifecycle.observe_gap(episode.key, sample_time)
+            for key in lifecycle.active_keys:
+                if key not in current_keys:
+                    lifecycle.observe_gap(key, sample_time)
                     counters["data_gap"] += 1
                     counters["persistence_broken"] += 1
 
@@ -562,7 +565,7 @@ def _load_volume_index(
     context_glob: str | None,
     start: datetime,
     end: datetime,
-) -> dict[tuple[str, str, str], tuple[_ReplayVolume, ...]]:
+) -> dict[tuple[str, str, str], _ReplayVolumeSeries]:
     if context_glob is None:
         return {}
     query = f"""
@@ -603,22 +606,30 @@ def _load_volume_index(
     for (venue, venue_symbol, canonical_symbol, _sample_time), value in latest.items():
         result.setdefault((venue, venue_symbol, canonical_symbol), []).append(value)
     return {
-        key: tuple(sorted(values, key=lambda item: item.observed_at))
+        key: _ReplayVolumeSeries(
+            observed_times=tuple(
+                item.observed_at
+                for item in sorted(values, key=lambda item: item.observed_at)
+            ),
+            values=tuple(sorted(values, key=lambda item: item.observed_at)),
+        )
         for key, values in result.items()
     }
 
 
 def _volume_as_of(
-    volumes: Mapping[tuple[str, str, str], tuple[_ReplayVolume, ...]],
+    volumes: Mapping[tuple[str, str, str], _ReplayVolumeSeries],
     key: tuple[str, str, str],
     as_of: datetime,
 ) -> float | None:
-    values = volumes.get(key, ())
-    selected: _ReplayVolume | None = None
-    for value in values:
-        if value.observed_at <= as_of and value.sample_time <= as_of:
-            selected = value
-    return None if selected is None else selected.volume_24h
+    series = volumes.get(key)
+    if series is None:
+        return None
+    end = bisect_right(series.observed_times, as_of)
+    for value in reversed(series.values[:end]):
+        if value.sample_time <= as_of:
+            return value.volume_24h
+    return None
 
 
 def _valid_bbo(best_bid: float, best_ask: float) -> bool:
