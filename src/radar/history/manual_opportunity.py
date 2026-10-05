@@ -76,9 +76,10 @@ class BboRollingHistory:
             raise ValueError("minimum_coverage must be between 0 and 1")
         self.expected_interval_seconds = expected_interval_seconds
         self.minimum_coverage = minimum_coverage
-        self._times: deque[datetime] = deque()
-        self._values: dict[datetime, float] = {}
-        self._sum = 0.0
+        self._points: dict[str, deque[tuple[datetime, float]]] = {
+            name: deque() for name in self.windows_seconds
+        }
+        self._sums: dict[str, float] = {name: 0.0 for name in self.windows_seconds}
         self._last_sample_time: datetime | None = None
 
     def observe(
@@ -93,27 +94,16 @@ class BboRollingHistory:
             raise ValueError("sample_time must not move backwards")
 
         results: dict[str, BboWindowStats] = {}
-        max_window_seconds = max(self.windows_seconds.values())
-        self._prune(timestamp - timedelta(seconds=max_window_seconds))
+        self._remove_current(timestamp)
         for name, window_seconds in self.windows_seconds.items():
             cutoff = timestamp - timedelta(seconds=window_seconds)
-            prior_values = [
-                item
-                for item_time, item in self._values.items()
-                if cutoff <= item_time < timestamp
-            ]
-            count = len(prior_values)
+            points = self._points[name]
+            self._prune(name, cutoff)
+            count = len(points)
             expected_slots = window_seconds / self.expected_interval_seconds
             coverage = min(1.0, count / expected_slots) if expected_slots else 0.0
-            mean = sum(prior_values) / count if count else None
-            oldest = next(
-                (
-                    item_time
-                    for item_time in self._times
-                    if cutoff <= item_time < timestamp
-                ),
-                None,
-            )
+            mean = self._sums[name] / count if count else None
+            oldest = points[0][0] if points else None
             required_count = math.ceil(expected_slots * self.minimum_coverage)
             covers_window_start = (
                 self.minimum_coverage == 0
@@ -137,9 +127,9 @@ class BboRollingHistory:
 
     def hydrate(self, points: list[tuple[datetime, float]]) -> None:
         """Replace the bounded history with sorted, de-duplicated points."""
-        self._times.clear()
-        self._values.clear()
-        self._sum = 0.0
+        for name in self.windows_seconds:
+            self._points[name].clear()
+            self._sums[name] = 0.0
         self._last_sample_time = None
         values: dict[datetime, float] = {}
         for timestamp, value in points:
@@ -150,21 +140,23 @@ class BboRollingHistory:
             self._append(timestamp, values[timestamp])
 
     def _append(self, timestamp: datetime, value: float) -> None:
-        previous = self._values.get(timestamp)
-        if previous is not None:
-            self._sum += value - previous
-            self._values[timestamp] = value
-            return
-        self._times.append(timestamp)
-        self._values[timestamp] = value
-        self._sum += value
+        for name in self.windows_seconds:
+            self._points[name].append((timestamp, value))
+            self._sums[name] += value
         self._last_sample_time = timestamp
 
-    def _prune(self, cutoff: datetime) -> None:
-        while self._times and self._times[0] < cutoff:
-            timestamp = self._times.popleft()
-            value = self._values.pop(timestamp)
-            self._sum -= value
+    def _remove_current(self, timestamp: datetime) -> None:
+        for name in self.windows_seconds:
+            points = self._points[name]
+            if points and points[-1][0] == timestamp:
+                _timestamp, value = points.pop()
+                self._sums[name] -= value
+
+    def _prune(self, name: str, cutoff: datetime) -> None:
+        points = self._points[name]
+        while points and points[0][0] < cutoff:
+            _timestamp, value = points.popleft()
+            self._sums[name] -= value
 
 
 @dataclass(frozen=True)
