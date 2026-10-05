@@ -36,6 +36,22 @@ class AnomalyV2Config(BaseModel):
     notification_symbol_cooldown_seconds: int = Field(default=300, ge=0)
 
 
+class ManualOpportunityConfig(BaseModel):
+    """Configuration for the opt-in, BBO-only manual opportunity lifecycle."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    confirmation_seconds: int = Field(default=60, ge=0)
+    baseline_range_max_bps: float = Field(default=5.0, ge=0, allow_inf_nan=False)
+    expected_net_min_bps: float = Field(default=10.0, ge=0, allow_inf_nan=False)
+    volume_24h_min_usd: float = Field(
+        default=1_000_000.0, gt=0, allow_inf_nan=False
+    )
+    expansion_notify_step_bps: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    max_gap_seconds: int = Field(default=20, gt=0)
+
+
 class SpreadMonitorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -66,6 +82,9 @@ class RadarConfig(BaseModel):
     markets: list[MarketConfig] = Field(default_factory=list)
     quoted_markets: list[MarketConfig] = Field(default_factory=list)
     monitors: MonitorConfig = Field(default_factory=MonitorConfig)
+    manual_opportunity: ManualOpportunityConfig = Field(
+        default_factory=ManualOpportunityConfig
+    )
 
     @field_validator("sampling_seconds")
     @classmethod

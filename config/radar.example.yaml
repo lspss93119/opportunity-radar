@@ -18,6 +18,15 @@ maker_fees_bps:
   arcus: 0.0
   backpack: 1.8
 
+manual_opportunity:
+  enabled: false
+  confirmation_seconds: 60
+  baseline_range_max_bps: 5.0
+  expected_net_min_bps: 10.0
+  volume_24h_min_usd: 1000000
+  expansion_notify_step_bps: 5.0
+  max_gap_seconds: 20
+
 markets:
   - venue: lighter
     venue_symbol: BTC
