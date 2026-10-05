@@ -495,8 +495,6 @@ def _stream_market_rows(
                 tzinfo=UTC,
             )
             day_end = day_start + timedelta(days=1)
-            query_start = max(start, day_start)
-            query_end = min(end, day_end)
             path_glob = str(partition / "part-*.parquet").replace("'", "''")
             query = f"""
                 WITH ranked AS (
@@ -522,27 +520,34 @@ def _stream_market_rows(
                 ORDER BY sample_time, canonical_symbol, venue, venue_symbol
             """
             with duckdb.connect() as connection:
-                connection.execute("PRAGMA memory_limit='2GB'")
-                reader = connection.execute(
-                    query, [query_start, query_end]
-                ).to_arrow_reader(batch_size=50_000)
-                for batch in reader:
-                    for row in batch.to_pylist():
-                        parsed = _parse_market_row(row)
-                        if parsed is None:
-                            continue
-                        if slot_time is None:
-                            slot_time = parsed.sample_time
-                        if parsed.sample_time != slot_time:
-                            completed_slot = slot_time
-                            process_slot(slot_rows)
-                            missing_slot = completed_slot + timedelta(seconds=10)
-                            while missing_slot < parsed.sample_time:
-                                process_slot([], missing_slot)
-                                missing_slot += timedelta(seconds=10)
-                            slot_rows = []
-                            slot_time = parsed.sample_time
-                        slot_rows.append(parsed)
+                connection.execute("PRAGMA memory_limit='1GB'")
+                current_hour = day_start
+                while current_hour < day_end:
+                    hour_end = current_hour + timedelta(hours=1)
+                    query_start = max(start, current_hour)
+                    query_end = min(end, hour_end)
+                    if query_start < query_end:
+                        reader = connection.execute(
+                            query, [query_start, query_end]
+                        ).to_arrow_reader(batch_size=50_000)
+                        for batch in reader:
+                            for row in batch.to_pylist():
+                                parsed = _parse_market_row(row)
+                                if parsed is None:
+                                    continue
+                                if slot_time is None:
+                                    slot_time = parsed.sample_time
+                                if parsed.sample_time != slot_time:
+                                    completed_slot = slot_time
+                                    process_slot(slot_rows)
+                                    missing_slot = completed_slot + timedelta(seconds=10)
+                                    while missing_slot < parsed.sample_time:
+                                        process_slot([], missing_slot)
+                                        missing_slot += timedelta(seconds=10)
+                                    slot_rows = []
+                                    slot_time = parsed.sample_time
+                                slot_rows.append(parsed)
+                    current_hour = hour_end
         current_date += timedelta(days=1)
     if slot_rows:
         process_slot(slot_rows)
