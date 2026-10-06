@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import math
@@ -521,6 +521,116 @@ def _dataset_glob(data_root: Path, dataset: str) -> str | None:
     if root is None:
         return None
     return str(root / "date=*" / "part-*.parquet").replace("'", "''")
+
+
+def load_recent_bbo_history(
+    data_root: Path,
+    *,
+    allowed_feeds: Collection[tuple[str, str, str]],
+    as_of: datetime,
+    window_seconds: int = 3 * 24 * 60 * 60,
+) -> dict[SpreadPairKey, tuple[tuple[datetime, float], ...]]:
+    """Load strictly-prior directional BBO history for enabled exact feeds.
+
+    The Parquet scan selects only the fields needed to build a directional BBO
+    spread and consumes Arrow batches ordered by sample slot.  A SQL window
+    keeps the latest observed row for each feed and slot before route pairing,
+    so late duplicate writes cannot create duplicate route points.
+    """
+    as_of_utc = _as_utc(as_of, "as_of")
+    if window_seconds <= 0:
+        raise ValueError("window_seconds must be positive")
+    feeds = set(allowed_feeds)
+    if not feeds:
+        return {}
+    market_root = _dataset_root(data_root, "market")
+    if market_root is None:
+        raise FileNotFoundError("market Parquet dataset is missing")
+    market_glob = _dataset_glob(data_root, "market")
+    if market_glob is None:
+        raise FileNotFoundError("market Parquet dataset is missing")
+
+    start = as_of_utc - timedelta(seconds=window_seconds)
+    query = f"""
+        WITH ranked AS (
+            SELECT
+                sample_time,
+                observed_at,
+                venue,
+                venue_symbol,
+                canonical_symbol,
+                best_bid,
+                best_ask,
+                row_number() OVER (
+                    PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
+                    ORDER BY observed_at DESC
+                ) AS row_number
+            FROM read_parquet('{market_glob}')
+            WHERE sample_time >= ?
+              AND sample_time < ?
+              AND observed_at <= ?
+        )
+        SELECT sample_time, observed_at, venue, venue_symbol, canonical_symbol,
+               best_bid, best_ask
+        FROM ranked
+        WHERE row_number = 1
+        ORDER BY sample_time, canonical_symbol, venue, venue_symbol
+    """
+
+    points: dict[SpreadPairKey, list[tuple[datetime, float]]] = {}
+
+    def process_slot(rows: list[_ReplayMarketRow]) -> None:
+        if not rows:
+            return
+        by_symbol: dict[str, dict[tuple[str, str], _ReplayMarketRow]] = {}
+        for row in rows:
+            feed = (row.venue, row.venue_symbol, row.canonical_symbol)
+            if feed not in feeds or not _valid_bbo(row.best_bid, row.best_ask):
+                continue
+            by_symbol.setdefault(row.canonical_symbol, {})[
+                (row.venue, row.venue_symbol)
+            ] = row
+
+        sample_time = rows[0].sample_time
+        for canonical_symbol, symbol_feeds in sorted(by_symbol.items()):
+            ordered_feeds = sorted(symbol_feeds.items())
+            for (long_venue, long_symbol), long_row in ordered_feeds:
+                for (short_venue, short_symbol), short_row in ordered_feeds:
+                    if long_venue.lower() == short_venue.lower():
+                        continue
+                    key = SpreadPairKey(
+                        canonical_symbol=canonical_symbol,
+                        long_venue=long_venue,
+                        long_venue_symbol=long_symbol,
+                        short_venue=short_venue,
+                        short_venue_symbol=short_symbol,
+                    )
+                    spread_bps = (
+                        short_row.best_bid / long_row.best_ask - 1.0
+                    ) * 10_000.0
+                    points.setdefault(key, []).append((sample_time, spread_bps))
+
+    current_sample: datetime | None = None
+    slot_rows: list[_ReplayMarketRow] = []
+    with duckdb.connect() as connection:
+        reader = connection.execute(query, [start, as_of_utc, as_of_utc]).to_arrow_reader(
+            batch_size=50_000
+        )
+        for batch in reader:
+            for raw_row in batch.to_pylist():
+                parsed = _parse_market_row(raw_row)
+                if parsed is None:
+                    continue
+                if current_sample is None:
+                    current_sample = parsed.sample_time
+                elif parsed.sample_time != current_sample:
+                    process_slot(slot_rows)
+                    slot_rows = []
+                    current_sample = parsed.sample_time
+                slot_rows.append(parsed)
+    process_slot(slot_rows)
+
+    return {key: tuple(route_points) for key, route_points in points.items()}
 
 
 def _stream_market_rows(
