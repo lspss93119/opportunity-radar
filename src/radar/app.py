@@ -13,8 +13,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from radar.alerts.spread import SpreadAlertProcessor
+from radar.alerts.manual_opportunity import ManualOpportunityAlertProcessor
 from radar.alerts.telegram import TelegramTransport
-from radar.alerts.worker import AlertWorker
+from radar.alerts.worker import AlertProcessor, AlertRouter, AlertWorker
 from radar.collectors.base import CollectorBatch
 from radar.config import RadarConfig, load_config
 from radar.history.spread import SpreadHistory
@@ -97,7 +98,7 @@ class RadarApplication:
         alert_worker: AlertWorker,
         storage: ParquetStorage,
         runtime_store: SQLiteRuntimeStore,
-        processor: SpreadAlertProcessor,
+        processor: AlertProcessor,
         telegram: TelegramTransport | None = None,
         config: RadarConfig | None = None,
         clock: Callable[[], datetime] = utc_now,
@@ -639,7 +640,7 @@ def build_application(
         error_handler=monitor_error_handler,
     )
     telegram = TelegramTransport(token, chat_id)
-    processor = SpreadAlertProcessor(
+    spread_processor = SpreadAlertProcessor(
         history,
         telegram,
         candidate_net_bps=config.monitors.spread.candidate_net_bps,
@@ -647,6 +648,10 @@ def build_application(
         anomaly_v2_config=config.monitors.spread.anomaly_v2,
         runtime_store=runtime_store,
         stale_after_seconds=config.monitors.spread.stale_after_seconds,
+    )
+    processor = AlertRouter(
+        spread_processor,
+        ManualOpportunityAlertProcessor(telegram),
     )
     alert_worker = AlertWorker(
         queue,

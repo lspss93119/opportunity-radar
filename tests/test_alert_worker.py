@@ -19,6 +19,15 @@ def make_alert(event_id: str) -> AlertRequest:
     )
 
 
+def make_manual_alert(event_id: str) -> AlertRequest:
+    return AlertRequest(
+        monitor="manual_opportunity",
+        event_id=event_id,
+        created_at=NOW,
+        payload={"event_id": event_id},
+    )
+
+
 class FakeProcessor:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
@@ -122,3 +131,45 @@ async def test_run_forever_processes_items_until_cancelled():
         await task
 
     assert processor.processed == [alert]
+
+
+@pytest.mark.asyncio
+async def test_alert_router_dispatches_spread_and_manual_independently():
+    from radar.alerts.worker import AlertRouter
+
+    spread = FakeProcessor()
+    manual = FakeProcessor()
+    router = AlertRouter(spread, manual)
+    spread_alert = make_alert("spread")
+    manual_alert = make_manual_alert("manual")
+
+    await router.process(spread_alert)
+    await router.process(manual_alert)
+
+    assert spread.processed == [spread_alert]
+    assert manual.processed == [manual_alert]
+
+
+@pytest.mark.asyncio
+async def test_unknown_monitor_reaches_existing_worker_error_handler():
+    from radar.alerts.worker import AlertRouter, AlertWorker
+
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    alert = AlertRequest(
+        monitor="unknown",
+        event_id="unknown",
+        created_at=NOW,
+        payload={},
+    )
+    failures: list[tuple[AlertRequest, Exception]] = []
+    queue.put_nowait(alert)
+    worker = AlertWorker(
+        queue,
+        AlertRouter(FakeProcessor(), FakeProcessor()),
+        error_handler=lambda item, error: failures.append((item, error)),
+    )
+
+    await worker.run_once()
+
+    assert failures[0][0] == alert
+    assert isinstance(failures[0][1], ValueError)

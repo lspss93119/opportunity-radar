@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import math
 
 from radar.monitors.base import AlertRequest
+from radar.alerts.telegram import TelegramTransport
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,17 @@ class ManualOpportunityAlertDetails:
     short_best_bid: float
     sample_time: datetime
     expansion_level_bps: float | None
+
+
+class ManualOpportunityAlertProcessor:
+    """Deliver Manual Opportunity alerts as text-only Telegram messages."""
+
+    def __init__(self, telegram: TelegramTransport) -> None:
+        self._telegram = telegram
+
+    async def process(self, alert: AlertRequest) -> None:
+        details = parse_manual_opportunity_alert(alert)
+        await self._telegram.send_text(format_manual_opportunity_alert(details))
 
 
 def parse_manual_opportunity_alert(

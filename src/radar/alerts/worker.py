@@ -3,18 +3,43 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from typing import Protocol
 
-from radar.alerts.spread import SpreadAlertProcessor
 from radar.monitors.base import AlertRequest
 
 LOGGER = logging.getLogger(__name__)
+
+
+class AlertProcessor(Protocol):
+    async def process(self, alert: AlertRequest) -> None:
+        ...
+
+
+class AlertRouter:
+    """Route alert requests to their existing slow-path processors."""
+
+    def __init__(
+        self,
+        spread_processor: AlertProcessor,
+        manual_processor: AlertProcessor,
+    ) -> None:
+        self._spread_processor = spread_processor
+        self._manual_processor = manual_processor
+
+    async def process(self, alert: AlertRequest) -> None:
+        if alert.monitor == "spread":
+            await self._spread_processor.process(alert)
+        elif alert.monitor == "manual_opportunity":
+            await self._manual_processor.process(alert)
+        else:
+            raise ValueError(f"unknown alert monitor: {alert.monitor}")
 
 
 class AlertWorker:
     def __init__(
         self,
         queue: asyncio.Queue[AlertRequest],
-        processor: SpreadAlertProcessor,
+        processor: AlertProcessor,
         *,
         error_handler: Callable[[AlertRequest, Exception], None] | None = None,
     ) -> None:

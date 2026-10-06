@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from radar.alerts.manual_opportunity import (
+    ManualOpportunityAlertProcessor,
     format_manual_opportunity_alert,
     parse_manual_opportunity_alert,
 )
+from radar.monitors.base import AlertRequest
 
 
 def payload(event_kind: str = "manual_initial") -> dict[str, object]:
@@ -51,6 +55,10 @@ def test_manual_alert_parser_and_formatter_keep_bbo_fields_only():
     assert "VWAP" not in message
     assert "ENME" not in message
     assert "Funding" not in message
+    assert "Normal basis a" in message
+    assert "24h Volume" in message
+    assert "Long best ask" in message
+    assert "Short best bid" in message
 
 
 def test_manual_expansion_message_identifies_new_expected_net_level():
@@ -60,3 +68,30 @@ def test_manual_expansion_message_identifies_new_expected_net_level():
 
     assert "Expansion" in message
     assert "20.00 bps" in message
+
+
+@pytest.mark.asyncio
+async def test_manual_processor_sends_exactly_one_text_message_and_no_chart():
+    class FakeTelegram:
+        def __init__(self):
+            self.text_calls: list[str] = []
+            self.chart_calls: list[tuple[bytes, str]] = []
+
+        async def send_text(self, text: str) -> None:
+            self.text_calls.append(text)
+
+        async def send_chart(self, png: bytes, caption: str) -> None:
+            self.chart_calls.append((png, caption))
+
+    telegram = FakeTelegram()
+    alert = AlertRequest(
+        monitor="manual_opportunity",
+        event_id="manual:initial",
+        created_at=datetime(2026, 9, 28, 10, 31, tzinfo=UTC),
+        payload=payload(),
+    )
+
+    await ManualOpportunityAlertProcessor(telegram).process(alert)  # type: ignore[arg-type]
+
+    assert telegram.text_calls == [format_manual_opportunity_alert(alert)]
+    assert telegram.chart_calls == []
