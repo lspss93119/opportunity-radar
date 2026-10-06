@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import resource
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -87,6 +88,21 @@ def _elapsed_ms(started: float) -> float:
 def _max_rss_bytes() -> int:
     value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     return value if sys.platform == "darwin" else value * 1024
+
+
+def _current_rss_bytes() -> int | None:
+    """Read current RSS via the lightweight platform ``ps`` command."""
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        value = result.stdout.strip()
+        return None if not value else int(value) * 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 class RadarApplication:
@@ -609,7 +625,7 @@ def build_application(
     )
     if manual_monitors:
         hydration_started = time.perf_counter()
-        rss_before = _max_rss_bytes()
+        peak_rss_before = _max_rss_bytes()
         allowed_feeds = {
             (market.venue, market.venue_symbol, market.canonical_symbol)
             for market in config.markets
@@ -626,12 +642,14 @@ def build_application(
                 hydrate_history(manual_history)
         LOGGER.info(
             "manual opportunity history hydrated routes=%d observations=%d "
-            "duration_ms=%.3f rss_before=%d rss_after=%d",
+            "duration_ms=%.3f peak_rss_before=%d peak_rss_after=%d "
+            "current_rss_after=%s",
             len(manual_history),
             sum(len(points) for points in manual_history.values()),
             _elapsed_ms(hydration_started),
-            rss_before,
+            peak_rss_before,
             _max_rss_bytes(),
+            _current_rss_bytes(),
         )
     monitor_runner = MonitorRunner(
         monitors,

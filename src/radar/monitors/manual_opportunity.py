@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import logging
 import math
+import time
 from typing import Any
 
 from radar.config import ManualOpportunityConfig
@@ -16,6 +17,11 @@ from radar.state import RadarState
 from radar.storage.sqlite import SQLiteRuntimeStore
 
 DEFAULT_MANUAL_STALE_AFTER_SECONDS = 30
+LOGGER = logging.getLogger(__name__)
+
+
+def _elapsed_ms(started: float) -> float:
+    return (time.perf_counter() - started) * 1000.0
 
 
 def _as_utc(value: datetime, field_name: str) -> datetime:
@@ -288,6 +294,10 @@ class ManualOpportunityLifecycle:
         self._runtime_store = runtime_store
         self._stale_after_seconds = stale_after_seconds
         self._episodes: dict[SpreadPairKey, ManualOpportunityEpisode] = {}
+        self._cycle_originals: dict[
+            SpreadPairKey, ManualOpportunityEpisode | None
+        ] | None = None
+        self._cycle_events: list[tuple[str, str, object, datetime | None]] | None = None
         if runtime_store is not None:
             self._episodes = self._load_episodes(
                 runtime_store.get_monitor_state(self.name, self.state_key)
@@ -308,100 +318,166 @@ class ManualOpportunityLifecycle:
     def is_active(self, key: SpreadPairKey) -> bool:
         return key in self._episodes
 
+    def begin_cycle(self) -> None:
+        if self._cycle_originals is not None:
+            raise RuntimeError("manual opportunity cycle is already active")
+        self._cycle_originals = {}
+        self._cycle_events = []
+
+    def rollback_cycle(self) -> None:
+        if self._cycle_originals is None:
+            return
+        for key, previous in self._cycle_originals.items():
+            if previous is None:
+                self._episodes.pop(key, None)
+            else:
+                self._episodes[key] = previous
+        self._cycle_originals = None
+        self._cycle_events = None
+
+    def flush_cycle(self, updated_at: datetime) -> None:
+        if self._cycle_originals is None or self._cycle_events is None:
+            raise RuntimeError("manual opportunity cycle is not active")
+        try:
+            self._persist(updated_at, self._cycle_events)
+        except Exception:
+            self.rollback_cycle()
+            raise
+        self._cycle_originals = None
+        self._cycle_events = None
+
+    def _remember_episode(self, key: SpreadPairKey) -> None:
+        if self._cycle_originals is None:
+            raise RuntimeError("manual opportunity cycle is not active")
+        if key in self._cycle_originals:
+            return
+        episode = self._episodes.get(key)
+        self._cycle_originals[key] = None if episode is None else replace(episode)
+
     def evaluate(
         self,
         observation: ManualOpportunityObservation,
         *,
         now: datetime | None = None,
+        persist: bool = True,
     ) -> list[AlertRequest]:
         evaluation_time = (
             datetime.now(UTC) if now is None else _as_utc(now, "now")
         )
-        observation = self._with_configured_fees(observation)
-        snapshot = deepcopy(self._episodes) if self._runtime_store is not None else None
-        alerts: list[AlertRequest] = []
-        events: list[tuple[str, str, object, datetime | None]] = []
+        owns_cycle = persist
+        if owns_cycle:
+            self.begin_cycle()
+        elif self._cycle_originals is None:
+            raise RuntimeError("persist=False requires an active cycle")
         try:
-            episode = self._episodes.get(observation.key)
-            temporal_reason = manual_opportunity_temporal_rejection_reason(
-                observation,
-                evaluation_time,
-                stale_after_seconds=self._stale_after_seconds,
-            )
-            reason = temporal_reason or manual_opportunity_rejection_reason(
-                observation, self.config
-            )
-
-            if episode is not None and self._gap_exceeded(episode, observation):
-                del self._episodes[observation.key]
-                episode = None
-
-            if episode is not None and episode.confirmed_at is not None:
-                reason = temporal_reason or self._post_confirmation_reason(
-                    episode, observation
-                )
-
-            if reason is not None:
-                if episode is not None:
-                    del self._episodes[observation.key]
-                self._persist(evaluation_time, events)
-                return alerts
-
-            if episode is None:
-                episode = self._new_episode(observation)
-                self._episodes[observation.key] = episode
-            else:
-                episode.last_seen_at = observation.available_at
-                episode.last_observation = observation
-
-            if episode.confirmed_at is None:
-                elapsed = (
-                    observation.available_at - episode.candidate_started_at
-                ).total_seconds()
-                if elapsed >= self.config.confirmation_seconds:
-                    self._confirm(episode, observation)
-                    alert = self._build_alert(episode, observation, "manual_initial", None)
-                    alerts.append(alert)
-                    events.append(
-                        (
-                            alert.event_id,
-                            "manual_initial",
-                            alert.payload,
-                            alert.created_at,
-                        )
-                    )
-            else:
-                expansion_alert = self._maybe_expansion(episode, observation)
-                if expansion_alert is not None:
-                    alerts.append(expansion_alert)
-                    events.append(
-                        (
-                            expansion_alert.event_id,
-                            "manual_expansion",
-                            expansion_alert.payload,
-                            expansion_alert.created_at,
-                        )
-                    )
-
-            self._persist(evaluation_time, events)
+            alerts, events = self._evaluate_mutation(observation, evaluation_time)
+            if self._cycle_events is None:
+                raise RuntimeError("manual opportunity cycle events are unavailable")
+            self._cycle_events.extend(events)
+            if owns_cycle:
+                self.flush_cycle(evaluation_time)
             return alerts
         except Exception:
-            if snapshot is not None:
-                self._episodes = snapshot
+            if owns_cycle:
+                self.rollback_cycle()
             raise
 
-    def observe_gap(self, key: SpreadPairKey, sample_time: datetime) -> None:
+    def _evaluate_mutation(
+        self,
+        observation: ManualOpportunityObservation,
+        evaluation_time: datetime,
+    ) -> tuple[list[AlertRequest], list[tuple[str, str, object, datetime | None]]]:
+        observation = self._with_configured_fees(observation)
+        self._remember_episode(observation.key)
+        episode = self._episodes.get(observation.key)
+        temporal_reason = manual_opportunity_temporal_rejection_reason(
+            observation,
+            evaluation_time,
+            stale_after_seconds=self._stale_after_seconds,
+        )
+        reason = temporal_reason or manual_opportunity_rejection_reason(
+            observation, self.config
+        )
+
+        if episode is not None and self._gap_exceeded(episode, observation):
+            del self._episodes[observation.key]
+            episode = None
+
+        if episode is not None and episode.confirmed_at is not None:
+            reason = temporal_reason or self._post_confirmation_reason(
+                episode, observation
+            )
+
+        alerts: list[AlertRequest] = []
+        events: list[tuple[str, str, object, datetime | None]] = []
+        if reason is not None:
+            if episode is not None:
+                del self._episodes[observation.key]
+            return alerts, events
+
+        if episode is None:
+            episode = self._new_episode(observation)
+            self._episodes[observation.key] = episode
+        else:
+            episode.last_seen_at = observation.available_at
+            episode.last_observation = observation
+
+        if episode.confirmed_at is None:
+            elapsed = (
+                observation.available_at - episode.candidate_started_at
+            ).total_seconds()
+            if elapsed >= self.config.confirmation_seconds:
+                self._confirm(episode, observation)
+                alert = self._build_alert(episode, observation, "manual_initial", None)
+                alerts.append(alert)
+                events.append(
+                    (
+                        alert.event_id,
+                        "manual_initial",
+                        alert.payload,
+                        alert.created_at,
+                    )
+                )
+        else:
+            expansion_alert = self._maybe_expansion(episode, observation)
+            if expansion_alert is not None:
+                alerts.append(expansion_alert)
+                events.append(
+                    (
+                        expansion_alert.event_id,
+                        "manual_expansion",
+                        expansion_alert.payload,
+                        expansion_alert.created_at,
+                    )
+                )
+        return alerts, events
+
+    def observe_gap(
+        self,
+        key: SpreadPairKey,
+        sample_time: datetime,
+        *,
+        persist: bool = True,
+    ) -> None:
         """End a route episode when a sample slot has no valid observation."""
         timestamp = _as_utc(sample_time, "sample_time")
         if key not in self._episodes:
             return
-        snapshot = deepcopy(self._episodes) if self._runtime_store is not None else None
+        owns_cycle = persist
+        if owns_cycle:
+            self.begin_cycle()
+        elif self._cycle_originals is None:
+            raise RuntimeError("persist=False requires an active cycle")
         try:
+            self._remember_episode(key)
             del self._episodes[key]
-            self._persist(timestamp, [])
+            if self._cycle_events is None:
+                raise RuntimeError("manual opportunity cycle events are unavailable")
+            if owns_cycle:
+                self.flush_cycle(timestamp)
         except Exception:
-            if snapshot is not None:
-                self._episodes = snapshot
+            if owns_cycle:
+                self.rollback_cycle()
             raise
 
     def _new_episode(
@@ -809,30 +885,38 @@ class ManualOpportunityMonitor:
         state: RadarState,
     ) -> list[AlertRequest]:
         current_time = _as_utc(now, "now")
-        previous_histories = (
-            deepcopy(self._histories) if self._runtime_store is not None else None
-        )
+        cycle_started = time.perf_counter()
+        route_preparation_ms = 0.0
+        history_ms = 0.0
+        lifecycle_ms = 0.0
+        sqlite_persistence_ms = 0.0
+        routes_evaluated = 0
+        route_observations: list[ManualOpportunityObservation] = []
         current_keys: set[SpreadPairKey] = set()
         alerts: list[AlertRequest] = []
+        history_mutations: list[tuple[Any, Any]] = []
+        new_history_keys: set[SpreadPairKey] = set()
         markets_by_symbol: dict[
             str, dict[tuple[str, str], MarketSnapshot]
         ] = {}
-        for snapshot in state.markets:
-            markets_by_symbol.setdefault(snapshot.canonical_symbol, {})[
-                (snapshot.venue, snapshot.venue_symbol)
-            ] = snapshot
-        context_by_key = {
-            (context.venue, context.venue_symbol, context.canonical_symbol): context
-            for context in state.hourly_context
-        }
-
+        self._lifecycle.begin_cycle()
         try:
+            preparation_started = time.perf_counter()
+            for snapshot in state.markets:
+                markets_by_symbol.setdefault(snapshot.canonical_symbol, {})[
+                    (snapshot.venue, snapshot.venue_symbol)
+                ] = snapshot
+            context_by_key = {
+                (context.venue, context.venue_symbol, context.canonical_symbol): context
+                for context in state.hourly_context
+            }
             for canonical_symbol, symbol_markets in sorted(markets_by_symbol.items()):
                 ordered_markets = sorted(symbol_markets.items())
                 for (long_venue, long_symbol), long_snapshot in ordered_markets:
                     for (short_venue, short_symbol), short_snapshot in ordered_markets:
                         if long_venue.lower() == short_venue.lower():
                             continue
+                        routes_evaluated += 1
                         if not self._usable_snapshot(long_snapshot) or not self._usable_snapshot(
                             short_snapshot
                         ):
@@ -869,32 +953,78 @@ class ManualOpportunityMonitor:
                             is not None
                         ):
                             continue
-                        history = self._histories.setdefault(
-                            observation.key, self._new_history()
-                        )
-                        stats = history.observe(
-                            observation.sample_time,
-                            observation.current_spread_bps,
-                        )
-                        observation = replace(
-                            observation,
-                            mean_2h_bps=stats["2h"].mean_bps,
-                            mean_24h_bps=stats["24h"].mean_bps,
-                            mean_3d_bps=stats["3d"].mean_bps,
-                        )
                         current_keys.add(observation.key)
-                        alerts.extend(
-                            self._lifecycle.evaluate(observation, now=current_time)
-                        )
+                        route_observations.append(observation)
+            route_preparation_ms = _elapsed_ms(preparation_started)
+
+            history_started = time.perf_counter()
+            lifecycle_observations: list[ManualOpportunityObservation] = []
+            for observation in route_observations:
+                history = self._histories.get(observation.key)
+                if history is None:
+                    history = self._new_history()
+                    self._histories[observation.key] = history
+                    new_history_keys.add(observation.key)
+                stats, mutation = history.observe_with_rollback(
+                    observation.sample_time,
+                    observation.current_spread_bps,
+                )
+                history_mutations.append((history, mutation))
+                lifecycle_observations.append(
+                    replace(
+                        observation,
+                        mean_2h_bps=stats["2h"].mean_bps,
+                        mean_24h_bps=stats["24h"].mean_bps,
+                        mean_3d_bps=stats["3d"].mean_bps,
+                    )
+                )
+            history_ms = _elapsed_ms(history_started)
+
+            lifecycle_started = time.perf_counter()
+            for observation in lifecycle_observations:
+                alerts.extend(
+                    self._lifecycle.evaluate(
+                        observation,
+                        now=current_time,
+                        persist=False,
+                    )
+                )
 
             for key in self._lifecycle.active_keys:
                 if key not in current_keys:
-                    self._lifecycle.observe_gap(key, current_time)
+                    self._lifecycle.observe_gap(key, current_time, persist=False)
+            lifecycle_ms = _elapsed_ms(lifecycle_started)
+
+            persistence_started = time.perf_counter()
+            try:
+                self._lifecycle.flush_cycle(current_time)
+            finally:
+                sqlite_persistence_ms = _elapsed_ms(persistence_started)
             return alerts
         except Exception:
-            if previous_histories is not None:
-                self._histories = previous_histories
+            self._lifecycle.rollback_cycle()
+            for history, mutation in reversed(history_mutations):
+                mutation.rollback()
+            for key in new_history_keys:
+                self._histories.pop(key, None)
             raise
+        finally:
+            LOGGER.info(
+                "manual opportunity cycle route_preparation_ms=%.3f "
+                "history_ms=%.3f lifecycle_ms=%.3f "
+                "sqlite_persistence_ms=%.3f total_ms=%.3f "
+                "routes_evaluated=%d observations=%d active_episodes=%d "
+                "alerts_emitted=%d",
+                route_preparation_ms,
+                history_ms,
+                lifecycle_ms,
+                sqlite_persistence_ms,
+                (time.perf_counter() - cycle_started) * 1000.0,
+                routes_evaluated,
+                len(route_observations),
+                len(self._lifecycle.active_keys),
+                len(alerts),
+            )
 
     @staticmethod
     def _usable_snapshot(snapshot: MarketSnapshot) -> bool:

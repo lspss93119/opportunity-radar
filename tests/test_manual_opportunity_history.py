@@ -43,6 +43,35 @@ def test_bbo_history_marks_insufficient_coverage_unavailable():
     assert stats["3d"].available is False
 
 
+def test_bbo_history_mutation_can_restore_the_exact_previous_state():
+    history = BboRollingHistory(
+        windows_seconds={"2h": 20, "24h": 30, "3d": 40},
+        expected_interval_seconds=10,
+        minimum_coverage=0.0,
+    )
+    points = [
+        (START, 1.0),
+        (START + timedelta(seconds=10), 2.0),
+        (START + timedelta(seconds=20), 3.0),
+    ]
+    history.hydrate(points)
+    expected = BboRollingHistory(
+        windows_seconds={"2h": 20, "24h": 30, "3d": 40},
+        expected_interval_seconds=10,
+        minimum_coverage=0.0,
+    )
+    expected.hydrate(points)
+
+    _stats, mutation = history.observe_with_rollback(
+        START + timedelta(seconds=30), 4.0
+    )
+    mutation.rollback()
+
+    assert history._last_sample_time == expected._last_sample_time
+    assert history._points == expected._points
+    assert history._sums == expected._sums
+
+
 def _market_schema() -> pa.Schema:
     timestamp = pa.timestamp("us", tz="UTC")
     return pa.schema(

@@ -31,6 +31,41 @@ class BboWindowStats:
     available: bool
 
 
+@dataclass
+class BboHistoryMutation:
+    """Minimal inverse operation for one rolling-history observation."""
+
+    history: BboRollingHistory
+    previous_last_sample_time: datetime | None
+    appended_timestamp: datetime
+    appended_value: float
+    removed_current: dict[str, tuple[datetime, float] | None]
+    pruned_points: dict[str, tuple[tuple[datetime, float], ...]]
+    _rolled_back: bool = False
+
+    def rollback(self) -> None:
+        if self._rolled_back:
+            return
+        for name in self.history.windows_seconds:
+            points = self.history._points[name]
+            if not points or points[-1] != (
+                self.appended_timestamp,
+                self.appended_value,
+            ):
+                raise RuntimeError("rolling history changed before rollback")
+            points.pop()
+            self.history._sums[name] -= self.appended_value
+            pruned = self.pruned_points[name]
+            points.extendleft(reversed(pruned))
+            self.history._sums[name] += sum(value for _, value in pruned)
+            removed = self.removed_current[name]
+            if removed is not None:
+                points.append(removed)
+                self.history._sums[name] += removed[1]
+        self.history._last_sample_time = self.previous_last_sample_time
+        self._rolled_back = True
+
+
 def _as_utc(value: datetime, field_name: str) -> datetime:
     if not isinstance(value, datetime):
         raise ValueError(f"{field_name} must be a datetime")
@@ -87,6 +122,12 @@ class BboRollingHistory:
     def observe(
         self, sample_time: datetime, raw_spread_bps: float
     ) -> dict[str, BboWindowStats]:
+        results, _mutation = self.observe_with_rollback(sample_time, raw_spread_bps)
+        return results
+
+    def observe_with_rollback(
+        self, sample_time: datetime, raw_spread_bps: float
+    ) -> tuple[dict[str, BboWindowStats], BboHistoryMutation]:
         timestamp = _as_utc(sample_time, "sample_time")
         value = _finite(raw_spread_bps, "raw_spread_bps")
         if (
@@ -95,12 +136,18 @@ class BboRollingHistory:
         ):
             raise ValueError("sample_time must not move backwards")
 
+        previous_last_sample_time = self._last_sample_time
+        removed_current: dict[str, tuple[datetime, float] | None] = {}
+        pruned_points: dict[str, tuple[tuple[datetime, float], ...]] = {}
         results: dict[str, BboWindowStats] = {}
-        self._remove_current(timestamp)
         for name, window_seconds in self.windows_seconds.items():
-            cutoff = timestamp - timedelta(seconds=window_seconds)
             points = self._points[name]
-            self._prune(name, cutoff)
+            if points and points[-1][0] == timestamp:
+                removed_current[name] = points.pop()
+            else:
+                removed_current[name] = None
+            cutoff = timestamp - timedelta(seconds=window_seconds)
+            pruned_points[name] = tuple(self._prune(name, cutoff))
             count = len(points)
             expected_slots = window_seconds / self.expected_interval_seconds
             coverage = min(1.0, count / expected_slots) if expected_slots else 0.0
@@ -125,7 +172,14 @@ class BboRollingHistory:
             )
 
         self._append(timestamp, value)
-        return results
+        return results, BboHistoryMutation(
+            history=self,
+            previous_last_sample_time=previous_last_sample_time,
+            appended_timestamp=timestamp,
+            appended_value=value,
+            removed_current=removed_current,
+            pruned_points=pruned_points,
+        )
 
     def hydrate(self, points: list[tuple[datetime, float]]) -> None:
         """Replace the bounded history with sorted, de-duplicated points."""
@@ -147,18 +201,14 @@ class BboRollingHistory:
             self._sums[name] += value
         self._last_sample_time = timestamp
 
-    def _remove_current(self, timestamp: datetime) -> None:
-        for name in self.windows_seconds:
-            points = self._points[name]
-            if points and points[-1][0] == timestamp:
-                _timestamp, value = points.pop()
-                self._sums[name] -= value
-
-    def _prune(self, name: str, cutoff: datetime) -> None:
+    def _prune(self, name: str, cutoff: datetime) -> list[tuple[datetime, float]]:
         points = self._points[name]
+        removed: list[tuple[datetime, float]] = []
         while points and points[0][0] < cutoff:
-            _timestamp, value = points.popleft()
+            removed.append(points.popleft())
+            _timestamp, value = removed[-1]
             self._sums[name] -= value
+        return removed
 
 
 @dataclass(frozen=True)

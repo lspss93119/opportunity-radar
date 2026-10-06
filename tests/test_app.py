@@ -1081,3 +1081,27 @@ def test_main_configures_info_logging(monkeypatch, tmp_path):
         ]
     ) == 0
     assert logging_calls == [{"level": logging.INFO}]
+
+
+def test_current_rss_bytes_reads_lightweight_process_rss(monkeypatch):
+    import os
+    import radar.app as app_module
+
+    class Result:
+        stdout = "1234\n"
+
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Result()
+
+    monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+
+    assert app_module._current_rss_bytes() == 1234 * 1024
+    assert calls == [
+        (
+            (["ps", "-o", "rss=", "-p", str(os.getpid())],),
+            {"check": True, "capture_output": True, "text": True},
+        )
+    ]

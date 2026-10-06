@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import logging
 
 import pytest
 
 import radar.history.manual_opportunity as history_module
+import radar.monitors.manual_opportunity as monitor_module
 from radar.collectors.base import CollectorBatch
 from radar.config import ManualOpportunityConfig
 from radar.history.manual_opportunity import BboRollingHistory
@@ -307,3 +309,176 @@ async def test_monitor_persistence_failure_rolls_back_history_and_retries(
             START + timedelta(seconds=60), state_for(START + timedelta(seconds=60))
         )
         assert [alert.payload["event_kind"] for alert in retried] == ["manual_initial"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_store_batch_preserves_strategy_outputs(small_history, tmp_path):
+    del small_history
+    memory_monitor = monitor()
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        persisted_monitor = monitor(store=store)
+        prime(memory_monitor)
+        prime(persisted_monitor)
+
+        for offset in range(0, 80, 10):
+            when = START + timedelta(seconds=offset)
+            memory_alerts = await memory_monitor.evaluate(when, state_for(when))
+            persisted_alerts = await persisted_monitor.evaluate(when, state_for(when))
+
+            assert [
+                (alert.event_id, alert.payload) for alert in persisted_alerts
+            ] == [
+                (alert.event_id, alert.payload) for alert in memory_alerts
+            ]
+            assert (
+                persisted_monitor._lifecycle._serialize_state()
+                == memory_monitor._lifecycle._serialize_state()
+            )
+
+
+@pytest.mark.asyncio
+async def test_runtime_store_cycle_does_not_deepcopy_all_histories(
+    monkeypatch, small_history, tmp_path
+):
+    del small_history
+    monkeypatch.setattr(
+        monitor_module,
+        "deepcopy",
+        lambda _value: pytest.fail("live monitor must not deepcopy all histories"),
+        raising=False,
+    )
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        instance = monitor(store=store)
+        prime(instance)
+        assert await instance.evaluate(START, state_for(START)) == []
+
+
+@pytest.mark.asyncio
+async def test_manual_cycle_uses_at_most_one_runtime_transaction(small_history, tmp_path):
+    del small_history
+    current = START
+    venues = (
+        ("arcus", "QQQ-USD"),
+        ("lighter_robinhood", "QQQ"),
+        ("backpack", "QQQ.US_USDC_PERP"),
+    )
+    state = RadarState()
+    state.apply_market_batch(
+        CollectorBatch(
+            market_snapshots=tuple(
+                snapshot(
+                    venue,
+                    venue_symbol,
+                    current,
+                    best_bid=99.0 + index,
+                    best_ask=100.0 + index,
+                )
+                for index, (venue, venue_symbol) in enumerate(venues)
+            )
+        )
+    )
+    state.apply_context_batch(
+        CollectorBatch(
+            hourly_contexts=tuple(
+                context(venue, venue_symbol, current)
+                for venue, venue_symbol in venues
+            )
+        )
+    )
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        calls = 0
+        original = store.set_monitor_state_and_append_opportunities
+
+        def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        store.set_monitor_state_and_append_opportunities = counted  # type: ignore[method-assign]
+        instance = monitor(store=store)
+        assert await instance.evaluate(current, state) == []
+        assert calls <= 1
+
+
+@pytest.mark.asyncio
+async def test_production_scale_shape_keeps_one_transaction_for_420_routes(
+    small_history, tmp_path
+):
+    del small_history
+    current = START
+    venues = tuple(
+        (f"venue_{index:02d}", f"QQQ-{index:02d}") for index in range(21)
+    )
+    state = RadarState()
+    state.apply_market_batch(
+        CollectorBatch(
+            market_snapshots=tuple(
+                snapshot(
+                    venue,
+                    venue_symbol,
+                    current,
+                    best_bid=99.0 + index,
+                    best_ask=100.0 + index,
+                )
+                for index, (venue, venue_symbol) in enumerate(venues)
+            )
+        )
+    )
+    state.apply_context_batch(
+        CollectorBatch(
+            hourly_contexts=tuple(
+                context(venue, venue_symbol, current)
+                for venue, venue_symbol in venues
+            )
+        )
+    )
+    fees = {venue: 0.0 for venue, _symbol in venues}
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        calls = 0
+        original = store.set_monitor_state_and_append_opportunities
+
+        def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        store.set_monitor_state_and_append_opportunities = counted  # type: ignore[method-assign]
+        instance = ManualOpportunityMonitor(
+            ManualOpportunityConfig(), fees, runtime_store=store
+        )
+        assert await instance.evaluate(current, state) == []
+
+        assert len(instance._histories) == 21 * 20
+        assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_monitor_logs_cycle_timing(small_history, tmp_path, caplog):
+    del small_history
+    caplog.set_level(logging.INFO, logger=monitor_module.__name__)
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        instance = monitor(store=store)
+        prime(instance)
+        await instance.evaluate(START, state_for(START))
+
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("manual opportunity cycle")
+    )
+    for field in (
+        "route_preparation_ms=",
+        "history_ms=",
+        "lifecycle_ms=",
+        "sqlite_persistence_ms=",
+        "total_ms=",
+        "routes_evaluated=",
+        "active_episodes=",
+        "alerts_emitted=",
+    ):
+        assert field in message
