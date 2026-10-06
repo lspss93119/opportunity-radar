@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import replace
@@ -11,6 +11,7 @@ from radar.config import ManualOpportunityConfig
 from radar.models import MarketSnapshot
 from radar.monitors.base import AlertRequest, JSONValue
 from radar.monitors.spread.models import SpreadPairKey
+from radar.state import RadarState
 from radar.storage.sqlite import SQLiteRuntimeStore
 
 DEFAULT_MANUAL_STALE_AFTER_SECONDS = 30
@@ -750,6 +751,169 @@ class ManualOpportunityLifecycle:
             key.short_venue,
             key.short_venue_symbol,
         )
+
+
+class ManualOpportunityMonitor:
+    """Live BBO-only monitor backed by the manual opportunity lifecycle."""
+
+    name = "manual_opportunity"
+
+    def __init__(
+        self,
+        config: ManualOpportunityConfig,
+        fees_bps: Mapping[str, float],
+        *,
+        runtime_store: SQLiteRuntimeStore | None = None,
+        interval_seconds: int = 10,
+        stale_after_seconds: int = DEFAULT_MANUAL_STALE_AFTER_SECONDS,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        self.interval_seconds = interval_seconds
+        self.config = config
+        self._fees_bps = dict(fees_bps)
+        self._runtime_store = runtime_store
+        self._stale_after_seconds = stale_after_seconds
+        self._histories: dict[SpreadPairKey, Any] = {}
+        self._lifecycle = ManualOpportunityLifecycle(
+            config,
+            fees_bps,
+            runtime_store=runtime_store,
+            stale_after_seconds=stale_after_seconds,
+        )
+
+    @property
+    def active_episodes(self) -> tuple[ManualOpportunityEpisode, ...]:
+        return self._lifecycle.active_episodes
+
+    def hydrate_history(
+        self,
+        points_by_key: Mapping[SpreadPairKey, Sequence[tuple[datetime, float]]],
+    ) -> None:
+        """Replace live route histories with bounded strictly-prior points."""
+        from radar.history.manual_opportunity import BboRollingHistory
+
+        histories: dict[SpreadPairKey, Any] = {}
+        for key, points in points_by_key.items():
+            if isinstance(points, (str, bytes)):
+                raise TypeError("history points must be a sequence of pairs")
+            history = BboRollingHistory()
+            history.hydrate(list(points))
+            histories[key] = history
+        self._histories = histories
+
+    async def evaluate(
+        self,
+        now: datetime,
+        state: RadarState,
+    ) -> list[AlertRequest]:
+        current_time = _as_utc(now, "now")
+        previous_histories = (
+            deepcopy(self._histories) if self._runtime_store is not None else None
+        )
+        current_keys: set[SpreadPairKey] = set()
+        alerts: list[AlertRequest] = []
+        markets_by_symbol: dict[
+            str, dict[tuple[str, str], MarketSnapshot]
+        ] = {}
+        for snapshot in state.markets:
+            markets_by_symbol.setdefault(snapshot.canonical_symbol, {})[
+                (snapshot.venue, snapshot.venue_symbol)
+            ] = snapshot
+        context_by_key = {
+            (context.venue, context.venue_symbol, context.canonical_symbol): context
+            for context in state.hourly_context
+        }
+
+        try:
+            for canonical_symbol, symbol_markets in sorted(markets_by_symbol.items()):
+                ordered_markets = sorted(symbol_markets.items())
+                for (long_venue, long_symbol), long_snapshot in ordered_markets:
+                    for (short_venue, short_symbol), short_snapshot in ordered_markets:
+                        if long_venue.lower() == short_venue.lower():
+                            continue
+                        if not self._usable_snapshot(long_snapshot) or not self._usable_snapshot(
+                            short_snapshot
+                        ):
+                            continue
+                        if long_snapshot.sample_time != short_snapshot.sample_time:
+                            continue
+                        long_context = context_by_key.get(
+                            (long_venue, long_symbol, canonical_symbol)
+                        )
+                        short_context = context_by_key.get(
+                            (short_venue, short_symbol, canonical_symbol)
+                        )
+                        if long_context is None or short_context is None:
+                            continue
+                        try:
+                            observation = build_manual_observation(
+                                long_snapshot,
+                                short_snapshot,
+                                mean_2h_bps=None,
+                                mean_24h_bps=None,
+                                mean_3d_bps=None,
+                                long_volume_24h=long_context.volume_24h,
+                                short_volume_24h=short_context.volume_24h,
+                                fees_bps=self._fees_bps,
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                        if (
+                            manual_opportunity_temporal_rejection_reason(
+                                observation,
+                                current_time,
+                                stale_after_seconds=self._stale_after_seconds,
+                            )
+                            is not None
+                        ):
+                            continue
+                        history = self._histories.setdefault(
+                            observation.key, self._new_history()
+                        )
+                        stats = history.observe(
+                            observation.sample_time,
+                            observation.current_spread_bps,
+                        )
+                        observation = replace(
+                            observation,
+                            mean_2h_bps=stats["2h"].mean_bps,
+                            mean_24h_bps=stats["24h"].mean_bps,
+                            mean_3d_bps=stats["3d"].mean_bps,
+                        )
+                        current_keys.add(observation.key)
+                        alerts.extend(
+                            self._lifecycle.evaluate(observation, now=current_time)
+                        )
+
+            for key in self._lifecycle.active_keys:
+                if key not in current_keys:
+                    self._lifecycle.observe_gap(key, current_time)
+            return alerts
+        except Exception:
+            if previous_histories is not None:
+                self._histories = previous_histories
+            raise
+
+    @staticmethod
+    def _usable_snapshot(snapshot: MarketSnapshot) -> bool:
+        return (
+            math.isfinite(snapshot.best_bid)
+            and math.isfinite(snapshot.best_ask)
+            and math.isfinite(snapshot.best_bid_size)
+            and math.isfinite(snapshot.best_ask_size)
+            and snapshot.best_bid > 0
+            and snapshot.best_ask > 0
+            and snapshot.best_bid < snapshot.best_ask
+            and snapshot.best_bid_size > 0
+            and snapshot.best_ask_size > 0
+        )
+
+    @staticmethod
+    def _new_history() -> Any:
+        from radar.history.manual_opportunity import BboRollingHistory
+
+        return BboRollingHistory()
 
 
 def level_text(value: float) -> str:
