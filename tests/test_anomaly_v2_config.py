@@ -24,6 +24,13 @@ def test_anomaly_v2_defaults_are_disabled_and_use_approved_parameters():
     assert config.anomaly_v2.return_band_bps == 5.0
     assert config.anomaly_v2.max_gap_seconds == 20
     assert config.anomaly_v2.notification_symbol_cooldown_seconds == 300
+    assert config.anomaly_v2.telegram_enabled is True
+
+
+def test_anomaly_v2_telegram_gate_accepts_false():
+    config = AnomalyV2Config.model_validate({"telegram_enabled": False})
+
+    assert config.telegram_enabled is False
 
 
 @pytest.mark.parametrize(

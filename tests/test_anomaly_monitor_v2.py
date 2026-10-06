@@ -67,6 +67,7 @@ def make_monitor(
     store: SQLiteRuntimeStore | None = None,
     enabled: bool = True,
     confirmation_seconds: int = 60,
+    telegram_enabled: bool = True,
 ) -> SpreadMonitor:
     config = SpreadMonitorConfig(
         stale_after_seconds=120,
@@ -77,6 +78,7 @@ def make_monitor(
             return_band_bps=5.0,
             max_gap_seconds=20,
             expansion_notify_step_bps=5.0,
+            telegram_enabled=telegram_enabled,
         ),
     )
     return SpreadMonitor(
@@ -121,6 +123,28 @@ async def test_v2_confirms_at_15_bps_after_60_seconds_and_emits_no_legacy_alert(
     assert len(active) == 1
     assert active[0].episode.reference_mean_bps == pytest.approx(100.0)
     assert active[0].episode.confirmation_deviation_bps >= 15.0
+
+
+@pytest.mark.asyncio
+async def test_v2_telegram_disabled_persists_state_and_events_without_alert(tmp_path):
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(
+            store=store,
+            confirmation_seconds=0,
+            telegram_enabled=False,
+        )
+        prime(monitor)
+
+        alerts = await monitor.evaluate(START, state_at(START))
+
+        assert alerts == []
+        assert len(monitor.active_anomaly_episodes) == 1
+        assert store.get_monitor_state("spread", "anomaly_episodes_v2")
+        assert [
+            event["event_type"]
+            for event in store.list_opportunities(monitor_name="spread")
+        ] == ["anomaly_confirmed"]
 
 
 @pytest.mark.asyncio

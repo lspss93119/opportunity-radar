@@ -340,6 +340,8 @@ class SpreadMonitor:
             if previous_v2 is not None:
                 self._anomaly_v2 = previous_v2
             raise
+        if not self.config.anomaly_v2.telegram_enabled:
+            return []
         return list(result.alerts)
 
     def _start_episode(

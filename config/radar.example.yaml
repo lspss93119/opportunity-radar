@@ -663,6 +663,7 @@ monitors:
     stale_after_seconds: 30
     anomaly_v2:
       enabled: false
+      telegram_enabled: true
       deviation_bps: 15
       confirmation_seconds: 60
       return_band_bps: 5

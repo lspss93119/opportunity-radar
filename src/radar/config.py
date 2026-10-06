@@ -27,6 +27,7 @@ class AnomalyV2Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    telegram_enabled: bool = True
     deviation_bps: float = Field(default=15.0, ge=0, allow_inf_nan=False)
     confirmation_seconds: int = Field(default=60, ge=0)
     return_band_bps: float = Field(default=5.0, ge=0, allow_inf_nan=False)
