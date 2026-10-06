@@ -13,6 +13,8 @@ from radar.monitors.base import AlertRequest, JSONValue
 from radar.monitors.spread.models import SpreadPairKey
 from radar.storage.sqlite import SQLiteRuntimeStore
 
+DEFAULT_MANUAL_STALE_AFTER_SECONDS = 30
+
 
 def _as_utc(value: datetime, field_name: str) -> datetime:
     if not isinstance(value, datetime):
@@ -118,6 +120,11 @@ class ManualOpportunityObservation:
         return value
 
     @property
+    def available_at(self) -> datetime:
+        """Earliest time when both BBO legs and the sample slot were available."""
+        return max(self.sample_time, self.long_observed_at, self.short_observed_at)
+
+    @property
     def reference_a_bps(self) -> float | None:
         return self.mean_24h_bps
 
@@ -221,6 +228,27 @@ def manual_opportunity_rejection_reason(
     return None
 
 
+def manual_opportunity_temporal_rejection_reason(
+    observation: ManualOpportunityObservation,
+    now: datetime,
+    *,
+    stale_after_seconds: int = DEFAULT_MANUAL_STALE_AFTER_SECONDS,
+) -> str | None:
+    """Reject BBO data that was not available and fresh at evaluation time."""
+    current_time = _as_utc(now, "now")
+    if stale_after_seconds <= 0:
+        raise ValueError("stale_after_seconds must be positive")
+    if observation.sample_time > current_time:
+        return "future_sample"
+    for observed_at in (observation.long_observed_at, observation.short_observed_at):
+        age_seconds = (current_time - observed_at).total_seconds()
+        if age_seconds < 0:
+            return "future_bbo"
+        if age_seconds > stale_after_seconds:
+            return "stale_bbo"
+    return None
+
+
 @dataclass
 class ManualOpportunityEpisode:
     key: SpreadPairKey
@@ -249,10 +277,14 @@ class ManualOpportunityLifecycle:
         fees_bps: Mapping[str, float],
         *,
         runtime_store: SQLiteRuntimeStore | None = None,
+        stale_after_seconds: int = DEFAULT_MANUAL_STALE_AFTER_SECONDS,
     ) -> None:
+        if stale_after_seconds <= 0:
+            raise ValueError("stale_after_seconds must be positive")
         self.config = config
         self._fees_bps = dict(fees_bps)
         self._runtime_store = runtime_store
+        self._stale_after_seconds = stale_after_seconds
         self._episodes: dict[SpreadPairKey, ManualOpportunityEpisode] = {}
         if runtime_store is not None:
             self._episodes = self._load_episodes(
@@ -274,35 +306,55 @@ class ManualOpportunityLifecycle:
     def is_active(self, key: SpreadPairKey) -> bool:
         return key in self._episodes
 
-    def evaluate(self, observation: ManualOpportunityObservation) -> list[AlertRequest]:
+    def evaluate(
+        self,
+        observation: ManualOpportunityObservation,
+        *,
+        now: datetime | None = None,
+    ) -> list[AlertRequest]:
+        evaluation_time = (
+            datetime.now(UTC) if now is None else _as_utc(now, "now")
+        )
         observation = self._with_configured_fees(observation)
         snapshot = deepcopy(self._episodes) if self._runtime_store is not None else None
         alerts: list[AlertRequest] = []
         events: list[tuple[str, str, object, datetime | None]] = []
         try:
             episode = self._episodes.get(observation.key)
-            reason = manual_opportunity_rejection_reason(observation, self.config)
+            temporal_reason = manual_opportunity_temporal_rejection_reason(
+                observation,
+                evaluation_time,
+                stale_after_seconds=self._stale_after_seconds,
+            )
+            reason = temporal_reason or manual_opportunity_rejection_reason(
+                observation, self.config
+            )
 
             if episode is not None and self._gap_exceeded(episode, observation):
                 del self._episodes[observation.key]
                 episode = None
 
+            if episode is not None and episode.confirmed_at is not None:
+                reason = temporal_reason or self._post_confirmation_reason(
+                    episode, observation
+                )
+
             if reason is not None:
                 if episode is not None:
                     del self._episodes[observation.key]
-                self._persist(observation.sample_time, events)
+                self._persist(evaluation_time, events)
                 return alerts
 
             if episode is None:
                 episode = self._new_episode(observation)
                 self._episodes[observation.key] = episode
             else:
-                episode.last_seen_at = observation.sample_time
+                episode.last_seen_at = observation.available_at
                 episode.last_observation = observation
 
             if episode.confirmed_at is None:
                 elapsed = (
-                    observation.sample_time - episode.candidate_started_at
+                    observation.available_at - episode.candidate_started_at
                 ).total_seconds()
                 if elapsed >= self.config.confirmation_seconds:
                     self._confirm(episode, observation)
@@ -317,26 +369,19 @@ class ManualOpportunityLifecycle:
                         )
                     )
             else:
-                post_confirmation_reason = self._post_confirmation_reason(
-                    episode, observation
-                )
-                if post_confirmation_reason is not None:
-                    del self._episodes[observation.key]
-                    alerts.clear()
-                else:
-                    expansion_alert = self._maybe_expansion(episode, observation)
-                    if expansion_alert is not None:
-                        alerts.append(expansion_alert)
-                        events.append(
-                            (
-                                expansion_alert.event_id,
-                                "manual_expansion",
-                                expansion_alert.payload,
-                                expansion_alert.created_at,
-                            )
+                expansion_alert = self._maybe_expansion(episode, observation)
+                if expansion_alert is not None:
+                    alerts.append(expansion_alert)
+                    events.append(
+                        (
+                            expansion_alert.event_id,
+                            "manual_expansion",
+                            expansion_alert.payload,
+                            expansion_alert.created_at,
                         )
+                    )
 
-            self._persist(observation.sample_time, events)
+            self._persist(evaluation_time, events)
             return alerts
         except Exception:
             if snapshot is not None:
@@ -361,16 +406,17 @@ class ManualOpportunityLifecycle:
         self, observation: ManualOpportunityObservation
     ) -> ManualOpportunityEpisode:
         key = observation.key
+        candidate_started_at = observation.available_at
         episode_id = (
             f"manual:{key.canonical_symbol}:{key.long_venue}:{key.long_venue_symbol}:"
             f"{key.short_venue}:{key.short_venue_symbol}:"
-            f"{observation.sample_time.isoformat()}"
+            f"{candidate_started_at.isoformat()}"
         )
         return ManualOpportunityEpisode(
             key=key,
             episode_id=episode_id,
-            candidate_started_at=observation.sample_time,
-            last_seen_at=observation.sample_time,
+            candidate_started_at=candidate_started_at,
+            last_seen_at=candidate_started_at,
             last_observation=observation,
         )
 
@@ -444,10 +490,21 @@ class ManualOpportunityLifecycle:
         episode: ManualOpportunityEpisode,
         observation: ManualOpportunityObservation,
     ) -> str | None:
+        if (
+            observation.mean_2h_bps is None
+            or observation.mean_24h_bps is None
+            or observation.mean_3d_bps is None
+            or observation.baseline_range_bps is None
+        ):
+            return "insufficient_baseline_history"
+        if observation.baseline_range_bps > self.config.baseline_range_max_bps:
+            return "unstable_baseline"
         if observation.round_trip_fee_bps is None:
             return "fees_unavailable"
         if observation.route_volume_24h is None or observation.route_volume_24h <= 0:
             return "volume_unavailable"
+        if observation.route_volume_24h < self.config.volume_24h_min_usd:
+            return "volume_below_min"
         if episode.reference_a_bps is None or episode.frozen_round_trip_fee_bps is None:
             return "missing_frozen_basis"
         expected_net = (
@@ -483,7 +540,7 @@ class ManualOpportunityLifecycle:
         deviation = observation.current_spread_bps - reference
         expected_net = deviation - round_trip_fee
         signal_duration = int(
-            (observation.sample_time - episode.candidate_started_at).total_seconds()
+            (observation.available_at - episode.candidate_started_at).total_seconds()
         )
         payload: dict[str, JSONValue] = {
             "event_kind": event_kind,
@@ -520,7 +577,7 @@ class ManualOpportunityLifecycle:
         return AlertRequest(
             monitor=self.name,
             event_id=event_id,
-            created_at=observation.sample_time,
+            created_at=observation.available_at,
             payload=payload,
         )
 
@@ -681,7 +738,7 @@ class ManualOpportunityLifecycle:
         episode: ManualOpportunityEpisode,
         observation: ManualOpportunityObservation,
     ) -> bool:
-        delta = (observation.sample_time - episode.last_seen_at).total_seconds()
+        delta = (observation.available_at - episode.last_seen_at).total_seconds()
         return delta < 0 or delta > self.config.max_gap_seconds
 
     @staticmethod

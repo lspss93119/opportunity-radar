@@ -16,6 +16,7 @@ from radar.monitors.manual_opportunity import (
     ManualOpportunityLifecycle,
     ManualOpportunityObservation,
     manual_opportunity_rejection_reason,
+    manual_opportunity_temporal_rejection_reason,
 )
 from radar.monitors.spread.models import SpreadPairKey
 
@@ -236,6 +237,10 @@ def replay_manual_opportunity(
         "expected_net_below_min": 0,
         "volume_below_min": 0,
         "volume_unavailable": 0,
+        "bbo_freshness_rejected": 0,
+        "future_bbo": 0,
+        "stale_bbo": 0,
+        "future_sample": 0,
     }
     alert_payloads: list[dict[str, object]] = []
     unique_routes: set[SpreadPairKey] = set()
@@ -246,6 +251,10 @@ def replay_manual_opportunity(
     invalid_bbo_rows = 0
     qqq_inspection: list[dict[str, object]] = []
     requested_start = start_utc
+    observed_after_sample_rows = 0
+    oversized_fresh_observations = 0
+    oversized_candidate_episode_ids: set[str] = set()
+    oversized_confirmed_episode_ids: set[str] = set()
 
     def process_slot(
         rows: list[_ReplayMarketRow],
@@ -253,6 +262,7 @@ def replay_manual_opportunity(
     ) -> None:
         nonlocal route_sample_count, sample_slots, oversized_spreads
         nonlocal largest_abs_spread, invalid_bbo_rows
+        nonlocal oversized_fresh_observations, observed_after_sample_rows
         if not rows:
             if empty_sample_time is not None and empty_sample_time >= requested_start:
                 for key in lifecycle.active_keys:
@@ -267,6 +277,8 @@ def replay_manual_opportunity(
             feed_key = (row.venue, row.venue_symbol, row.canonical_symbol)
             if feed_key not in allowed_feeds:
                 continue
+            if row.observed_at > row.sample_time:
+                observed_after_sample_rows += 1
             if not _valid_bbo(row.best_bid, row.best_ask):
                 invalid_bbo_rows += 1
                 continue
@@ -327,18 +339,44 @@ def replay_manual_opportunity(
                         long_fee_bps=_fee(config.fees_bps, long_venue),
                         short_fee_bps=_fee(config.fees_bps, short_venue),
                     )
-                    _count_funnel(observation, config, counters)
-                    reason = manual_opportunity_rejection_reason(
+                    availability_time = observation.available_at
+                    temporal_reason = manual_opportunity_temporal_rejection_reason(
+                        observation,
+                        availability_time,
+                    )
+                    if temporal_reason is not None:
+                        counters["bbo_freshness_rejected"] += 1
+                        counters[temporal_reason] += 1
+                    else:
+                        _count_funnel(observation, config, counters)
+                    reason = temporal_reason or manual_opportunity_rejection_reason(
                         observation, config.manual_opportunity
                     )
+                    if abs(spread) > 1_000 and temporal_reason is None:
+                        oversized_fresh_observations += 1
                     if reason is not None:
                         counters[reason] = counters.get(reason, 0) + 1
                     was_active = lifecycle.is_active(key)
-                    alerts = lifecycle.evaluate(observation)
+                    alerts = lifecycle.evaluate(observation, now=availability_time)
+                    active_episode = next(
+                        (
+                            episode
+                            for episode in lifecycle.active_episodes
+                            if episode.key == key
+                        ),
+                        None,
+                    )
+                    if abs(spread) > 1_000 and temporal_reason is None and active_episode is not None:
+                        oversized_candidate_episode_ids.add(active_episode.episode_id)
                     if was_active and reason is not None and not lifecycle.is_active(key):
                         counters["persistence_broken"] += 1
                     for alert in alerts:
                         alert_payloads.append(dict(alert.payload))
+                        if (
+                            abs(spread) > 1_000
+                            and alert.payload.get("event_kind") == "manual_initial"
+                        ):
+                            oversized_confirmed_episode_ids.add(alert.event_id.split(":initial")[0])
                     if (
                         canonical_symbol == "QQQ"
                         and long_venue.lower() == "arcus"
@@ -350,6 +388,9 @@ def replay_manual_opportunity(
                         qqq_inspection.append(
                             {
                                 "sample_time": sample_time.isoformat(),
+                                "long_observed_at": long_row.observed_at.isoformat(),
+                                "short_observed_at": short_row.observed_at.isoformat(),
+                                "available_at": availability_time.isoformat(),
                                 "current_spread_bps": spread,
                                 "mean_2h_bps": stats["2h"].mean_bps,
                                 "mean_24h_bps": stats["24h"].mean_bps,
@@ -360,6 +401,7 @@ def replay_manual_opportunity(
                                 "short_volume_24h": short_volume,
                                 "route_volume_24h": observation.route_volume_24h,
                                 "rejection_reason": reason,
+                                "temporal_rejection_reason": temporal_reason,
                             }
                         )
 
@@ -425,6 +467,10 @@ def replay_manual_opportunity(
                 "volume_unavailable",
                 "persistence_broken",
                 "data_gap",
+                "bbo_freshness_rejected",
+                "future_bbo",
+                "stale_bbo",
+                "future_sample",
             }
         },
         "symbols_routes": [
@@ -446,6 +492,10 @@ def replay_manual_opportunity(
             "invalid_bbo_rows": invalid_bbo_rows,
             "abs_spread_over_1000_bps": oversized_spreads,
             "largest_abs_spread_bps": largest_abs_spread,
+            "oversized_fresh_observations": oversized_fresh_observations,
+            "oversized_candidate_episodes": len(oversized_candidate_episode_ids),
+            "oversized_confirmed_episodes": len(oversized_confirmed_episode_ids),
+            "observed_at_after_sample_rows": observed_after_sample_rows,
             "duplicate_initial_event_ids": len(initial)
             - len({str(item.get("episode_id")) for item in initial}),
             "source_mutation": False,

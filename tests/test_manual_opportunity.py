@@ -31,12 +31,14 @@ def observation(
     short_volume: float | None = 1_000_000.0,
     key: SpreadPairKey = KEY,
     fees: dict[str, float] = FEES,
+    long_observed_at: datetime | None = None,
+    short_observed_at: datetime | None = None,
 ) -> ManualOpportunityObservation:
     return ManualOpportunityObservation(
         key=key,
         sample_time=when,
-        long_observed_at=when,
-        short_observed_at=when,
+        long_observed_at=when if long_observed_at is None else long_observed_at,
+        short_observed_at=when if short_observed_at is None else short_observed_at,
         long_best_ask=100.0,
         short_best_bid=100.0 * (1.0 + spread_bps / 10_000.0),
         mean_2h_bps=means[0],
@@ -47,6 +49,15 @@ def observation(
         long_fee_bps=fees[key.long_venue],
         short_fee_bps=fees[key.short_venue],
     )
+
+
+def evaluate(
+    lifecycle: ManualOpportunityLifecycle,
+    item: ManualOpportunityObservation,
+    *,
+    now: datetime | None = None,
+):
+    return lifecycle.evaluate(item, now=item.available_at if now is None else now)
 
 
 def test_bbo_observation_uses_long_ask_and_short_bid_not_vwap():
@@ -144,7 +155,7 @@ def test_manual_lifecycle_confirms_after_strict_sixty_seconds():
     lifecycle = ManualOpportunityLifecycle(CONFIG, FEES)
 
     for offset in range(0, 61, 10):
-        alerts = lifecycle.evaluate(observation(START + timedelta(seconds=offset)))
+        alerts = evaluate(lifecycle, observation(START + timedelta(seconds=offset)))
 
     assert len(alerts) == 1
     assert alerts[0].payload["event_kind"] == "manual_initial"
@@ -154,19 +165,21 @@ def test_manual_lifecycle_confirms_after_strict_sixty_seconds():
 def test_one_failed_sample_resets_candidate_timer():
     lifecycle = ManualOpportunityLifecycle(CONFIG, FEES)
     for offset in (0, 10, 20):
-        assert lifecycle.evaluate(observation(START + timedelta(seconds=offset))) == []
-    assert lifecycle.evaluate(observation(START + timedelta(seconds=30), spread_bps=9.0)) == []
+        assert evaluate(lifecycle, observation(START + timedelta(seconds=offset))) == []
+    assert evaluate(
+        lifecycle, observation(START + timedelta(seconds=30), spread_bps=9.0)
+    ) == []
     for offset in range(40, 100, 10):
-        assert lifecycle.evaluate(observation(START + timedelta(seconds=offset))) == []
+        assert evaluate(lifecycle, observation(START + timedelta(seconds=offset))) == []
     assert lifecycle.active_episodes[0].confirmed_at is None
     assert lifecycle.active_episodes[0].candidate_started_at == START + timedelta(seconds=40)
-    assert lifecycle.evaluate(observation(START + timedelta(seconds=100)))
+    assert evaluate(lifecycle, observation(START + timedelta(seconds=100)))
 
 
 def test_continuity_gap_resets_candidate():
     lifecycle = ManualOpportunityLifecycle(CONFIG, FEES)
-    lifecycle.evaluate(observation(START))
-    assert lifecycle.evaluate(observation(START + timedelta(seconds=30))) == []
+    evaluate(lifecycle, observation(START))
+    assert evaluate(lifecycle, observation(START + timedelta(seconds=30))) == []
     assert lifecycle.active_episodes[0].candidate_started_at == START + timedelta(seconds=30)
 
 
@@ -176,14 +189,16 @@ def test_expansion_ladder_is_frozen_to_confirmation_basis():
         {"arcus": 0.0, "lighter_robinhood": 0.0},
     )
     for offset in range(0, 61, 10):
-        lifecycle.evaluate(
+        evaluate(
+            lifecycle,
             observation(
                 START + timedelta(seconds=offset),
                 spread_bps=12.0,
                 fees={"arcus": 0.0, "lighter_robinhood": 0.0},
             )
         )
-    expansion = lifecycle.evaluate(
+    expansion = evaluate(
+        lifecycle,
         observation(
             START + timedelta(seconds=70),
             spread_bps=16.0,
@@ -192,21 +207,24 @@ def test_expansion_ladder_is_frozen_to_confirmation_basis():
     )
     assert expansion[0].payload["event_kind"] == "manual_expansion"
     assert expansion[0].payload["expansion_level_bps"] == pytest.approx(15.0)
-    assert lifecycle.evaluate(
+    assert evaluate(
+        lifecycle,
         observation(
             START + timedelta(seconds=80),
             spread_bps=21.0,
             fees={"arcus": 0.0, "lighter_robinhood": 0.0},
         )
     )[0].payload["expansion_level_bps"] == pytest.approx(20.0)
-    assert lifecycle.evaluate(
+    assert evaluate(
+        lifecycle,
         observation(
             START + timedelta(seconds=90),
             spread_bps=21.0,
             fees={"arcus": 0.0, "lighter_robinhood": 0.0},
         )
     ) == []
-    assert lifecycle.evaluate(
+    assert evaluate(
+        lifecycle,
         observation(
             START + timedelta(seconds=100),
             spread_bps=26.0,
@@ -218,8 +236,10 @@ def test_expansion_ladder_is_frozen_to_confirmation_basis():
 def test_confirmed_episode_resolves_without_return_alert():
     lifecycle = ManualOpportunityLifecycle(CONFIG, FEES)
     for offset in range(0, 61, 10):
-        lifecycle.evaluate(observation(START + timedelta(seconds=offset)))
-    assert lifecycle.evaluate(observation(START + timedelta(seconds=70), spread_bps=9.0)) == []
+        evaluate(lifecycle, observation(START + timedelta(seconds=offset)))
+    assert evaluate(
+        lifecycle, observation(START + timedelta(seconds=70), spread_bps=9.0)
+    ) == []
     assert lifecycle.active_episodes == ()
 
 
@@ -232,14 +252,16 @@ def test_manual_state_restart_restores_frozen_basis_and_expansion_watermark(tmp_
             runtime_store=store,
         )
         for offset in range(0, 61, 10):
-            lifecycle.evaluate(
+            evaluate(
+                lifecycle,
                 observation(
                     START + timedelta(seconds=offset),
                     spread_bps=12.0,
                     fees={"arcus": 0.0, "lighter_robinhood": 0.0},
                 )
             )
-        lifecycle.evaluate(
+        evaluate(
+            lifecycle,
             observation(
                 START + timedelta(seconds=70),
                 spread_bps=16.0,
@@ -259,7 +281,8 @@ def test_manual_state_restart_restores_frozen_basis_and_expansion_watermark(tmp_
         assert restored.active_episodes[0].highest_notified_level_bps == pytest.approx(
             watermark
         )
-        assert restored.evaluate(
+        assert evaluate(
+            restored,
             observation(
                 START + timedelta(seconds=80),
                 spread_bps=21.0,
@@ -275,7 +298,7 @@ def test_persistence_failure_rolls_back_confirmation_and_alert(monkeypatch, tmp_
             ManualOpportunityConfig(), FEES, runtime_store=store
         )
         for offset in range(0, 60, 10):
-            lifecycle.evaluate(observation(START + timedelta(seconds=offset)))
+            evaluate(lifecycle, observation(START + timedelta(seconds=offset)))
 
         original = store.set_monitor_state_and_append_opportunities
         failed = True
@@ -289,10 +312,10 @@ def test_persistence_failure_rolls_back_confirmation_and_alert(monkeypatch, tmp_
 
         monkeypatch.setattr(store, "set_monitor_state_and_append_opportunities", fail_once)
         with pytest.raises(RuntimeError, match="injected persistence failure"):
-            lifecycle.evaluate(observation(START + timedelta(seconds=60)))
+            evaluate(lifecycle, observation(START + timedelta(seconds=60)))
         assert lifecycle.active_episodes[0].confirmed_at is None
 
-        alert = lifecycle.evaluate(observation(START + timedelta(seconds=60)))
+        alert = evaluate(lifecycle, observation(START + timedelta(seconds=60)))
         assert len(alert) == 1
         events = store.list_opportunities(monitor_name="manual_opportunity")
         assert len(events) == 1
@@ -305,3 +328,125 @@ def test_manual_config_is_disabled_and_does_not_change_anomaly_defaults():
     config = RadarConfig()
     assert config.manual_opportunity.enabled is False
     assert config.manual_opportunity.confirmation_seconds == 60
+
+
+def test_future_bbo_cannot_start_a_candidate_before_both_legs_are_available():
+    lifecycle = ManualOpportunityLifecycle(CONFIG, FEES)
+    item = observation(
+        START,
+        long_observed_at=START,
+        short_observed_at=START + timedelta(seconds=10),
+    )
+
+    assert lifecycle.evaluate(item, now=START + timedelta(seconds=5)) == []
+    assert lifecycle.active_episodes == ()
+
+    assert lifecycle.evaluate(item, now=START + timedelta(seconds=10)) == []
+    assert lifecycle.active_episodes[0].candidate_started_at == START + timedelta(
+        seconds=10
+    )
+
+
+def test_stale_bbo_fails_closed():
+    lifecycle = ManualOpportunityLifecycle(CONFIG, FEES)
+    item = observation(
+        START,
+        long_observed_at=START - timedelta(seconds=31),
+        short_observed_at=START,
+    )
+
+    assert lifecycle.evaluate(item, now=START) == []
+    assert lifecycle.active_episodes == ()
+
+
+def test_candidate_timing_uses_causal_availability_of_the_slower_leg():
+    lifecycle = ManualOpportunityLifecycle(CONFIG, FEES)
+    for offset in range(0, 61, 10):
+        when = START + timedelta(seconds=offset)
+        available_at = when + timedelta(seconds=30)
+        alerts = lifecycle.evaluate(
+            observation(
+                when,
+                long_observed_at=available_at,
+                short_observed_at=available_at,
+            ),
+            now=available_at,
+        )
+        if offset < 60:
+            assert alerts == []
+
+    assert len(alerts) == 1
+    assert lifecycle.active_episodes[0].candidate_started_at == START + timedelta(
+        seconds=30
+    )
+    assert alerts[0].payload["signal_duration_seconds"] == 60
+
+
+def _confirm_with_zero_fees(lifecycle: ManualOpportunityLifecycle) -> None:
+    zero_fees = {"arcus": 0.0, "lighter_robinhood": 0.0}
+    for offset in range(0, 61, 10):
+        when = START + timedelta(seconds=offset)
+        lifecycle.evaluate(
+            observation(
+                when,
+                spread_bps=12.0,
+                fees=zero_fees,
+            ),
+            now=when,
+        )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"long_volume": 999_999.0},
+        {"means": (0.0, 0.0, 6.0)},
+        {"means": (0.0, None, 0.0)},
+        {"spread_bps": 9.0},
+    ],
+)
+def test_post_confirmation_failure_resolves_without_expansion(changed):
+    lifecycle = ManualOpportunityLifecycle(
+        ManualOpportunityConfig(),
+        {"arcus": 0.0, "lighter_robinhood": 0.0},
+    )
+    _confirm_with_zero_fees(lifecycle)
+
+    failed_kwargs = {
+        "spread_bps": 16.0,
+        "fees": {"arcus": 0.0, "lighter_robinhood": 0.0},
+    }
+    failed_kwargs.update(changed)
+    failed = observation(START + timedelta(seconds=70), **failed_kwargs)
+    assert lifecycle.evaluate(failed, now=failed.available_at) == []
+    assert lifecycle.active_episodes == ()
+
+
+def test_requalification_starts_a_new_candidate_and_requires_fresh_sixty_seconds():
+    lifecycle = ManualOpportunityLifecycle(
+        ManualOpportunityConfig(),
+        {"arcus": 0.0, "lighter_robinhood": 0.0},
+    )
+    _confirm_with_zero_fees(lifecycle)
+
+    invalid = observation(
+        START + timedelta(seconds=70),
+        spread_bps=9.0,
+        fees={"arcus": 0.0, "lighter_robinhood": 0.0},
+    )
+    assert lifecycle.evaluate(invalid, now=invalid.available_at) == []
+
+    for offset in range(80, 141, 10):
+        when = START + timedelta(seconds=offset)
+        alerts = lifecycle.evaluate(
+            observation(
+                when,
+                spread_bps=12.0,
+                fees={"arcus": 0.0, "lighter_robinhood": 0.0},
+            ),
+            now=when,
+        )
+
+    assert len(alerts) == 1
+    assert alerts[0].payload["event_kind"] == "manual_initial"
+    assert alerts[0].payload["signal_duration_seconds"] == 60
