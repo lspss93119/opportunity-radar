@@ -4,11 +4,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from radar.collectors.base import CollectorBatch
-from radar.config import RadarConfig
+from radar.config import ManualOpportunityConfig, MonitorConfig, RadarConfig, SpreadMonitorConfig
 from radar.models import MarketSnapshot
 from radar.monitors.base import AlertRequest, Monitor
 from radar.monitors.registry import MONITOR_FACTORIES, build_enabled_monitors
 from radar.monitors.runner import MonitorRunner
+from radar.monitors.manual_opportunity import ManualOpportunityMonitor
 from radar.monitors.spread.monitor import SpreadMonitor
 from radar.state import RadarState
 from radar.storage.sqlite import SQLiteRuntimeStore
@@ -112,6 +113,36 @@ def test_registry_builds_real_spread_monitor_with_or_without_runtime_store(tmp_p
         with_store = build_enabled_monitors(config, runtime_store=store)
         assert len(with_store) == 1
         assert isinstance(with_store[0], SpreadMonitor)
+
+
+@pytest.mark.parametrize(
+    ("spread_enabled", "manual_enabled", "expected_names"),
+    [
+        (True, False, ("spread",)),
+        (False, True, ("manual_opportunity",)),
+        (True, True, ("spread", "manual_opportunity")),
+        (False, False, ()),
+    ],
+)
+def test_registry_builds_spread_and_manual_monitors_independently(
+    spread_enabled, manual_enabled, expected_names
+):
+    config = RadarConfig(
+        monitors=MonitorConfig(
+            spread=SpreadMonitorConfig(enabled=spread_enabled),
+        ),
+        manual_opportunity=ManualOpportunityConfig(enabled=manual_enabled),
+    )
+
+    monitors = build_enabled_monitors(config)
+
+    assert tuple(monitor.name for monitor in monitors) == expected_names
+    assert sum(isinstance(monitor, SpreadMonitor) for monitor in monitors) == int(
+        spread_enabled
+    )
+    assert sum(
+        isinstance(monitor, ManualOpportunityMonitor) for monitor in monitors
+    ) == int(manual_enabled)
 
 
 @pytest.mark.asyncio

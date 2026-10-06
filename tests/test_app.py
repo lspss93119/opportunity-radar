@@ -771,6 +771,91 @@ def test_build_application_wires_monitor_runner_and_worker_to_one_queue(tmp_path
         app.runtime_store.close()
 
 
+def test_build_application_hydrates_manual_history_before_pipeline_start(
+    monkeypatch, tmp_path
+):
+    import radar.app as app_module
+    from radar.monitors.spread.models import SpreadPairKey
+
+    events: list[str] = []
+    key = SpreadPairKey("QQQ", "arcus", "QQQ-USD", "lighter_robinhood", "QQQ")
+
+    class FakePipeline:
+        sampling_seconds = 10
+        state = RadarState()
+
+        async def start(self):
+            events.append("pipeline.start")
+
+    def fake_from_config(*args, **kwargs):
+        del args, kwargs
+        events.append("pipeline.construct")
+        return FakePipeline()
+
+    class FakeSpreadHistory:
+        def __init__(self, root):
+            del root
+
+        def load_recent_pair_points(self, **kwargs):
+            del kwargs
+            events.append("spread_history")
+            return {}
+
+    def fake_load_recent_bbo_history(*args, **kwargs):
+        del args, kwargs
+        events.append("manual_history")
+        return {key: ((NOW - timedelta(seconds=10), 0.0),)}
+
+    monkeypatch.setattr(
+        app_module.MarketDataPipeline,
+        "from_config",
+        staticmethod(fake_from_config),
+    )
+    monkeypatch.setattr(app_module, "SpreadHistory", FakeSpreadHistory)
+    monkeypatch.setattr(
+        app_module,
+        "load_recent_bbo_history",
+        fake_load_recent_bbo_history,
+        raising=False,
+    )
+    config = RadarConfig(
+        fees_bps={"arcus": 0.0, "lighter_robinhood": 0.0},
+        markets=[
+            MarketConfig(
+                venue="arcus",
+                venue_symbol="QQQ-USD",
+                canonical_symbol="QQQ",
+            ),
+            MarketConfig(
+                venue="lighter_robinhood",
+                venue_symbol="QQQ",
+                canonical_symbol="QQQ",
+            ),
+        ],
+        manual_opportunity={"enabled": True},
+    )
+
+    app = app_module.build_application(
+        config,
+        data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime" / "radar.sqlite3",
+        telegram_credentials=("token-not-logged", "chat-id"),
+        clock=lambda: NOW,
+    )
+    try:
+        assert events == ["pipeline.construct", "spread_history", "manual_history"]
+        manual = next(
+            monitor
+            for monitor in app.monitor_runner.monitors
+            if monitor.name == "manual_opportunity"
+        )
+        assert key in manual._histories
+        asyncio.run(app.pipeline.start())
+        assert events[-1] == "pipeline.start"
+    finally:
+        app.runtime_store.close()
+
+
 def test_parser_accepts_run_and_telegram_smoke_commands():
     from radar.app import build_parser
 

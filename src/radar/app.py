@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import logging
 import os
+import resource
+import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from radar.alerts.worker import AlertWorker
 from radar.collectors.base import CollectorBatch
 from radar.config import RadarConfig, load_config
 from radar.history.spread import SpreadHistory
+from radar.history.manual_opportunity import load_recent_bbo_history
 from radar.models import FundingSnapshot, MarketSnapshot
 from radar.monitors.base import AlertRequest, JSONValue
 from radar.monitors.registry import build_enabled_monitors
@@ -78,6 +81,11 @@ class _CycleTiming:
 
 def _elapsed_ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000.0
+
+
+def _max_rss_bytes() -> int:
+    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return value if sys.platform == "darwin" else value * 1024
 
 
 class RadarApplication:
@@ -590,9 +598,40 @@ def build_application(
             as_of=clock(),
         )
     for monitor in monitors:
+        if monitor.name != "spread":
+            continue
         hydrate_history = getattr(monitor, "hydrate_history", None)
         if callable(hydrate_history):
             hydrate_history(history_points)
+    manual_monitors = tuple(
+        monitor for monitor in monitors if monitor.name == "manual_opportunity"
+    )
+    if manual_monitors:
+        hydration_started = time.perf_counter()
+        rss_before = _max_rss_bytes()
+        allowed_feeds = {
+            (market.venue, market.venue_symbol, market.canonical_symbol)
+            for market in config.markets
+            if market.enabled
+        }
+        manual_history = load_recent_bbo_history(
+            Path(data_root),
+            allowed_feeds=allowed_feeds,
+            as_of=_as_utc(clock(), "clock"),
+        )
+        for monitor in manual_monitors:
+            hydrate_history = getattr(monitor, "hydrate_history", None)
+            if callable(hydrate_history):
+                hydrate_history(manual_history)
+        LOGGER.info(
+            "manual opportunity history hydrated routes=%d observations=%d "
+            "duration_ms=%.3f rss_before=%d rss_after=%d",
+            len(manual_history),
+            sum(len(points) for points in manual_history.values()),
+            _elapsed_ms(hydration_started),
+            rss_before,
+            _max_rss_bytes(),
+        )
     monitor_runner = MonitorRunner(
         monitors,
         state,
