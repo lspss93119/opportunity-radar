@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import math
+from typing import Any
 
 from radar.config import ManualOpportunityConfig
 from radar.models import MarketSnapshot
