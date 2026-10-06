@@ -250,4 +250,3 @@ Radar command, and verify service health before leaving the host.
 No synthetic Telegram smoke is required when transport health is already known;
 if one is necessary it must be one clearly labelled `TEST / SYNTHETIC` manual
 message only.
-

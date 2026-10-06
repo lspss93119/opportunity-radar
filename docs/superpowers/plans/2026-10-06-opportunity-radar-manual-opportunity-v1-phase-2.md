@@ -342,4 +342,3 @@
 - [ ] **Step 7: Report and stop**
 
   Report development/production SHAs, commits, config backup, sanitized changes, PIDs, hydration RSS/duration, monitor registration, latest datasets, SQLite/Parquet health, Telegram modes, and clean status. Do not begin automated trading work.
-
