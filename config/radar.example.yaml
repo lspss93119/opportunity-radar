@@ -141,6 +141,14 @@ markets:
     venue_symbol: QQQ
     canonical_symbol: QQQ
     enabled: true
+  - venue: lighter
+    venue_symbol: ZEC
+    canonical_symbol: ZEC
+    enabled: true
+  - venue: lighter
+    venue_symbol: NEAR
+    canonical_symbol: NEAR
+    enabled: true
   - venue: lighter_robinhood
     venue_symbol: BTC
     canonical_symbol: BTC
@@ -241,6 +249,14 @@ markets:
     venue_symbol: SLV
     canonical_symbol: SLV
     enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: ZEC
+    canonical_symbol: ZEC
+    enabled: true
+  - venue: lighter_robinhood
+    venue_symbol: NEAR
+    canonical_symbol: NEAR
+    enabled: true
   - venue: hyperliquid
     venue_symbol: BTC
     canonical_symbol: BTC
@@ -280,6 +296,14 @@ markets:
   - venue: hyperliquid
     venue_symbol: UNI
     canonical_symbol: UNI
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: ZEC
+    canonical_symbol: ZEC
+    enabled: true
+  - venue: hyperliquid
+    venue_symbol: NEAR
+    canonical_symbol: NEAR
     enabled: true
   - venue: trade_xyz
     venue_symbol: xyz:SNDK
@@ -348,6 +372,18 @@ markets:
   - venue: entropy
     venue_symbol: io:SNDK
     canonical_symbol: SNDK
+    enabled: true
+  - venue: arcus
+    venue_symbol: BTC-USD
+    canonical_symbol: BTC
+    enabled: true
+  - venue: arcus
+    venue_symbol: ETH-USD
+    canonical_symbol: ETH
+    enabled: true
+  - venue: arcus
+    venue_symbol: SOL-USD
+    canonical_symbol: SOL
     enabled: true
   - venue: arcus
     venue_symbol: SNDK-USD
@@ -456,6 +492,22 @@ markets:
   - venue: arcus
     venue_symbol: SLV-USD
     canonical_symbol: SLV
+    enabled: true
+  - venue: backpack
+    venue_symbol: BTC_USDC_PERP
+    canonical_symbol: BTC
+    enabled: true
+  - venue: backpack
+    venue_symbol: ETH_USDC_PERP
+    canonical_symbol: ETH
+    enabled: true
+  - venue: backpack
+    venue_symbol: SOL_USDC_PERP
+    canonical_symbol: SOL
+    enabled: true
+  - venue: backpack
+    venue_symbol: ZEC_USDC_PERP
+    canonical_symbol: ZEC
     enabled: true
   - venue: backpack
     venue_symbol: SNDK.US_USDC_PERP

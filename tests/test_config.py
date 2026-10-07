@@ -77,6 +77,8 @@ def test_example_config_loads():
             "BABA",
             "SPY",
             "QQQ",
+            "ZEC",
+            "NEAR",
         )
     } | {
         ("lighter_robinhood", symbol)
@@ -106,10 +108,22 @@ def test_example_config_loads():
             "QQQ",
             "USO",
             "SLV",
+            "ZEC",
+            "NEAR",
         )
     } | {
         ("hyperliquid", symbol)
-        for symbol in ("XRP", "HYPE", "SUI", "LINK", "DOGE", "AAVE", "UNI")
+        for symbol in (
+            "XRP",
+            "HYPE",
+            "SUI",
+            "LINK",
+            "DOGE",
+            "AAVE",
+            "UNI",
+            "ZEC",
+            "NEAR",
+        )
     } | {
         ("trade_xyz", f"xyz:{symbol}")
         for symbol in (
@@ -162,6 +176,9 @@ def test_example_config_loads():
             "QQQ",
             "USO",
             "SLV",
+            "BTC",
+            "ETH",
+            "SOL",
         )
     } | {
         ("backpack", f"{symbol}.US_USDC_PERP")
@@ -187,10 +204,18 @@ def test_example_config_loads():
             "UNI_USDC_PERP",
         )
     } | {
+        ("backpack", symbol)
+        for symbol in (
+            "BTC_USDC_PERP",
+            "ETH_USDC_PERP",
+            "SOL_USDC_PERP",
+            "ZEC_USDC_PERP",
+        )
+    } | {
         ("backpack", f"{symbol}.US_USDC_PERP")
         for symbol in ("AMD", "AMZN", "CRCL", "SPY", "QQQ")
     }
-    assert len(cfg.markets) == 127
+    assert len(cfg.markets) == 140
     assert len(cfg.quoted_markets) == 28
     assert {market.venue for market in cfg.quoted_markets} == {"variational"}
     assert {
@@ -228,6 +253,35 @@ def test_example_config_loads():
             "XRP",
         )
     } | {("US500", "SPY")}
+
+
+def test_expanded_market_entries_are_enabled_and_canonical():
+    cfg = load_config(Path("config/radar.example.yaml"))
+    expected = {
+        ("arcus", "BTC-USD", "BTC"),
+        ("arcus", "ETH-USD", "ETH"),
+        ("arcus", "SOL-USD", "SOL"),
+        ("backpack", "BTC_USDC_PERP", "BTC"),
+        ("backpack", "ETH_USDC_PERP", "ETH"),
+        ("backpack", "SOL_USDC_PERP", "SOL"),
+        ("backpack", "ZEC_USDC_PERP", "ZEC"),
+        ("lighter", "ZEC", "ZEC"),
+        ("lighter", "NEAR", "NEAR"),
+        ("lighter_robinhood", "ZEC", "ZEC"),
+        ("lighter_robinhood", "NEAR", "NEAR"),
+        ("hyperliquid", "ZEC", "ZEC"),
+        ("hyperliquid", "NEAR", "NEAR"),
+    }
+    configured = {
+        (market.venue, market.venue_symbol, market.canonical_symbol)
+        for market in cfg.markets
+        if market.enabled
+    }
+    assert expected <= configured
+    assert len(configured) == 140
+    assert len(cfg.markets) == len(
+        {(market.venue, market.venue_symbol) for market in cfg.markets}
+    )
 
 
 def test_quoted_markets_reject_non_variational_venues():
