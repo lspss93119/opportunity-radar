@@ -240,9 +240,11 @@ async def test_detector_event_is_persisted_when_repeated_initial_is_telegram_sup
             "manual_initial",
             "manual_initial",
         ]
+        suppression_logs = [record.getMessage() for record in caplog.records]
         assert any(
-            "manual_telegram_initial_suppressed" in record.getMessage()
-            for record in caplog.records
+            "manual_telegram_initial_suppressed" in message
+            and "reason=quiet_rearm_not_met" in message
+            for message in suppression_logs
         )
 
 

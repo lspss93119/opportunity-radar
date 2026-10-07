@@ -1434,7 +1434,7 @@ class ManualOpportunityMonitor:
                     LOGGER.info(
                         "manual_telegram_initial_suppressed symbol=%s "
                         "long_venue=%s short_venue=%s episode_id=%s "
-                        "expected_net=%s reason=route_disarmed",
+                        "expected_net=%s reason=quiet_rearm_not_met",
                         key.canonical_symbol,
                         key.long_venue,
                         key.short_venue,
