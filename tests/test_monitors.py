@@ -150,7 +150,7 @@ async def test_enabled_monitor_runs_and_disabled_registry_monitor_does_not():
     enabled = FakeMonitor("enabled", 10)
     runner = MonitorRunner([enabled], RadarState())
 
-    await runner.run_cycle(NOW)
+    assert await runner.run_cycle(NOW) == ("enabled",)
 
     assert len(enabled.calls) == 1
     assert build_enabled_monitors(
@@ -183,6 +183,46 @@ async def test_monitors_run_only_at_their_configured_cadences():
 
 
 @pytest.mark.asyncio
+async def test_aligned_schedule_time_prevents_boundary_lateness_skips():
+    monitor = FakeMonitor("manual_opportunity", 10)
+    runner = MonitorRunner([monitor], RadarState())
+    scheduled_slots = [
+        NOW,
+        NOW + timedelta(seconds=10),
+        NOW + timedelta(seconds=20),
+    ]
+    actual_times = [
+        scheduled_slots[0] + timedelta(milliseconds=150),
+        scheduled_slots[1] + timedelta(milliseconds=1),
+        scheduled_slots[2] + timedelta(milliseconds=2),
+    ]
+
+    for actual_time, scheduled_time in zip(actual_times, scheduled_slots):
+        await runner.run_cycle(actual_time, schedule_time=scheduled_time)
+
+    assert [call[0] for call in monitor.calls] == actual_times
+
+
+@pytest.mark.asyncio
+async def test_repeated_schedule_slot_is_not_run_twice_and_longer_cadence_uses_slots():
+    monitor = FakeMonitor("slow", 20)
+    runner = MonitorRunner([monitor], RadarState())
+
+    for offset in (0, 0, 10, 20, 30, 40):
+        scheduled_time = NOW + timedelta(seconds=offset)
+        await runner.run_cycle(
+            scheduled_time + timedelta(milliseconds=1),
+            schedule_time=scheduled_time,
+        )
+
+    assert [call[0] for call in monitor.calls] == [
+        NOW + timedelta(milliseconds=1),
+        NOW + timedelta(seconds=20, milliseconds=1),
+        NOW + timedelta(seconds=40, milliseconds=1),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_time_jump_runs_once_without_catch_up_executions():
     monitor = FakeMonitor("jump", 10)
     runner = MonitorRunner([monitor], RadarState())
@@ -203,7 +243,7 @@ async def test_alerts_are_queued_in_monitor_and_alert_order():
     queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
     runner = MonitorRunner([monitor_a, monitor_b], RadarState(), queue)
 
-    await runner.run_cycle(NOW)
+    assert await runner.run_cycle(NOW) == ("a", "b")
 
     assert [await queue.get(), await queue.get(), await queue.get()] == [
         request("a", "a1"),

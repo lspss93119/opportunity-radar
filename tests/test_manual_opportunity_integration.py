@@ -115,19 +115,27 @@ async def test_manual_monitor_runner_and_text_processor_have_no_slow_or_trading_
     runner = MonitorRunner((spread, manual), RadarState(), queue)
 
     for offset in range(0, 61, 10):
-        when = START + timedelta(seconds=offset)
-        runner.state = _state(when)
-        await runner.run_cycle(when)
+        scheduled_time = START + timedelta(seconds=offset)
+        actual_time = scheduled_time + timedelta(
+            milliseconds=150 if offset == 0 else 1
+        )
+        runner.state = _state(scheduled_time)
+        await runner.run_cycle(actual_time, schedule_time=scheduled_time)
 
     initial = await queue.get()
     assert initial.monitor == "manual_opportunity"
     assert initial.payload["event_kind"] == "manual_initial"
+    assert manual.active_episodes[0].confirmed_at == START + timedelta(seconds=60)
+    assert manual._histories[KEY]._last_sample_time == START + timedelta(seconds=60)
     assert queue.empty()
 
     for offset in (70,):
         when = START + timedelta(seconds=offset)
         runner.state = _state(when, short_bid=102.0)
-        await runner.run_cycle(when)
+        await runner.run_cycle(
+            when + timedelta(milliseconds=1),
+            schedule_time=when,
+        )
     expansion = await queue.get()
     assert expansion.payload["event_kind"] == "manual_expansion"
 

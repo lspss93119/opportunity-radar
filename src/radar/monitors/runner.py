@@ -43,6 +43,9 @@ class MonitorRunner:
         self.state = state
         self.queue = asyncio.Queue() if queue is None else queue
         self.error_handler = error_handler
+        # Store the cadence slot, not the wall-clock completion/evaluation time.
+        # RadarApplication owns the aligned market clock and may arrive at each
+        # boundary with different lateness.
         self._last_run: dict[str, datetime | None] = {}
         self._running: set[str] = set()
         self._validate_monitors()
@@ -65,25 +68,32 @@ class MonitorRunner:
             names.add(monitor.name)
             self._last_run[monitor.name] = None
 
-    def _is_due(self, monitor: Monitor, now: datetime) -> bool:
+    def _is_due(self, monitor: Monitor, schedule_time: datetime) -> bool:
         last_run = self._last_run[monitor.name]
-        return last_run is None or now >= last_run + timedelta(
+        return last_run is None or schedule_time >= last_run + timedelta(
             seconds=monitor.interval_seconds
         )
 
-    async def run_cycle(self, now: datetime) -> None:
+    async def run_cycle(
+        self,
+        now: datetime,
+        *,
+        schedule_time: datetime | None = None,
+    ) -> tuple[str, ...]:
         current_time = _as_utc(now)
+        cadence_time = current_time if schedule_time is None else _as_utc(schedule_time)
         due_monitors = tuple(
             monitor
             for monitor in self.monitors
-            if monitor.name not in self._running and self._is_due(monitor, current_time)
+            if monitor.name not in self._running
+            and self._is_due(monitor, cadence_time)
         )
         if not due_monitors:
-            return
+            return ()
 
         for monitor in due_monitors:
             self._running.add(monitor.name)
-            self._last_run[monitor.name] = current_time
+            self._last_run[monitor.name] = cadence_time
         try:
             results = await asyncio.gather(
                 *(self._evaluate(monitor, current_time) for monitor in due_monitors)
@@ -98,6 +108,7 @@ class MonitorRunner:
                 continue
             for alert in result.alerts:
                 await self.queue.put(alert)
+        return tuple(monitor.name for monitor in due_monitors)
 
     async def _evaluate(
         self,

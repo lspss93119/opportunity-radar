@@ -138,6 +138,7 @@ class RadarApplication:
         self._periodic_flush_task: asyncio.Task[None] | None = None
         self._next_scheduled_sample_time: datetime | None = None
         self._last_cycle_timing: _CycleTiming | None = None
+        self._last_monitors_run: tuple[str, ...] = ()
 
     async def collect_and_evaluate_once(
         self,
@@ -161,7 +162,18 @@ class RadarApplication:
                 snapshot.sample_time for snapshot in batch.market_snapshots
             )
         monitor_started = time.perf_counter()
-        await self.monitor_runner.run_cycle(current_time)
+        monitor_schedule_time = (
+            current_time
+            if sample_time is None
+            else _as_utc(sample_time, "sample_time")
+        )
+        monitors_run = await self.monitor_runner.run_cycle(
+            current_time,
+            schedule_time=monitor_schedule_time,
+        )
+        self._last_monitors_run = (
+            () if monitors_run is None else tuple(monitors_run)
+        )
         monitor_ms = _elapsed_ms(monitor_started)
         self._last_cycle_timing = _CycleTiming(
             cache_collect_ms=cache_collect_ms,
@@ -301,7 +313,7 @@ class RadarApplication:
                         "actual_cycle_start=%s boundary_lateness_ms=%.3f "
                         "cache_collect_ms=%.3f monitor_ms=%.3f "
                         "scheduler_critical_ms=%.3f markets=%d funding=%d "
-                        "hourly_context=%d queue_size=%d",
+                        "hourly_context=%d monitors_run=%s queue_size=%d",
                         self.stats.collection_cycles,
                         scheduled_sample_time,
                         cycle_time,
@@ -312,6 +324,7 @@ class RadarApplication:
                         len(batch.market_snapshots),
                         len(batch.funding_snapshots),
                         len(batch.hourly_contexts),
+                        ",".join(self._last_monitors_run) or "none",
                         self.monitor_runner.queue.qsize(),
                     )
                 except asyncio.CancelledError:

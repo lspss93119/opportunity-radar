@@ -79,6 +79,29 @@ def _fee_for(venue: str, fees_bps: Mapping[str, float]) -> float | None:
     return None
 
 
+def _log_transition(
+    event: str,
+    *,
+    sample_time: datetime,
+    available_at: datetime,
+    key: SpreadPairKey,
+    expected_net: float | None,
+    reason: str | None = None,
+) -> None:
+    LOGGER.info(
+        "manual opportunity %s sample_time=%s available_at=%s "
+        "symbol=%s long_venue=%s short_venue=%s expected_net=%s%s",
+        event,
+        sample_time,
+        available_at,
+        key.canonical_symbol,
+        key.long_venue,
+        key.short_venue,
+        expected_net,
+        "" if reason is None else f" reason={reason}",
+    )
+
+
 @dataclass(frozen=True)
 class ManualOpportunityObservation:
     key: SpreadPairKey
@@ -400,6 +423,14 @@ class ManualOpportunityLifecycle:
         )
 
         if episode is not None and self._gap_exceeded(episode, observation):
+            _log_transition(
+                "candidate_reset",
+                sample_time=observation.sample_time,
+                available_at=observation.available_at,
+                key=observation.key,
+                expected_net=observation.expected_net_at_a_bps,
+                reason="gap_exceeded",
+            )
             del self._episodes[observation.key]
             episode = None
 
@@ -412,12 +443,27 @@ class ManualOpportunityLifecycle:
         events: list[tuple[str, str, object, datetime | None]] = []
         if reason is not None:
             if episode is not None:
+                _log_transition(
+                    "candidate_reset",
+                    sample_time=observation.sample_time,
+                    available_at=observation.available_at,
+                    key=observation.key,
+                    expected_net=observation.expected_net_at_a_bps,
+                    reason=reason,
+                )
                 del self._episodes[observation.key]
             return alerts, events
 
         if episode is None:
             episode = self._new_episode(observation)
             self._episodes[observation.key] = episode
+            _log_transition(
+                "candidate_start",
+                sample_time=observation.sample_time,
+                available_at=observation.available_at,
+                key=observation.key,
+                expected_net=observation.expected_net_at_a_bps,
+            )
         else:
             episode.last_seen_at = observation.available_at
             episode.last_observation = observation
@@ -428,6 +474,13 @@ class ManualOpportunityLifecycle:
             ).total_seconds()
             if elapsed >= self.config.confirmation_seconds:
                 self._confirm(episode, observation)
+                _log_transition(
+                    "manual_confirm",
+                    sample_time=observation.sample_time,
+                    available_at=observation.available_at,
+                    key=observation.key,
+                    expected_net=episode.confirmation_expected_net_at_a_bps,
+                )
                 alert = self._build_alert(episode, observation, "manual_initial", None)
                 alerts.append(alert)
                 events.append(
@@ -441,6 +494,13 @@ class ManualOpportunityLifecycle:
         else:
             expansion_alert = self._maybe_expansion(episode, observation)
             if expansion_alert is not None:
+                _log_transition(
+                    "manual_expansion",
+                    sample_time=observation.sample_time,
+                    available_at=observation.available_at,
+                    key=observation.key,
+                    expected_net=observation.expected_net_at_a_bps,
+                )
                 alerts.append(expansion_alert)
                 events.append(
                     (
@@ -990,8 +1050,27 @@ class ManualOpportunityMonitor:
                     )
                 )
 
+            active_episodes = {
+                episode.key: episode for episode in self._lifecycle.active_episodes
+            }
             for key in self._lifecycle.active_keys:
                 if key not in current_keys:
+                    episode = active_episodes.get(key)
+                    _log_transition(
+                        "candidate_reset",
+                        sample_time=max(
+                            (snapshot.sample_time for snapshot in state.markets),
+                            default=current_time,
+                        ),
+                        available_at=current_time,
+                        key=key,
+                        expected_net=(
+                            None
+                            if episode is None
+                            else episode.last_observation.expected_net_at_a_bps
+                        ),
+                        reason="missing_observation",
+                    )
                     self._lifecycle.observe_gap(key, current_time, persist=False)
             lifecycle_ms = _elapsed_ms(lifecycle_started)
 

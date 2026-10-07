@@ -49,9 +49,16 @@ class RecordingRunner:
     def __init__(self, queue: asyncio.Queue[AlertRequest]) -> None:
         self.queue = queue
         self.calls: list[tuple[datetime, RadarState]] = []
+        self.schedule_calls: list[tuple[datetime, datetime | None]] = []
 
-    async def run_cycle(self, now: datetime) -> None:
+    async def run_cycle(
+        self,
+        now: datetime,
+        *,
+        schedule_time: datetime | None = None,
+    ) -> None:
         self.calls.append((now, self.state))
+        self.schedule_calls.append((now, schedule_time))
 
     state: RadarState
 
@@ -383,6 +390,7 @@ async def test_scheduler_forwards_authoritative_sample_time_to_pipeline():
     await app.run(stop_event=asyncio.Event())
 
     assert pipeline.collect_calls == [(actual_now, scheduled_sample_time)]
+    assert runner.schedule_calls == [(actual_now, scheduled_sample_time)]
 
 
 @pytest.mark.asyncio

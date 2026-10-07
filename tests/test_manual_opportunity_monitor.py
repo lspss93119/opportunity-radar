@@ -202,6 +202,49 @@ async def test_monitor_uses_prior_mean_and_exact_hourly_volume(small_history):
 
 
 @pytest.mark.asyncio
+async def test_monitor_logs_manual_lifecycle_transitions(small_history, caplog):
+    del small_history
+    caplog.set_level(logging.INFO, logger=monitor_module.__name__)
+    instance = monitor()
+    prime(instance)
+
+    await instance.evaluate(START, state_for(START))
+    await instance.evaluate(
+        START + timedelta(seconds=10),
+        state_for(START + timedelta(seconds=10), short_bid=99.0),
+    )
+    for offset in range(20, 81, 10):
+        when = START + timedelta(seconds=offset)
+        await instance.evaluate(when, state_for(when))
+    await instance.evaluate(
+        START + timedelta(seconds=90),
+        state_for(START + timedelta(seconds=90), short_bid=101.9),
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    transition_messages = [
+        message
+        for message in messages
+        if any(
+            f"manual opportunity {event}" in message
+            for event in (
+                "candidate_start",
+                "candidate_reset",
+                "manual_confirm",
+                "manual_expansion",
+            )
+        )
+    ]
+    assert any("manual opportunity candidate_start" in message for message in transition_messages)
+    assert any("manual opportunity candidate_reset" in message for message in transition_messages)
+    assert any("manual opportunity manual_confirm" in message for message in transition_messages)
+    assert any("manual opportunity manual_expansion" in message for message in transition_messages)
+    assert all("sample_time=" in message for message in transition_messages)
+    assert all("available_at=" in message for message in transition_messages)
+    assert all("symbol=QQQ" in message for message in transition_messages)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "state_kwargs",
     [
