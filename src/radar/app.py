@@ -20,7 +20,10 @@ from radar.alerts.worker import AlertProcessor, AlertRouter, AlertWorker
 from radar.collectors.base import CollectorBatch
 from radar.config import RadarConfig, load_config
 from radar.history.spread import SpreadHistory
-from radar.history.manual_opportunity import load_recent_bbo_history
+from radar.history.manual_opportunity import (
+    ManualOpportunityHistory,
+    load_recent_bbo_history,
+)
 from radar.models import FundingSnapshot, MarketSnapshot
 from radar.monitors.base import AlertRequest, JSONValue
 from radar.monitors.manual_opportunity import ManualOpportunityMonitor
@@ -685,6 +688,7 @@ def build_application(
         spread_processor,
         ManualOpportunityAlertProcessor(
             telegram,
+            history=ManualOpportunityHistory(Path(data_root)),
             notification_gate=(
                 next(
                     (
@@ -695,6 +699,7 @@ def build_application(
                     None,
                 )
             ),
+            min_profit_bps=config.manual_opportunity.expected_net_min_bps,
         ),
     )
     alert_worker = AlertWorker(

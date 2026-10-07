@@ -12,7 +12,10 @@ from radar.alerts.manual_opportunity import ManualOpportunityAlertProcessor
 from radar.alerts.worker import AlertRouter
 from radar.collectors.base import CollectorBatch
 from radar.config import AnomalyV2Config, ManualOpportunityConfig, SpreadMonitorConfig
-from radar.history.manual_opportunity import BboRollingHistory
+from radar.history.manual_opportunity import (
+    BboRollingHistory,
+    ManualOpportunityHistoryContext,
+)
 from radar.models import HourlyContext, MarketSnapshot
 from radar.monitors.manual_opportunity import ManualOpportunityMonitor
 from radar.monitors.runner import MonitorRunner
@@ -141,9 +144,17 @@ async def test_manual_monitor_runner_and_text_processor_have_no_slow_or_trading_
         async def send_chart(self, png: bytes, caption: str) -> None:
             self.chart_calls.append((png, caption))
 
+    class FakeHistory:
+        def query(self, **kwargs: object) -> ManualOpportunityHistoryContext:
+            del kwargs
+            return ManualOpportunityHistoryContext.empty()
+
     telegram = FakeTelegram()
     processor = ManualOpportunityAlertProcessor(
-        telegram, notification_gate=manual.notification_gate
+        telegram,
+        notification_gate=manual.notification_gate,
+        history=FakeHistory(),  # type: ignore[arg-type]
+        chart_renderer=lambda details, context: b"png",
     )  # type: ignore[arg-type]
     router = AlertRouter(
         spread_processor=processor,
@@ -162,8 +173,9 @@ async def test_manual_monitor_runner_and_text_processor_have_no_slow_or_trading_
     assert expansion.payload["event_kind"] == "manual_expansion"
     await router.process(expansion)
 
-    assert len(telegram.text_calls) == 2
-    assert telegram.chart_calls == []
+    assert len(telegram.text_calls) == 1
+    assert telegram.chart_calls[0][0] == b"png"
+    assert "QQQ Manual Opportunity" in telegram.chart_calls[0][1]
     assert telegram.network_calls == 0
 
 

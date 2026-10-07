@@ -10,6 +10,7 @@ import pytest
 
 from radar.history.manual_opportunity import (
     BboRollingHistory,
+    ManualOpportunityHistory,
     load_recent_bbo_history,
 )
 from radar.monitors.spread.models import SpreadPairKey
@@ -218,4 +219,63 @@ def test_load_recent_bbo_history_is_streaming_prior_only_and_route_isolated(tmp_
         (99.0 / 102.0 - 1.0) * 10_000.0
     )
     assert all(timestamp < as_of for points in result.values() for timestamp, _ in points)
+    assert hashlib.sha256(path.read_bytes()).digest() == before
+
+
+def test_manual_opportunity_history_queries_exact_route_without_lookahead(tmp_path):
+    as_of = datetime(2026, 10, 5, 0, 0, 30, tzinfo=UTC)
+    t0 = datetime(2026, 10, 5, 0, 0, 0, tzinfo=UTC)
+    t1 = t0 + timedelta(seconds=10)
+    rows = [
+        {
+            "sample_time": t0,
+            "observed_at": t0,
+            "venue": "arcus",
+            "venue_symbol": "QQQ-USD",
+            "canonical_symbol": "QQQ",
+            "best_bid": 99.0,
+            "best_ask": 100.0,
+        },
+        {
+            "sample_time": t0,
+            "observed_at": t0,
+            "venue": "lighter_robinhood",
+            "venue_symbol": "QQQ",
+            "canonical_symbol": "QQQ",
+            "best_bid": 101.0,
+            "best_ask": 102.0,
+        },
+        {
+            "sample_time": t1,
+            "observed_at": as_of + timedelta(seconds=1),
+            "venue": "arcus",
+            "venue_symbol": "QQQ-USD",
+            "canonical_symbol": "QQQ",
+            "best_bid": 99.0,
+            "best_ask": 100.0,
+        },
+        {
+            "sample_time": t1,
+            "observed_at": t1,
+            "venue": "lighter_robinhood",
+            "venue_symbol": "QQQ",
+            "canonical_symbol": "QQQ",
+            "best_bid": 101.0,
+            "best_ask": 102.0,
+        },
+    ]
+    path = _write_market_rows(tmp_path / "data", rows)
+    before = hashlib.sha256(path.read_bytes()).digest()
+
+    result = ManualOpportunityHistory(tmp_path / "data").query(
+        canonical_symbol="QQQ",
+        long_venue="arcus",
+        long_venue_symbol="QQQ-USD",
+        short_venue="lighter_robinhood",
+        short_venue_symbol="QQQ",
+        as_of=as_of,
+    )
+
+    assert [point.sample_time for point in result.points] == [t0]
+    assert result.points[0].raw_spread_bps == pytest.approx(100.0)
     assert hashlib.sha256(path.read_bytes()).digest() == before

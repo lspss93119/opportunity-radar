@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+import asyncio
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import math
+import logging
 
 from radar.monitors.base import AlertRequest
 from radar.monitors.manual_opportunity import ManualOpportunityNotificationGate
 from radar.monitors.spread.models import SpreadPairKey
 from radar.alerts.telegram import TelegramTransport
+from radar.history.manual_opportunity import (
+    ManualOpportunityHistory,
+    ManualOpportunityHistoryContext,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -35,26 +43,88 @@ class ManualOpportunityAlertDetails:
     route_volume_24h: float | None
     long_best_ask: float
     short_best_bid: float
+    candidate_started_at: datetime
+    confirmed_at: datetime | None
     sample_time: datetime
     expansion_level_bps: float | None
 
 
 class ManualOpportunityAlertProcessor:
-    """Deliver Manual Opportunity alerts as text-only Telegram messages."""
+    """Deliver Manual Opportunity alerts with an optional initial chart."""
 
     def __init__(
         self,
         telegram: TelegramTransport,
         *,
         notification_gate: ManualOpportunityNotificationGate | None = None,
+        history: ManualOpportunityHistory | None = None,
+        chart_renderer: Callable[
+            [ManualOpportunityAlertDetails, ManualOpportunityHistoryContext],
+            bytes | None,
+        ]
+        | None = None,
+        min_profit_bps: float = 10.0,
     ) -> None:
         self._telegram = telegram
         self._notification_gate = notification_gate
+        self._history = history
+        self._min_profit_bps = min_profit_bps
+        if chart_renderer is None:
+            from radar.alerts.manual_chart import render_manual_opportunity_chart
+
+            def chart_renderer(
+                details: ManualOpportunityAlertDetails,
+                context: ManualOpportunityHistoryContext,
+            ) -> bytes | None:
+                return render_manual_opportunity_chart(
+                    details,
+                    context,
+                    min_profit_bps=self._min_profit_bps,
+                )
+
+        self._chart_renderer = chart_renderer
 
     async def process(self, alert: AlertRequest) -> None:
         details = parse_manual_opportunity_alert(alert)
+        message = format_manual_opportunity_alert(details)
+        chart_png: bytes | None = None
+        if details.event_kind == "manual_initial" and self._history is not None:
+            context = ManualOpportunityHistoryContext.empty()
+            try:
+                context = await asyncio.to_thread(
+                    self._history.query,
+                    canonical_symbol=details.canonical_symbol,
+                    long_venue=details.long_venue,
+                    long_venue_symbol=details.long_venue_symbol,
+                    short_venue=details.short_venue,
+                    short_venue_symbol=details.short_venue_symbol,
+                    as_of=details.sample_time,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "manual opportunity history query failed event_id=%s",
+                    alert.event_id,
+                )
+            try:
+                chart_png = await asyncio.to_thread(
+                    self._chart_renderer,
+                    details,
+                    context,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "manual opportunity chart render failed event_id=%s",
+                    alert.event_id,
+                )
         try:
-            await self._telegram.send_text(format_manual_opportunity_alert(details))
+            if (
+                details.event_kind == "manual_initial"
+                and chart_png is not None
+                and len(message) <= 1024
+            ):
+                await self._telegram.send_chart(chart_png, message)
+            else:
+                await self._telegram.send_text(message)
         except Exception:
             if (
                 self._notification_gate is not None
@@ -119,6 +189,9 @@ def parse_manual_opportunity_alert(
         route_volume_24h=_optional_number(payload, "route_volume_24h"),
         long_best_ask=_number(payload, "long_best_ask"),
         short_best_bid=_number(payload, "short_best_bid"),
+        candidate_started_at=_optional_timestamp(payload, "candidate_started_at")
+        or _timestamp(payload, "sample_time"),
+        confirmed_at=_optional_timestamp(payload, "confirmed_at"),
         sample_time=_timestamp(payload, "sample_time"),
         expansion_level_bps=_optional_number(payload, "expansion_level_bps"),
     )
@@ -142,6 +215,7 @@ def format_manual_opportunity_alert(
             f"{details.canonical_symbol} {heading} · {duration}",
             f"Long  {details.long_venue} ({details.long_venue_symbol})",
             f"Short {details.short_venue} ({details.short_venue_symbol})",
+            "Directional BBO spread",
             "",
             f"Current spread       {_bps(details.current_spread_bps)}",
             f"Normal basis a       {_bps(details.reference_a_bps)}",
@@ -210,6 +284,15 @@ def _timestamp(payload: Mapping[str, object], field_name: str) -> datetime:
     if result.tzinfo is None or offset is None or offset.total_seconds() != 0:
         raise ValueError(f"{field_name} must be UTC")
     return result.astimezone(UTC)
+
+
+def _optional_timestamp(
+    payload: Mapping[str, object], field_name: str
+) -> datetime | None:
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    return _timestamp(payload, field_name)
 
 
 def _bps(value: float) -> str:

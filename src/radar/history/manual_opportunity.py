@@ -31,6 +31,25 @@ class BboWindowStats:
     available: bool
 
 
+@dataclass(frozen=True)
+class ManualOpportunityHistoryPoint:
+    """One directional BBO spread observation for alert presentation."""
+
+    sample_time: datetime
+    raw_spread_bps: float
+
+
+@dataclass(frozen=True)
+class ManualOpportunityHistoryContext:
+    """Recent route-specific BBO history without recomputed strategy state."""
+
+    points: tuple[ManualOpportunityHistoryPoint, ...]
+
+    @classmethod
+    def empty(cls) -> "ManualOpportunityHistoryContext":
+        return cls(())
+
+
 @dataclass
 class BboHistoryMutation:
     """Minimal inverse operation for one rolling-history observation."""
@@ -571,6 +590,124 @@ def _dataset_glob(data_root: Path, dataset: str) -> str | None:
     if root is None:
         return None
     return str(root / "date=*" / "part-*.parquet").replace("'", "''")
+
+
+class ManualOpportunityHistory:
+    """Read recent exact-feed BBO history for Manual Opportunity charts.
+
+    This is presentation history only.  It does not calculate a baseline or
+    replay lifecycle state; the alert payload remains authoritative for those
+    values.
+    """
+
+    def __init__(self, data_root: Path, *, window_seconds: int = 24 * 60 * 60) -> None:
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        self.data_root = Path(data_root)
+        self.window_seconds = window_seconds
+
+    def query(
+        self,
+        *,
+        canonical_symbol: str,
+        long_venue: str,
+        long_venue_symbol: str,
+        short_venue: str,
+        short_venue_symbol: str,
+        as_of: datetime,
+    ) -> ManualOpportunityHistoryContext:
+        as_of_utc = _as_utc(as_of, "as_of")
+        market_glob = _dataset_glob(self.data_root, "market")
+        if market_glob is None:
+            return ManualOpportunityHistoryContext.empty()
+        start = as_of_utc - timedelta(seconds=self.window_seconds)
+        query = f"""
+            WITH ranked AS (
+                SELECT
+                    sample_time,
+                    observed_at,
+                    venue,
+                    venue_symbol,
+                    canonical_symbol,
+                    best_bid,
+                    best_ask,
+                    row_number() OVER (
+                        PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
+                        ORDER BY observed_at DESC
+                    ) AS row_number
+                FROM read_parquet('{market_glob}')
+                WHERE sample_time >= ?
+                  AND sample_time <= ?
+                  AND observed_at <= ?
+                  AND canonical_symbol = ?
+                  AND (
+                      (venue = ? AND venue_symbol = ?)
+                      OR (venue = ? AND venue_symbol = ?)
+                  )
+            )
+            SELECT sample_time, observed_at, venue, venue_symbol,
+                   canonical_symbol, best_bid, best_ask
+            FROM ranked
+            WHERE row_number = 1
+            ORDER BY sample_time, venue, venue_symbol
+        """
+        route_feeds = {
+            (long_venue, long_venue_symbol),
+            (short_venue, short_venue_symbol),
+        }
+        points: list[ManualOpportunityHistoryPoint] = []
+        current_sample: datetime | None = None
+        rows: dict[tuple[str, str], _ReplayMarketRow] = {}
+
+        def emit() -> None:
+            if len(rows) != len(route_feeds):
+                return
+            long_row = rows.get((long_venue, long_venue_symbol))
+            short_row = rows.get((short_venue, short_venue_symbol))
+            if long_row is None or short_row is None:
+                return
+            if not _valid_bbo(long_row.best_bid, long_row.best_ask) or not _valid_bbo(
+                short_row.best_bid, short_row.best_ask
+            ):
+                return
+            points.append(
+                ManualOpportunityHistoryPoint(
+                    sample_time=long_row.sample_time,
+                    raw_spread_bps=(
+                        short_row.best_bid / long_row.best_ask - 1.0
+                    )
+                    * 10_000.0,
+                )
+            )
+
+        with duckdb.connect() as connection:
+            reader = connection.execute(
+                query,
+                [
+                    start,
+                    as_of_utc,
+                    as_of_utc,
+                    canonical_symbol,
+                    long_venue,
+                    long_venue_symbol,
+                    short_venue,
+                    short_venue_symbol,
+                ],
+            ).to_arrow_reader(batch_size=50_000)
+            for batch in reader:
+                for raw_row in batch.to_pylist():
+                    parsed = _parse_market_row(raw_row)
+                    if parsed is None:
+                        continue
+                    if current_sample is None:
+                        current_sample = parsed.sample_time
+                    elif parsed.sample_time != current_sample:
+                        emit()
+                        rows = {}
+                        current_sample = parsed.sample_time
+                    rows[(parsed.venue, parsed.venue_symbol)] = parsed
+        emit()
+        return ManualOpportunityHistoryContext(tuple(points))
 
 
 def load_recent_bbo_history(

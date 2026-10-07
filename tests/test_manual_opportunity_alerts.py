@@ -9,6 +9,10 @@ from radar.alerts.manual_opportunity import (
     format_manual_opportunity_alert,
     parse_manual_opportunity_alert,
 )
+from radar.history.manual_opportunity import (
+    ManualOpportunityHistoryContext,
+    ManualOpportunityHistoryPoint,
+)
 from radar.monitors.base import AlertRequest
 
 
@@ -36,6 +40,8 @@ def payload(event_kind: str = "manual_initial") -> dict[str, object]:
         "route_volume_24h": 2_000_000.0,
         "long_best_ask": 100.0,
         "short_best_bid": 100.302,
+        "candidate_started_at": datetime(2026, 9, 28, 10, 30, tzinfo=UTC).isoformat(),
+        "confirmed_at": datetime(2026, 9, 28, 10, 31, tzinfo=UTC).isoformat(),
         "sample_time": datetime(2026, 9, 28, 10, 31, tzinfo=UTC).isoformat(),
         "expansion_level_bps": None,
     }
@@ -71,7 +77,7 @@ def test_manual_expansion_message_identifies_new_expected_net_level():
 
 
 @pytest.mark.asyncio
-async def test_manual_processor_sends_exactly_one_text_message_and_no_chart():
+async def test_manual_initial_processor_sends_chart_with_matching_caption():
     class FakeTelegram:
         def __init__(self):
             self.text_calls: list[str] = []
@@ -83,6 +89,20 @@ async def test_manual_processor_sends_exactly_one_text_message_and_no_chart():
         async def send_chart(self, png: bytes, caption: str) -> None:
             self.chart_calls.append((png, caption))
 
+    class FakeHistory:
+        def query(self, **kwargs: object) -> ManualOpportunityHistoryContext:
+            del kwargs
+            return ManualOpportunityHistoryContext(
+                points=(
+                    ManualOpportunityHistoryPoint(
+                        datetime(2026, 9, 28, 10, 30, tzinfo=UTC), 9.0
+                    ),
+                    ManualOpportunityHistoryPoint(
+                        datetime(2026, 9, 28, 10, 31, tzinfo=UTC), 30.2
+                    ),
+                )
+            )
+
     telegram = FakeTelegram()
     alert = AlertRequest(
         monitor="manual_opportunity",
@@ -91,7 +111,91 @@ async def test_manual_processor_sends_exactly_one_text_message_and_no_chart():
         payload=payload(),
     )
 
-    await ManualOpportunityAlertProcessor(telegram).process(alert)  # type: ignore[arg-type]
+    processor = ManualOpportunityAlertProcessor(
+        telegram,
+        history=FakeHistory(),  # type: ignore[arg-type]
+        chart_renderer=lambda details, context: b"png",
+    )
+    await processor.process(alert)
 
-    assert telegram.text_calls == [format_manual_opportunity_alert(alert)]
+    assert telegram.text_calls == []
+    assert telegram.chart_calls == [(b"png", format_manual_opportunity_alert(alert))]
+    assert "Current spread       +30.20 bps" in telegram.chart_calls[0][1]
+    assert "Normal basis a       +9.08 bps" in telegram.chart_calls[0][1]
+    assert "Expected net at a    +16.62 bps" in telegram.chart_calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_manual_expansion_remains_text_only_even_when_history_is_available():
+    class FakeTelegram:
+        def __init__(self):
+            self.text_calls: list[str] = []
+            self.chart_calls: list[tuple[bytes, str]] = []
+
+        async def send_text(self, text: str) -> None:
+            self.text_calls.append(text)
+
+        async def send_chart(self, png: bytes, caption: str) -> None:
+            self.chart_calls.append((png, caption))
+
+    class FakeHistory:
+        def query(self, **kwargs: object) -> ManualOpportunityHistoryContext:
+            del kwargs
+            return ManualOpportunityHistoryContext.empty()
+
+    data = payload("manual_expansion")
+    data["expansion_level_bps"] = 20.0
+    alert = AlertRequest(
+        monitor="manual_opportunity",
+        event_id="manual:expansion",
+        created_at=datetime(2026, 9, 28, 10, 31, tzinfo=UTC),
+        payload=data,
+    )
+    telegram = FakeTelegram()
+    processor = ManualOpportunityAlertProcessor(
+        telegram,
+        history=FakeHistory(),  # type: ignore[arg-type]
+        chart_renderer=lambda details, context: b"png",
+    )
+
+    await processor.process(alert)
+
+    assert len(telegram.text_calls) == 1
+    assert telegram.chart_calls == []
+
+
+@pytest.mark.asyncio
+async def test_manual_initial_falls_back_to_text_when_history_is_insufficient():
+    class FakeTelegram:
+        def __init__(self):
+            self.text_calls: list[str] = []
+            self.chart_calls: list[tuple[bytes, str]] = []
+
+        async def send_text(self, text: str) -> None:
+            self.text_calls.append(text)
+
+        async def send_chart(self, png: bytes, caption: str) -> None:
+            self.chart_calls.append((png, caption))
+
+    class FakeHistory:
+        def query(self, **kwargs: object) -> ManualOpportunityHistoryContext:
+            del kwargs
+            return ManualOpportunityHistoryContext.empty()
+
+    telegram = FakeTelegram()
+    alert = AlertRequest(
+        monitor="manual_opportunity",
+        event_id="manual:initial",
+        created_at=datetime(2026, 9, 28, 10, 31, tzinfo=UTC),
+        payload=payload(),
+    )
+    processor = ManualOpportunityAlertProcessor(
+        telegram,
+        history=FakeHistory(),  # type: ignore[arg-type]
+        chart_renderer=lambda details, context: None,
+    )
+
+    await processor.process(alert)
+
+    assert len(telegram.text_calls) == 1
     assert telegram.chart_calls == []
