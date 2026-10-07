@@ -328,6 +328,7 @@ def test_manual_config_is_disabled_and_does_not_change_anomaly_defaults():
     config = RadarConfig()
     assert config.manual_opportunity.enabled is False
     assert config.manual_opportunity.confirmation_seconds == 60
+    assert config.manual_opportunity.telegram_rearm_quiet_seconds == 300
 
 
 def test_future_bbo_cannot_start_a_candidate_before_both_legs_are_available():

@@ -8,6 +8,7 @@ import pytest
 import radar.history.manual_opportunity as history_module
 import radar.monitors.manual_opportunity as monitor_module
 from radar.collectors.base import CollectorBatch
+from radar.alerts.manual_opportunity import ManualOpportunityAlertProcessor
 from radar.config import ManualOpportunityConfig
 from radar.history.manual_opportunity import BboRollingHistory
 from radar.models import HourlyContext, MarketSnapshot
@@ -202,6 +203,130 @@ async def test_monitor_uses_prior_mean_and_exact_hourly_volume(small_history):
 
 
 @pytest.mark.asyncio
+async def test_detector_event_is_persisted_when_repeated_initial_is_telegram_suppressed(
+    small_history, tmp_path, caplog
+):
+    del small_history
+    caplog.set_level(logging.INFO, logger=monitor_module.__name__)
+
+    class FakeTelegram:
+        async def send_text(self, _text: str) -> None:
+            return None
+
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        instance = monitor(store=store, confirmation_seconds=0)
+        prime(instance)
+        processor = ManualOpportunityAlertProcessor(
+            FakeTelegram(), notification_gate=instance.notification_gate
+        )  # type: ignore[arg-type]
+
+        first = await instance.evaluate(START, state_for(START))
+        assert [alert.payload["event_kind"] for alert in first] == ["manual_initial"]
+        await processor.process(first[0])
+
+        await instance.evaluate(
+            START + timedelta(seconds=10),
+            state_for(START + timedelta(seconds=10), short_bid=99.0),
+        )
+        repeated = await instance.evaluate(
+            START + timedelta(seconds=90),
+            state_for(START + timedelta(seconds=90)),
+        )
+
+        assert repeated == []
+        events = store.list_opportunities(monitor_name="manual_opportunity")
+        assert [event["event_type"] for event in events] == [
+            "manual_initial",
+            "manual_initial",
+        ]
+        assert any(
+            "manual_telegram_initial_suppressed" in record.getMessage()
+            for record in caplog.records
+        )
+
+
+@pytest.mark.asyncio
+async def test_expansion_is_sent_only_for_a_telegram_notified_episode(
+    small_history, tmp_path
+):
+    del small_history
+
+    class FakeTelegram:
+        async def send_text(self, _text: str) -> None:
+            return None
+
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        instance = monitor(store=store, confirmation_seconds=0)
+        prime(instance)
+        processor = ManualOpportunityAlertProcessor(
+            FakeTelegram(), notification_gate=instance.notification_gate
+        )  # type: ignore[arg-type]
+
+        first = await instance.evaluate(START, state_for(START))
+        await processor.process(first[0])
+        expansion = await instance.evaluate(
+            START + timedelta(seconds=10),
+            state_for(START + timedelta(seconds=10), short_bid=101.9),
+        )
+
+        assert [alert.payload["event_kind"] for alert in expansion] == [
+            "manual_expansion"
+        ]
+        await processor.process(expansion[0])
+        events = store.list_opportunities(monitor_name="manual_opportunity")
+        assert [event["event_type"] for event in events] == [
+            "manual_initial",
+            "manual_expansion",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_suppressed_episode_expansion_remains_persisted_but_not_telegram_sent(
+    small_history, tmp_path
+):
+    del small_history
+
+    class FakeTelegram:
+        async def send_text(self, _text: str) -> None:
+            return None
+
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        instance = monitor(store=store, confirmation_seconds=0)
+        prime(instance)
+        processor = ManualOpportunityAlertProcessor(
+            FakeTelegram(), notification_gate=instance.notification_gate
+        )  # type: ignore[arg-type]
+
+        first = await instance.evaluate(START, state_for(START))
+        await processor.process(first[0])
+        await instance.evaluate(
+            START + timedelta(seconds=10),
+            state_for(START + timedelta(seconds=10), short_bid=99.0),
+        )
+        suppressed_initial = await instance.evaluate(
+            START + timedelta(seconds=20),
+            state_for(START + timedelta(seconds=20)),
+        )
+        assert suppressed_initial == []
+
+        suppressed_expansion = await instance.evaluate(
+            START + timedelta(seconds=30),
+            state_for(START + timedelta(seconds=30), short_bid=101.9),
+        )
+        assert suppressed_expansion == []
+
+        events = store.list_opportunities(monitor_name="manual_opportunity")
+        assert [event["event_type"] for event in events] == [
+            "manual_initial",
+            "manual_initial",
+            "manual_expansion",
+        ]
+
+
+@pytest.mark.asyncio
 async def test_monitor_logs_manual_lifecycle_transitions(small_history, caplog):
     del small_history
     caplog.set_level(logging.INFO, logger=monitor_module.__name__)
@@ -351,7 +476,51 @@ async def test_monitor_persistence_failure_rolls_back_history_and_retries(
         retried = await instance.evaluate(
             START + timedelta(seconds=60), state_for(START + timedelta(seconds=60))
         )
-        assert [alert.payload["event_kind"] for alert in retried] == ["manual_initial"]
+    assert [alert.payload["event_kind"] for alert in retried] == ["manual_initial"]
+
+
+@pytest.mark.asyncio
+async def test_stale_bbo_does_not_advance_notification_quiet_timer(
+    small_history, tmp_path
+):
+    del small_history
+
+    class FakeTelegram:
+        async def send_text(self, _text: str) -> None:
+            return None
+
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        instance = monitor(store=store, confirmation_seconds=0)
+        prime(instance)
+        processor = ManualOpportunityAlertProcessor(
+            FakeTelegram(), notification_gate=instance.notification_gate
+        )  # type: ignore[arg-type]
+
+        initial = await instance.evaluate(START, state_for(START))
+        await processor.process(initial[0])
+        await instance.evaluate(
+            START + timedelta(seconds=10),
+            state_for(START + timedelta(seconds=10), short_bid=99.0),
+        )
+
+        stale_time = START + timedelta(seconds=310)
+        assert await instance.evaluate(
+            stale_time,
+            state_for(
+                stale_time,
+                short_bid=99.0,
+                long_observed_at=START + timedelta(seconds=10),
+                short_observed_at=START + timedelta(seconds=10),
+            ),
+        ) == []
+
+        retry_time = START + timedelta(seconds=320)
+        assert await instance.evaluate(
+            retry_time,
+            state_for(retry_time, short_bid=99.0),
+        ) == []
+        assert not instance.notification_gate.is_armed(KEY)
 
 
 @pytest.mark.asyncio

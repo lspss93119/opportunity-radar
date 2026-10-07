@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 import math
 
 from radar.monitors.base import AlertRequest
+from radar.monitors.manual_opportunity import ManualOpportunityNotificationGate
+from radar.monitors.spread.models import SpreadPairKey
 from radar.alerts.telegram import TelegramTransport
 
 
@@ -40,12 +42,47 @@ class ManualOpportunityAlertDetails:
 class ManualOpportunityAlertProcessor:
     """Deliver Manual Opportunity alerts as text-only Telegram messages."""
 
-    def __init__(self, telegram: TelegramTransport) -> None:
+    def __init__(
+        self,
+        telegram: TelegramTransport,
+        *,
+        notification_gate: ManualOpportunityNotificationGate | None = None,
+    ) -> None:
         self._telegram = telegram
+        self._notification_gate = notification_gate
 
     async def process(self, alert: AlertRequest) -> None:
         details = parse_manual_opportunity_alert(alert)
-        await self._telegram.send_text(format_manual_opportunity_alert(details))
+        try:
+            await self._telegram.send_text(format_manual_opportunity_alert(details))
+        except Exception:
+            if (
+                self._notification_gate is not None
+                and details.event_kind == "manual_initial"
+            ):
+                self._notification_gate.mark_failed(
+                    _route_key(details), details.episode_id
+                )
+            raise
+        if (
+            self._notification_gate is not None
+            and details.event_kind == "manual_initial"
+        ):
+            self._notification_gate.mark_sent(
+                _route_key(details),
+                details.episode_id,
+                sent_at=datetime.now(UTC),
+            )
+
+
+def _route_key(details: ManualOpportunityAlertDetails) -> SpreadPairKey:
+    return SpreadPairKey(
+        canonical_symbol=details.canonical_symbol,
+        long_venue=details.long_venue,
+        long_venue_symbol=details.long_venue_symbol,
+        short_venue=details.short_venue,
+        short_venue_symbol=details.short_venue_symbol,
+    )
 
 
 def parse_manual_opportunity_alert(

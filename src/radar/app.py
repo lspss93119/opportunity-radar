@@ -23,6 +23,7 @@ from radar.history.spread import SpreadHistory
 from radar.history.manual_opportunity import load_recent_bbo_history
 from radar.models import FundingSnapshot, MarketSnapshot
 from radar.monitors.base import AlertRequest, JSONValue
+from radar.monitors.manual_opportunity import ManualOpportunityMonitor
 from radar.monitors.registry import build_enabled_monitors
 from radar.monitors.runner import MonitorRunner
 from radar.pipeline import MarketDataPipeline, aligned_sample_time, utc_now
@@ -682,7 +683,19 @@ def build_application(
     )
     processor = AlertRouter(
         spread_processor,
-        ManualOpportunityAlertProcessor(telegram),
+        ManualOpportunityAlertProcessor(
+            telegram,
+            notification_gate=(
+                next(
+                    (
+                        monitor.notification_gate
+                        for monitor in monitors
+                        if isinstance(monitor, ManualOpportunityMonitor)
+                    ),
+                    None,
+                )
+            ),
+        ),
     )
     alert_worker = AlertWorker(
         queue,

@@ -129,16 +129,6 @@ async def test_manual_monitor_runner_and_text_processor_have_no_slow_or_trading_
     assert manual._histories[KEY]._last_sample_time == START + timedelta(seconds=60)
     assert queue.empty()
 
-    for offset in (70,):
-        when = START + timedelta(seconds=offset)
-        runner.state = _state(when, short_bid=102.0)
-        await runner.run_cycle(
-            when + timedelta(milliseconds=1),
-            schedule_time=when,
-        )
-    expansion = await queue.get()
-    assert expansion.payload["event_kind"] == "manual_expansion"
-
     class FakeTelegram:
         def __init__(self):
             self.text_calls: list[str] = []
@@ -152,12 +142,24 @@ async def test_manual_monitor_runner_and_text_processor_have_no_slow_or_trading_
             self.chart_calls.append((png, caption))
 
     telegram = FakeTelegram()
-    processor = ManualOpportunityAlertProcessor(telegram)  # type: ignore[arg-type]
+    processor = ManualOpportunityAlertProcessor(
+        telegram, notification_gate=manual.notification_gate
+    )  # type: ignore[arg-type]
     router = AlertRouter(
         spread_processor=processor,
         manual_processor=processor,
     )
     await router.process(initial)
+
+    for offset in (70,):
+        when = START + timedelta(seconds=offset)
+        runner.state = _state(when, short_bid=102.0)
+        await runner.run_cycle(
+            when + timedelta(milliseconds=1),
+            schedule_time=when,
+        )
+    expansion = await queue.get()
+    assert expansion.payload["event_kind"] == "manual_expansion"
     await router.process(expansion)
 
     assert len(telegram.text_calls) == 2

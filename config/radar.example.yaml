@@ -26,6 +26,7 @@ manual_opportunity:
   volume_24h_min_usd: 1000000
   expansion_notify_step_bps: 5.0
   max_gap_seconds: 20
+  telegram_rearm_quiet_seconds: 300
 
 markets:
   - venue: lighter

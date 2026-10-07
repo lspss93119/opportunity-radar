@@ -296,6 +296,278 @@ class ManualOpportunityEpisode:
     highest_notified_level_bps: float | None = None
 
 
+@dataclass
+class _ManualNotificationRouteState:
+    key: SpreadPairKey
+    armed: bool = True
+    last_sent_episode_id: str | None = None
+    quiet_started_at: datetime | None = None
+    last_observation_at: datetime | None = None
+    pending_episode_id: str | None = None
+
+
+class ManualOpportunityNotificationGate:
+    """Restart-safe Telegram gate for one exact directional route."""
+
+    name = "manual_opportunity"
+    state_key = "telegram_notification_gate"
+
+    def __init__(
+        self,
+        config: ManualOpportunityConfig,
+        *,
+        runtime_store: SQLiteRuntimeStore | None = None,
+    ) -> None:
+        self._config = config
+        self._runtime_store = runtime_store
+        self._states = self._load_states(
+            None
+            if runtime_store is None
+            else runtime_store.get_monitor_state(self.name, self.state_key)
+        )
+        self._cycle_originals: dict[
+            SpreadPairKey, _ManualNotificationRouteState | None
+        ] | None = None
+
+    def is_armed(self, key: SpreadPairKey) -> bool:
+        state = self._states.get(key)
+        return state is None or state.armed
+
+    def notified_episode_id(self, key: SpreadPairKey) -> str | None:
+        state = self._states.get(key)
+        return None if state is None else state.last_sent_episode_id
+
+    def reserve_initial(self, key: SpreadPairKey, episode_id: str) -> bool:
+        state = self._states.setdefault(
+            key, _ManualNotificationRouteState(key=key)
+        )
+        if not state.armed or state.pending_episode_id is not None:
+            return False
+        state.pending_episode_id = episode_id
+        return True
+
+    def mark_sent(
+        self,
+        key: SpreadPairKey,
+        episode_id: str,
+        *,
+        sent_at: datetime | None = None,
+    ) -> None:
+        timestamp = datetime.now(UTC) if sent_at is None else _as_utc(sent_at, "sent_at")
+        state = self._states.get(key)
+        if state is None:
+            state = _ManualNotificationRouteState(key=key)
+            self._states[key] = state
+        if (
+            state.pending_episode_id is not None
+            and state.pending_episode_id != episode_id
+        ):
+            raise ValueError("notification reservation does not match episode")
+        state.armed = False
+        state.last_sent_episode_id = episode_id
+        state.pending_episode_id = None
+        state.quiet_started_at = None
+        LOGGER.info(
+            "manual_telegram_disarmed symbol=%s long_venue=%s short_venue=%s "
+            "episode_id=%s",
+            key.canonical_symbol,
+            key.long_venue,
+            key.short_venue,
+            episode_id,
+        )
+        self._persist(timestamp)
+
+    def mark_failed(self, key: SpreadPairKey, episode_id: str) -> None:
+        state = self._states.get(key)
+        if state is not None and state.pending_episode_id == episode_id:
+            state.pending_episode_id = None
+
+    def allow_expansion(self, key: SpreadPairKey, episode_id: str) -> bool:
+        state = self._states.get(key)
+        return state is not None and state.last_sent_episode_id == episode_id
+
+    def observe(
+        self,
+        key: SpreadPairKey,
+        *,
+        qualifies: bool,
+        observed_at: datetime,
+    ) -> None:
+        timestamp = _as_utc(observed_at, "observed_at")
+        state = self._states.get(key)
+        if state is None:
+            return
+        if state.last_observation_at is not None and timestamp < state.last_observation_at:
+            return
+        if state.armed:
+            state.last_observation_at = timestamp
+            return
+        previous = state.last_observation_at
+        state.last_observation_at = timestamp
+        if previous is None or (
+            timestamp - previous
+        ).total_seconds() > self._config.max_gap_seconds:
+            state.quiet_started_at = timestamp
+            LOGGER.info(
+                "manual_telegram_quiet_start symbol=%s long_venue=%s "
+                "short_venue=%s",
+                key.canonical_symbol,
+                key.long_venue,
+                key.short_venue,
+            )
+            return
+        if qualifies:
+            if state.quiet_started_at is not None:
+                LOGGER.info(
+                    "manual_telegram_quiet_reset symbol=%s long_venue=%s "
+                    "short_venue=%s",
+                    key.canonical_symbol,
+                    key.long_venue,
+                    key.short_venue,
+                )
+            state.quiet_started_at = None
+            return
+        if state.quiet_started_at is None:
+            state.quiet_started_at = timestamp
+            LOGGER.info(
+                "manual_telegram_quiet_start symbol=%s long_venue=%s "
+                "short_venue=%s",
+                key.canonical_symbol,
+                key.long_venue,
+                key.short_venue,
+            )
+            return
+        quiet_seconds = (timestamp - state.quiet_started_at).total_seconds()
+        if quiet_seconds >= self._config.telegram_rearm_quiet_seconds:
+            state.armed = True
+            state.quiet_started_at = None
+            LOGGER.info(
+                "manual_telegram_rearmed symbol=%s long_venue=%s short_venue=%s",
+                key.canonical_symbol,
+                key.long_venue,
+                key.short_venue,
+            )
+
+    def begin_cycle(self) -> None:
+        if self._cycle_originals is not None:
+            raise RuntimeError("manual notification gate cycle is already active")
+        self._cycle_originals = {
+            key: replace(state) for key, state in self._states.items()
+        }
+
+    def rollback_cycle(self) -> None:
+        if self._cycle_originals is None:
+            return
+        self._states = {
+            key: replace(state)
+            for key, state in self._cycle_originals.items()
+            if state is not None
+        }
+        self._cycle_originals = None
+
+    def commit_cycle(self, updated_at: datetime, *, persist: bool = True) -> None:
+        if self._cycle_originals is None:
+            raise RuntimeError("manual notification gate cycle is not active")
+        if persist:
+            self._persist(_as_utc(updated_at, "updated_at"))
+        self._cycle_originals = None
+
+    def serialized_state(self) -> dict[str, JSONValue]:
+        routes: list[JSONValue] = []
+        for state in sorted(self._states.values(), key=lambda item: self._sort_key(item.key)):
+            routes.append(
+                {
+                    "key": self._serialize_key(state.key),
+                    "armed": state.armed,
+                    "last_sent_episode_id": state.last_sent_episode_id,
+                    "quiet_started_at": (
+                        None
+                        if state.quiet_started_at is None
+                        else state.quiet_started_at.isoformat()
+                    ),
+                    "last_observation_at": (
+                        None
+                        if state.last_observation_at is None
+                        else state.last_observation_at.isoformat()
+                    ),
+                }
+            )
+        return {"routes": routes}
+
+    def _persist(self, updated_at: datetime) -> None:
+        if self._runtime_store is not None:
+            self._runtime_store.set_monitor_state(
+                self.name,
+                self.state_key,
+                self.serialized_state(),
+                updated_at=updated_at,
+            )
+
+    @classmethod
+    def _load_states(
+        cls, state: object | None
+    ) -> dict[SpreadPairKey, _ManualNotificationRouteState]:
+        if state is None:
+            return {}
+        if not isinstance(state, dict) or not isinstance(state.get("routes"), list):
+            raise ValueError("invalid manual notification gate state")
+        result: dict[SpreadPairKey, _ManualNotificationRouteState] = {}
+        for raw in state["routes"]:
+            if not isinstance(raw, dict):
+                raise ValueError("invalid manual notification route state")
+            key = cls._deserialize_key(raw.get("key"))
+            armed = raw.get("armed")
+            if not isinstance(armed, bool):
+                raise ValueError("invalid manual notification armed state")
+            last_sent = raw.get("last_sent_episode_id")
+            if last_sent is not None and not isinstance(last_sent, str):
+                raise ValueError("invalid manual notification episode state")
+            result[key] = _ManualNotificationRouteState(
+                key=key,
+                armed=armed,
+                last_sent_episode_id=last_sent,
+                quiet_started_at=_optional_time(
+                    raw.get("quiet_started_at"), "quiet_started_at"
+                ),
+                last_observation_at=_optional_time(
+                    raw.get("last_observation_at"), "last_observation_at"
+                ),
+            )
+        return result
+
+    @staticmethod
+    def _serialize_key(key: SpreadPairKey) -> dict[str, JSONValue]:
+        return {
+            "canonical_symbol": key.canonical_symbol,
+            "long_venue": key.long_venue,
+            "long_venue_symbol": key.long_venue_symbol,
+            "short_venue": key.short_venue,
+            "short_venue_symbol": key.short_venue_symbol,
+        }
+
+    @staticmethod
+    def _deserialize_key(raw: object) -> SpreadPairKey:
+        if not isinstance(raw, dict):
+            raise ValueError("invalid manual notification route key")
+        return SpreadPairKey(
+            canonical_symbol=_required_text(raw.get("canonical_symbol"), "canonical_symbol"),
+            long_venue=_required_text(raw.get("long_venue"), "long_venue"),
+            long_venue_symbol=_required_text(raw.get("long_venue_symbol"), "long_venue_symbol"),
+            short_venue=_required_text(raw.get("short_venue"), "short_venue"),
+            short_venue_symbol=_required_text(raw.get("short_venue_symbol"), "short_venue_symbol"),
+        )
+
+    @staticmethod
+    def _sort_key(key: SpreadPairKey) -> tuple[str, str, str, str, str]:
+        return (
+            key.canonical_symbol,
+            key.long_venue,
+            key.long_venue_symbol,
+            key.short_venue,
+            key.short_venue_symbol,
+        )
+
+
 class ManualOpportunityLifecycle:
     """Standalone BBO-only lifecycle for manual Telegram opportunities."""
 
@@ -358,11 +630,16 @@ class ManualOpportunityLifecycle:
         self._cycle_originals = None
         self._cycle_events = None
 
-    def flush_cycle(self, updated_at: datetime) -> None:
+    def flush_cycle(
+        self,
+        updated_at: datetime,
+        *,
+        additional_states: Sequence[tuple[str, str, object, datetime | None]] = (),
+    ) -> None:
         if self._cycle_originals is None or self._cycle_events is None:
             raise RuntimeError("manual opportunity cycle is not active")
         try:
-            self._persist(updated_at, self._cycle_events)
+            self._persist(updated_at, self._cycle_events, additional_states)
         except Exception:
             self.rollback_cycle()
             raise
@@ -723,6 +1000,7 @@ class ManualOpportunityLifecycle:
         self,
         updated_at: datetime,
         events: list[tuple[str, str, object, datetime | None]],
+        additional_states: Sequence[tuple[str, str, object, datetime | None]] = (),
     ) -> None:
         if self._runtime_store is None:
             return
@@ -732,6 +1010,7 @@ class ManualOpportunityLifecycle:
             self._serialize_state(),
             updated_at=updated_at,
             opportunities=events,
+            additional_states=additional_states,
         )
 
     def _serialize_state(self) -> dict[str, JSONValue]:
@@ -912,6 +1191,10 @@ class ManualOpportunityMonitor:
         self._runtime_store = runtime_store
         self._stale_after_seconds = stale_after_seconds
         self._histories: dict[SpreadPairKey, Any] = {}
+        self._notification_gate = ManualOpportunityNotificationGate(
+            config,
+            runtime_store=runtime_store,
+        )
         self._lifecycle = ManualOpportunityLifecycle(
             config,
             fees_bps,
@@ -922,6 +1205,10 @@ class ManualOpportunityMonitor:
     @property
     def active_episodes(self) -> tuple[ManualOpportunityEpisode, ...]:
         return self._lifecycle.active_episodes
+
+    @property
+    def notification_gate(self) -> ManualOpportunityNotificationGate:
+        return self._notification_gate
 
     def hydrate_history(
         self,
@@ -959,6 +1246,7 @@ class ManualOpportunityMonitor:
         markets_by_symbol: dict[
             str, dict[tuple[str, str], MarketSnapshot]
         ] = {}
+        self._notification_gate.begin_cycle()
         self._lifecycle.begin_cycle()
         try:
             preparation_started = time.perf_counter()
@@ -1042,12 +1330,22 @@ class ManualOpportunityMonitor:
 
             lifecycle_started = time.perf_counter()
             for observation in lifecycle_observations:
+                qualifies = (
+                    manual_opportunity_rejection_reason(observation, self.config)
+                    is None
+                )
+                self._notification_gate.observe(
+                    observation.key,
+                    qualifies=qualifies,
+                    observed_at=observation.available_at,
+                )
+                lifecycle_alerts = self._lifecycle.evaluate(
+                    observation,
+                    now=current_time,
+                    persist=False,
+                )
                 alerts.extend(
-                    self._lifecycle.evaluate(
-                        observation,
-                        now=current_time,
-                        persist=False,
-                    )
+                    self._filter_notification_alerts(observation.key, lifecycle_alerts)
                 )
 
             active_episodes = {
@@ -1076,11 +1374,23 @@ class ManualOpportunityMonitor:
 
             persistence_started = time.perf_counter()
             try:
-                self._lifecycle.flush_cycle(current_time)
+                self._lifecycle.flush_cycle(
+                    current_time,
+                    additional_states=(
+                        (
+                            self._notification_gate.name,
+                            self._notification_gate.state_key,
+                            self._notification_gate.serialized_state(),
+                            current_time,
+                        ),
+                    ),
+                )
+                self._notification_gate.commit_cycle(current_time, persist=False)
             finally:
                 sqlite_persistence_ms = _elapsed_ms(persistence_started)
             return alerts
         except Exception:
+            self._notification_gate.rollback_cycle()
             self._lifecycle.rollback_cycle()
             for history, mutation in reversed(history_mutations):
                 mutation.rollback()
@@ -1104,6 +1414,48 @@ class ManualOpportunityMonitor:
                 len(self._lifecycle.active_keys),
                 len(alerts),
             )
+
+    def _filter_notification_alerts(
+        self,
+        key: SpreadPairKey,
+        alerts: Sequence[AlertRequest],
+    ) -> list[AlertRequest]:
+        filtered: list[AlertRequest] = []
+        for alert in alerts:
+            event_kind = alert.payload.get("event_kind")
+            episode_id = alert.payload.get("episode_id")
+            if not isinstance(event_kind, str) or not isinstance(episode_id, str):
+                filtered.append(alert)
+                continue
+            if event_kind == "manual_initial":
+                if self._notification_gate.reserve_initial(key, episode_id):
+                    filtered.append(alert)
+                else:
+                    LOGGER.info(
+                        "manual_telegram_initial_suppressed symbol=%s "
+                        "long_venue=%s short_venue=%s episode_id=%s "
+                        "expected_net=%s reason=route_disarmed",
+                        key.canonical_symbol,
+                        key.long_venue,
+                        key.short_venue,
+                        episode_id,
+                        alert.payload.get("expected_net_at_a_bps"),
+                    )
+            elif event_kind == "manual_expansion":
+                if self._notification_gate.allow_expansion(key, episode_id):
+                    filtered.append(alert)
+                else:
+                    LOGGER.info(
+                        "manual_telegram_expansion_suppressed symbol=%s "
+                        "long_venue=%s short_venue=%s episode_id=%s",
+                        key.canonical_symbol,
+                        key.long_venue,
+                        key.short_venue,
+                        episode_id,
+                    )
+            else:
+                filtered.append(alert)
+        return filtered
 
     @staticmethod
     def _usable_snapshot(snapshot: MarketSnapshot) -> bool:

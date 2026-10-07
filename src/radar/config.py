@@ -51,6 +51,7 @@ class ManualOpportunityConfig(BaseModel):
     )
     expansion_notify_step_bps: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     max_gap_seconds: int = Field(default=20, gt=0)
+    telegram_rearm_quiet_seconds: int = Field(default=300, ge=0)
 
 
 class SpreadMonitorConfig(BaseModel):
