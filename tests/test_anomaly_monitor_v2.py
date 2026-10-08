@@ -289,6 +289,53 @@ async def test_v2_unconfirmed_present_pair_basis_ineligible_is_abandoned(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_v2_persistence_failure_rolls_back_basis_and_lifecycle_state(
+    monkeypatch, tmp_path
+):
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(store=store, confirmation_seconds=60)
+        prime(monitor)
+        assert await monitor.evaluate(START, state_at(START)) == []
+        basis = monitor._basis_by_key[next(iter(monitor._basis_by_key))]
+        before_basis = (
+            tuple(basis._times),
+            dict(basis._values),
+            basis._sum,
+            basis._sum_squares,
+            basis._last_sample_time,
+        )
+        assert monitor._anomaly_v2 is not None
+        before_lifecycle = monitor._anomaly_v2.snapshot()
+
+        original = store.set_monitor_state_and_append_opportunities
+        failed = True
+
+        def fail_once(*args: object, **kwargs: object) -> None:
+            nonlocal failed
+            if failed:
+                failed = False
+                raise RuntimeError("injected persistence failure")
+            original(*args, **kwargs)
+
+        monkeypatch.setattr(store, "set_monitor_state_and_append_opportunities", fail_once)
+        with pytest.raises(RuntimeError, match="injected persistence failure"):
+            await monitor.evaluate(START + timedelta(seconds=10), state_at(START + timedelta(seconds=10)))
+
+        basis = monitor._basis_by_key[next(iter(monitor._basis_by_key))]
+        assert (
+            tuple(basis._times),
+            dict(basis._values),
+            basis._sum,
+            basis._sum_squares,
+            basis._last_sample_time,
+        ) == before_basis
+        assert monitor._anomaly_v2.snapshot() == before_lifecycle
+
+        await monitor.evaluate(START + timedelta(seconds=10), state_at(START + timedelta(seconds=10)))
+
+
+@pytest.mark.asyncio
 async def test_v2_data_gap_and_new_candidate_same_observation_stay_synchronized(tmp_path):
     database = tmp_path / "runtime.sqlite3"
     with SQLiteRuntimeStore(database) as store:

@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import logging
 
 import pytest
 
@@ -8,6 +9,8 @@ from radar.config import SpreadMonitorConfig
 from radar.models import FundingSnapshot, MarketSnapshot
 from radar.monitors.base import Monitor
 from radar.monitors.spread import SpreadMonitor as ExportedSpreadMonitor
+from radar.monitors.spread import monitor as monitor_module
+from radar.monitors.spread.basis import RollingBasis
 from radar.monitors.spread.models import (
     SpreadPairKey,
     build_spread_candidates,
@@ -158,6 +161,128 @@ def fail_next_persistence(
         original(*args, **kwargs)
 
     monkeypatch.setattr(store, "set_monitor_state_and_append_opportunities", persist)
+
+
+@pytest.mark.asyncio
+async def test_runtime_store_evaluation_does_not_deepcopy_basis_histories(
+    monkeypatch, tmp_path
+):
+    database = tmp_path / "runtime.sqlite3"
+    state = make_state(
+        make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
+        make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
+    )
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(runtime_store=store)
+        prime_monitor(monitor, state)
+        original_deepcopy = deepcopy
+
+        def reject_basis_history_copy(value: object) -> object:
+            if isinstance(value, dict) and any(
+                isinstance(item, RollingBasis) for item in value.values()
+            ):
+                pytest.fail("SpreadMonitor must not deepcopy RollingBasis histories")
+            return original_deepcopy(value)
+
+        monkeypatch.setattr(monitor_module, "deepcopy", reject_basis_history_copy)
+
+        assert await monitor.evaluate(NOW, state) == []
+
+
+@pytest.mark.asyncio
+async def test_spread_evaluation_logs_phase_timings(caplog):
+    state = make_state(
+        make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
+        make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
+    )
+    monitor = make_monitor()
+    prime_monitor(monitor, state)
+
+    with caplog.at_level(logging.INFO, logger="radar.monitors.spread.monitor"):
+        await monitor.evaluate(NOW, state)
+
+    message = next(record.message for record in caplog.records if "spread cycle" in record.message)
+    for field in (
+        "candidate_build_ms=",
+        "basis_ms=",
+        "lifecycle_ms=",
+        "sqlite_persistence_ms=",
+        "total_ms=",
+        "routes=",
+        "alerts=",
+    ):
+        assert field in message
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_removes_new_basis_routes_and_restores_existing_history(
+    monkeypatch, tmp_path
+):
+    database = tmp_path / "runtime.sqlite3"
+    initial_state = make_state(
+        make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
+        make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
+    )
+    expanded_state = make_state(
+        *initial_state.markets,
+        make_market(
+            "long-two",
+            canonical_symbol="ETH",
+            venue_symbol="ETH",
+            buy_10k_vwap=100.0,
+            sell_10k_vwap=99.0,
+        ),
+        make_market(
+            "short-two",
+            canonical_symbol="ETH",
+            venue_symbol="ETH",
+            buy_10k_vwap=102.0,
+            sell_10k_vwap=101.0,
+        ),
+    )
+    with SQLiteRuntimeStore(database) as store:
+        monitor = make_monitor(runtime_store=store)
+        prime_monitor(monitor, initial_state)
+        await monitor.evaluate(NOW, initial_state)
+        existing_keys = set(monitor._basis_by_key)
+        existing_state = {
+            key: (
+                tuple(basis._times),
+                dict(basis._values),
+                basis._sum,
+                basis._sum_squares,
+                basis._last_sample_time,
+            )
+            for key, basis in monitor._basis_by_key.items()
+        }
+        fail_next_persistence(monkeypatch, store)
+
+        with pytest.raises(RuntimeError, match="injected persistence failure"):
+            await monitor.evaluate(NOW + timedelta(seconds=10), expanded_state)
+
+        assert set(monitor._basis_by_key) == existing_keys
+        for key, expected in existing_state.items():
+            basis = monitor._basis_by_key[key]
+            assert (
+                tuple(basis._times),
+                dict(basis._values),
+                basis._sum,
+                basis._sum_squares,
+                basis._last_sample_time,
+            ) == expected
+
+        await monitor.evaluate(NOW + timedelta(seconds=10), expanded_state)
+        assert set(monitor._basis_by_key) == {
+            candidate.key
+            for candidate in build_spread_candidates(
+                expanded_state.markets,
+                NOW + timedelta(seconds=10),
+                primary_size_usd=monitor.config.primary_size_usd,
+                stale_after_seconds=monitor.config.stale_after_seconds,
+                fees_bps=monitor._fees_bps,
+                require_fees=False,
+            )
+        }
 
 
 def test_directional_spread_uses_executable_prices_and_both_taker_fees():

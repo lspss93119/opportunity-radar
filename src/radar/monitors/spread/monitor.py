@@ -4,7 +4,9 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 import math
+import time
 
 from radar.config import SpreadMonitorConfig
 from radar.monitors.base import AlertRequest, JSONValue
@@ -17,6 +19,7 @@ from radar.monitors.spread.basis import (
     MIN_HISTORY_OBSERVATIONS,
     ROLLING_WINDOW_SECONDS,
     RollingBasis,
+    RollingBasisMutation,
     RollingBasisStats,
 )
 from radar.monitors.spread.anomaly_v2 import AnomalyV2Lifecycle
@@ -32,6 +35,11 @@ OpportunityEvent = tuple[str, str, object, datetime]
 BASIS_STD_MAX_BPS = 3.0
 BASIS_DEVIATION_MIN_BPS = 15.0
 BASIS_PERSISTENCE_SECONDS = 60
+LOGGER = logging.getLogger(__name__)
+
+
+def _elapsed_ms(started: float) -> float:
+    return (time.perf_counter() - started) * 1000.0
 
 
 def _pair_sort_key(key: SpreadPairKey) -> tuple[str, str, str, str, str]:
@@ -150,6 +158,40 @@ class SpreadMonitor:
             expected_interval_seconds=self._basis_expected_interval_seconds,
         )
 
+    def _rollback_basis_mutations(
+        self,
+        mutations: list[RollingBasisMutation],
+        created_keys: set[SpreadPairKey],
+    ) -> None:
+        for mutation in reversed(mutations):
+            mutation.rollback()
+        for key in created_keys:
+            self._basis_by_key.pop(key, None)
+
+    @staticmethod
+    def _log_cycle_timing(
+        *,
+        candidate_build_ms: float,
+        basis_ms: float,
+        lifecycle_ms: float,
+        sqlite_persistence_ms: float,
+        total_ms: float,
+        route_count: int,
+        alert_count: int,
+    ) -> None:
+        LOGGER.info(
+            "spread cycle candidate_build_ms=%.3f basis_ms=%.3f "
+            "lifecycle_ms=%.3f sqlite_persistence_ms=%.3f total_ms=%.3f "
+            "routes=%d alerts=%d",
+            candidate_build_ms,
+            basis_ms,
+            lifecycle_ms,
+            sqlite_persistence_ms,
+            total_ms,
+            route_count,
+            alert_count,
+        )
+
     async def evaluate(
         self,
         now: datetime,
@@ -158,6 +200,8 @@ class SpreadMonitor:
         current_time = _as_utc(now, "now")
         if self._anomaly_v2 is not None:
             return await self._evaluate_anomaly_v2(current_time, state)
+        cycle_started = time.perf_counter()
+        candidate_build_started = time.perf_counter()
         candidates = build_spread_candidates(
             state.markets,
             current_time,
@@ -166,135 +210,156 @@ class SpreadMonitor:
             fees_bps=self._fees_bps,
             require_fees=False,
         )
+        candidate_build_ms = _elapsed_ms(candidate_build_started)
         previous_episodes = (
             deepcopy(self._episodes) if self._runtime_store is not None else None
-        )
-        previous_basis = (
-            deepcopy(self._basis_by_key) if self._runtime_store is not None else None
         )
 
         events: list[OpportunityEvent] = []
         alerts: list[AlertRequest] = []
         current_candidates = {candidate.key: candidate for candidate in candidates}
         basis_stats: dict[SpreadPairKey, RollingBasisStats] = {}
-        for candidate in candidates:
-            basis = self._basis_by_key.setdefault(candidate.key, self._new_basis())
-            basis_stats[candidate.key] = basis.observe(
-                candidate.sample_time,
-                candidate.raw_spread_bps,
-            )
-
-        for key in tuple(self._episodes):
-            current_candidate = current_candidates.get(key)
-            stats = basis_stats.get(key)
-            if current_candidate is None:
-                if not self._episodes[key].alerted:
-                    self._resolve_episode(
-                        key,
-                        current_time,
-                        reason="missing_observation",
-                        events=events,
-                    )
-                continue
-            if stats is None or not stats.eligible:
-                if not self._episodes[key].alerted:
-                    self._resolve_episode(
-                        key,
-                        current_time,
-                        reason="insufficient_history",
-                        events=events,
-                    )
-                else:
-                    self._update_episode(
-                        self._episodes[key], current_candidate, current_time, stats
-                    )
-                continue
-            if stats.mean_bps is None or stats.std_bps is None:
-                continue
-            deviation = current_candidate.raw_spread_bps - stats.mean_bps
-            if deviation < BASIS_DEVIATION_MIN_BPS:
-                self._resolve_episode(
-                    key,
-                    current_time,
-                    reason="rearmed_below_deviation",
-                    events=events,
-                )
-
-        for key in sorted(basis_stats, key=_pair_sort_key):
-            candidate = current_candidates[key]
-            stats = basis_stats[key]
-            if not stats.eligible or stats.mean_bps is None or stats.std_bps is None:
-                continue
-            deviation = candidate.raw_spread_bps - stats.mean_bps
-            stable_condition = (
-                stats.std_bps <= BASIS_STD_MAX_BPS
-                and deviation >= BASIS_DEVIATION_MIN_BPS
-            )
-            episode = self._episodes.get(key)
-            if episode is None:
-                if not stable_condition:
-                    continue
-                episode = self._start_episode(
-                    candidate,
-                    current_time,
-                    stats=stats,
-                )
-                self._episodes[key] = episode
-            elif not self._is_continuous(episode, current_time):
-                if episode.alerted:
-                    self._update_episode(episode, candidate, current_time, stats)
-                    continue
-                self._resolve_episode(key, current_time, reason="continuity_gap", events=events)
-                if not stable_condition:
-                    continue
-                episode = self._start_episode(
-                    candidate,
-                    current_time,
-                    stats=stats,
-                )
-                self._episodes[key] = episode
-            else:
-                self._update_episode(episode, candidate, current_time, stats)
-
-            if (
-                not episode.candidate_confirmed
-                and current_time - episode.first_seen_at
-                >= timedelta(seconds=self.config.candidate_duration_seconds)
-            ):
-                episode.candidate_confirmed = True
-                episode.candidate_confirmed_at = current_time
-                self._log_event(
-                    episode,
-                    "candidate_confirmed",
-                    current_time,
-                    events=events,
-                )
-
-            if stable_condition:
-                if episode.alert_condition_since is None:
-                    episode.alert_condition_since = current_time
-            elif not episode.alerted:
-                episode.alert_condition_since = None
-
-            if self._is_alert_eligible(episode, current_time):
-                episode.alerted = True
-                alert = self._build_alert_request(episode, current_time, state)
-                self._log_event(
-                    episode,
-                    "alert",
-                    current_time,
-                    event=alert.payload,
-                    events=events,
-                )
-                alerts.append(alert)
-
+        basis_mutations: list[RollingBasisMutation] = []
+        created_basis_keys: set[SpreadPairKey] = set()
+        basis_started = time.perf_counter()
         try:
+            for candidate in candidates:
+                basis = self._basis_by_key.get(candidate.key)
+                if basis is None:
+                    basis = self._new_basis()
+                    self._basis_by_key[candidate.key] = basis
+                    created_basis_keys.add(candidate.key)
+                stats, mutation = basis.observe_with_rollback(
+                    candidate.sample_time,
+                    candidate.raw_spread_bps,
+                )
+                basis_mutations.append(mutation)
+                basis_stats[candidate.key] = stats
+            basis_ms = _elapsed_ms(basis_started)
+
+            lifecycle_started = time.perf_counter()
+            for key in tuple(self._episodes):
+                current_candidate = current_candidates.get(key)
+                episode_stats = basis_stats.get(key)
+                if current_candidate is None:
+                    if not self._episodes[key].alerted:
+                        self._resolve_episode(
+                            key,
+                            current_time,
+                            reason="missing_observation",
+                            events=events,
+                        )
+                    continue
+                if episode_stats is None or not episode_stats.eligible:
+                    if not self._episodes[key].alerted:
+                        self._resolve_episode(
+                            key,
+                            current_time,
+                            reason="insufficient_history",
+                            events=events,
+                        )
+                    else:
+                        self._update_episode(
+                            self._episodes[key], current_candidate, current_time, episode_stats
+                        )
+                    continue
+                if episode_stats.mean_bps is None or episode_stats.std_bps is None:
+                    continue
+                deviation = current_candidate.raw_spread_bps - episode_stats.mean_bps
+                if deviation < BASIS_DEVIATION_MIN_BPS:
+                    self._resolve_episode(
+                        key,
+                        current_time,
+                        reason="rearmed_below_deviation",
+                        events=events,
+                    )
+
+            for key in sorted(basis_stats, key=_pair_sort_key):
+                candidate = current_candidates[key]
+                stats = basis_stats[key]
+                if not stats.eligible or stats.mean_bps is None or stats.std_bps is None:
+                    continue
+                deviation = candidate.raw_spread_bps - stats.mean_bps
+                stable_condition = (
+                    stats.std_bps <= BASIS_STD_MAX_BPS
+                    and deviation >= BASIS_DEVIATION_MIN_BPS
+                )
+                episode = self._episodes.get(key)
+                if episode is None:
+                    if not stable_condition:
+                        continue
+                    episode = self._start_episode(
+                        candidate,
+                        current_time,
+                        stats=stats,
+                    )
+                    self._episodes[key] = episode
+                elif not self._is_continuous(episode, current_time):
+                    if episode.alerted:
+                        self._update_episode(episode, candidate, current_time, stats)
+                        continue
+                    self._resolve_episode(key, current_time, reason="continuity_gap", events=events)
+                    if not stable_condition:
+                        continue
+                    episode = self._start_episode(
+                        candidate,
+                        current_time,
+                        stats=stats,
+                    )
+                    self._episodes[key] = episode
+                else:
+                    self._update_episode(episode, candidate, current_time, stats)
+
+                if (
+                    not episode.candidate_confirmed
+                    and current_time - episode.first_seen_at
+                    >= timedelta(seconds=self.config.candidate_duration_seconds)
+                ):
+                    episode.candidate_confirmed = True
+                    episode.candidate_confirmed_at = current_time
+                    self._log_event(
+                        episode,
+                        "candidate_confirmed",
+                        current_time,
+                        events=events,
+                    )
+
+                if stable_condition:
+                    if episode.alert_condition_since is None:
+                        episode.alert_condition_since = current_time
+                elif not episode.alerted:
+                    episode.alert_condition_since = None
+
+                if self._is_alert_eligible(episode, current_time):
+                    episode.alerted = True
+                    alert = self._build_alert_request(episode, current_time, state)
+                    self._log_event(
+                        episode,
+                        "alert",
+                        current_time,
+                        event=alert.payload,
+                        events=events,
+                    )
+                    alerts.append(alert)
+
+            lifecycle_ms = _elapsed_ms(lifecycle_started)
+            persistence_started = time.perf_counter()
             self._persist_episodes(current_time, events)
+            sqlite_persistence_ms = _elapsed_ms(persistence_started)
+            self._log_cycle_timing(
+                candidate_build_ms=candidate_build_ms,
+                basis_ms=basis_ms,
+                lifecycle_ms=lifecycle_ms,
+                sqlite_persistence_ms=sqlite_persistence_ms,
+                total_ms=_elapsed_ms(cycle_started),
+                route_count=len(candidates),
+                alert_count=len(alerts),
+            )
         except Exception:
-            if previous_episodes is not None:
-                self._episodes = previous_episodes
-            if previous_basis is not None:
-                self._basis_by_key = previous_basis
+            if self._runtime_store is not None:
+                self._rollback_basis_mutations(basis_mutations, created_basis_keys)
+                if previous_episodes is not None:
+                    self._episodes = previous_episodes
             raise
         return alerts
 
@@ -303,6 +368,8 @@ class SpreadMonitor:
         current_time: datetime,
         state: RadarState,
     ) -> list[AlertRequest]:
+        cycle_started = time.perf_counter()
+        candidate_build_started = time.perf_counter()
         candidates = build_spread_candidates(
             state.markets,
             current_time,
@@ -311,34 +378,57 @@ class SpreadMonitor:
             fees_bps=self._fees_bps,
             require_fees=False,
         )
+        candidate_build_ms = _elapsed_ms(candidate_build_started)
         candidate_by_key = {candidate.key: candidate for candidate in candidates}
-        previous_basis = (
-            deepcopy(self._basis_by_key) if self._runtime_store is not None else None
-        )
         previous_v2 = (
             deepcopy(self._anomaly_v2) if self._runtime_store is not None else None
         )
         basis_stats: dict[SpreadPairKey, RollingBasisStats] = {}
-        for candidate in candidates:
-            basis = self._basis_by_key.setdefault(candidate.key, self._new_basis())
-            basis_stats[candidate.key] = basis.observe(
-                candidate.sample_time,
-                candidate.raw_spread_bps,
-            )
-        assert self._anomaly_v2 is not None
-        result = self._anomaly_v2.evaluate(
-            candidates=candidate_by_key,
-            basis_stats=basis_stats,
-            state=state,
-            now=current_time,
-        )
+        basis_mutations: list[RollingBasisMutation] = []
+        created_basis_keys: set[SpreadPairKey] = set()
+        basis_started = time.perf_counter()
         try:
+            for candidate in candidates:
+                basis = self._basis_by_key.get(candidate.key)
+                if basis is None:
+                    basis = self._new_basis()
+                    self._basis_by_key[candidate.key] = basis
+                    created_basis_keys.add(candidate.key)
+                stats, mutation = basis.observe_with_rollback(
+                    candidate.sample_time,
+                    candidate.raw_spread_bps,
+                )
+                basis_mutations.append(mutation)
+                basis_stats[candidate.key] = stats
+            basis_ms = _elapsed_ms(basis_started)
+
+            assert self._anomaly_v2 is not None
+            lifecycle_started = time.perf_counter()
+            result = self._anomaly_v2.evaluate(
+                candidates=candidate_by_key,
+                basis_stats=basis_stats,
+                state=state,
+                now=current_time,
+            )
+            lifecycle_ms = _elapsed_ms(lifecycle_started)
+            persistence_started = time.perf_counter()
             self._persist_anomaly_v2(current_time, result.events)
+            sqlite_persistence_ms = _elapsed_ms(persistence_started)
+            alert_count = len(result.alerts) if self.config.anomaly_v2.telegram_enabled else 0
+            self._log_cycle_timing(
+                candidate_build_ms=candidate_build_ms,
+                basis_ms=basis_ms,
+                lifecycle_ms=lifecycle_ms,
+                sqlite_persistence_ms=sqlite_persistence_ms,
+                total_ms=_elapsed_ms(cycle_started),
+                route_count=len(candidates),
+                alert_count=alert_count,
+            )
         except Exception:
-            if previous_basis is not None:
-                self._basis_by_key = previous_basis
-            if previous_v2 is not None:
-                self._anomaly_v2 = previous_v2
+            if self._runtime_store is not None:
+                self._rollback_basis_mutations(basis_mutations, created_basis_keys)
+                if previous_v2 is not None:
+                    self._anomaly_v2 = previous_v2
             raise
         if not self.config.anomaly_v2.telegram_enabled:
             return []
