@@ -128,7 +128,13 @@ class RecordingPipeline:
     async def stop(self) -> None:
         self.events.append("pipeline.stop")
 
-    def flush_storage(self, *, now: datetime | None = None) -> int:
+    def flush_storage(
+        self,
+        *,
+        now: datetime | None = None,
+        flush_id: str | None = None,
+    ) -> int:
+        del flush_id
         assert now is not None
         self.events.append("flush")
         self.flush_calls.append(now)
@@ -169,7 +175,13 @@ class SmokePipeline:
         self.state.apply(self.batch, replace_context=True)
         return self.batch
 
-    def flush_storage(self, *, now: datetime | None = None) -> int:
+    def flush_storage(
+        self,
+        *,
+        now: datetime | None = None,
+        flush_id: str | None = None,
+    ) -> int:
+        del flush_id
         assert now is not None
         self.flush_calls.append(now)
         return 1
@@ -211,7 +223,13 @@ class SmokePipelineWithEvents:
     async def stop(self) -> None:
         self.events.append("stop")
 
-    def flush_storage(self, *, now: datetime | None = None) -> int:
+    def flush_storage(
+        self,
+        *,
+        now: datetime | None = None,
+        flush_id: str | None = None,
+    ) -> int:
+        del flush_id
         assert now is not None
         self.events.append("flush")
         return 1
@@ -485,6 +503,73 @@ async def test_application_flushes_at_interval_not_after_each_sample():
 
 
 @pytest.mark.asyncio
+async def test_application_flush_logs_correlated_timing_telemetry(caplog):
+    from radar.app import RadarApplication
+
+    caplog.set_level(logging.INFO, logger="radar.app")
+
+    class TelemetryPipeline(RecordingPipeline):
+        def __init__(self, events: list[str]) -> None:
+            super().__init__(events)
+            self.flush_ids: list[str | None] = []
+
+        def flush_storage(
+            self,
+            *,
+            now: datetime | None = None,
+            flush_id: str | None = None,
+        ) -> int:
+            assert now is not None
+            self.flush_calls.append(now)
+            self.flush_ids.append(flush_id)
+            return 1
+
+    events: list[str] = []
+    pipeline = TelemetryPipeline(events)
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    app = RadarApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=FakeRuntimeStore(events),  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    app._last_flush_at = NOW - timedelta(seconds=60)
+
+    assert app.maybe_flush(NOW) is True
+    await app._wait_for_periodic_flush()
+
+    assert len(pipeline.flush_ids) == 1
+    flush_id = pipeline.flush_ids[0]
+    assert isinstance(flush_id, str)
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if "parquet flush complete reason=periodic" in record.getMessage()
+    )
+    assert f"flush_id={flush_id}" in message
+    for field in (
+        "outer_start=",
+        "outer_end=",
+        "outer_wall_ms=",
+        "worker_dispatch_delay_ms=",
+        "worker_wall_ms=",
+        "return_to_loop_delay_ms=",
+        "process_cpu_ms=",
+        "rss_before=",
+        "rss_after=",
+        "rss_delta=",
+        "files=1",
+        "pending=1",
+    ):
+        assert field in message
+
+
+@pytest.mark.asyncio
 async def test_blocked_periodic_flush_does_not_block_samples_or_overlap():
     from radar.app import RadarApplication
 
@@ -492,7 +577,13 @@ async def test_blocked_periodic_flush_does_not_block_samples_or_overlap():
     release_flush = threading.Event()
 
     class BlockedFlushPipeline(RecordingPipeline):
-        def flush_storage(self, *, now: datetime | None = None) -> int:
+        def flush_storage(
+            self,
+            *,
+            now: datetime | None = None,
+            flush_id: str | None = None,
+        ) -> int:
+            del flush_id
             assert now is not None
             self.flush_calls.append(now)
             if len(self.flush_calls) == 1:
@@ -543,7 +634,13 @@ async def test_shutdown_waits_for_periodic_flush_before_final_flush_and_close():
     release_flush = threading.Event()
 
     class BlockingFlushPipeline(RecordingPipeline):
-        def flush_storage(self, *, now: datetime | None = None) -> int:
+        def flush_storage(
+            self,
+            *,
+            now: datetime | None = None,
+            flush_id: str | None = None,
+        ) -> int:
+            del flush_id
             assert now is not None
             call_number = len(self.flush_calls) + 1
             self.flush_calls.append(now)
@@ -620,7 +717,13 @@ async def test_final_flush_preserves_rows_appended_during_periodic_flush(
     class StoragePipeline:
         state = RadarState()
 
-        def flush_storage(self, *, now: datetime | None = None) -> int:
+        def flush_storage(
+            self,
+            *,
+            now: datetime | None = None,
+            flush_id: str | None = None,
+        ) -> int:
+            del flush_id
             assert now is not None
             return storage.flush(now=now)
 

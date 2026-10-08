@@ -8,6 +8,7 @@ import resource
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -85,6 +86,12 @@ class _CycleTiming:
     monitor_ms: float
 
 
+@dataclass
+class _FlushWorkerTiming:
+    entered: float | None = None
+    completed: float | None = None
+
+
 def _elapsed_ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000.0
 
@@ -107,6 +114,17 @@ def _current_rss_bytes() -> int | None:
         return None if not value else int(value) * 1024
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
+
+
+def _process_cpu_ms() -> float:
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return (usage.ru_utime + usage.ru_stime) * 1000.0
+
+
+def _duration_ms(started: float | None, completed: float | None) -> float | None:
+    if started is None or completed is None:
+        return None
+    return (completed - started) * 1000.0
 
 
 class RadarApplication:
@@ -241,22 +259,82 @@ class RadarApplication:
         return await self._flush_now(current_time, reason="final")
 
     async def _flush_now(self, current_time: datetime, *, reason: str) -> int:
-        started = time.perf_counter()
-        LOGGER.info("parquet flush start reason=%s at=%s", reason, current_time)
-        files_written = await asyncio.to_thread(
-            self.pipeline.flush_storage,
-            now=current_time,
-        )
-        self._last_flush_at = current_time
-        self.stats.parquet_flushes += 1
+        flush_id = uuid.uuid4().hex
+        outer_started = time.perf_counter()
+        outer_start_at = datetime.now(UTC)
+        cpu_before = _process_cpu_ms()
+        rss_before = _current_rss_bytes()
         LOGGER.info(
-            "parquet flush complete reason=%s duration_ms=%.3f files=%d pending=%d",
+            "parquet flush start reason=%s flush_id=%s at=%s",
             reason,
-            _elapsed_ms(started),
-            files_written,
-            self.storage.pending_count,
+            flush_id,
+            current_time,
         )
-        return files_written
+        dispatch_started = time.perf_counter()
+        worker_timing = _FlushWorkerTiming()
+        files_written = -1
+        succeeded = False
+
+        def run_worker() -> int:
+            worker_timing.entered = time.perf_counter()
+            try:
+                return self.pipeline.flush_storage(
+                    now=current_time,
+                    flush_id=flush_id,
+                )
+            finally:
+                worker_timing.completed = time.perf_counter()
+
+        try:
+            files_written = await asyncio.to_thread(run_worker)
+            self._last_flush_at = current_time
+            self.stats.parquet_flushes += 1
+            succeeded = True
+            return files_written
+        finally:
+            outer_completed = time.perf_counter()
+            outer_end_at = datetime.now(UTC)
+            cpu_after = _process_cpu_ms()
+            rss_after = _current_rss_bytes()
+            dispatch_delay_ms = _duration_ms(
+                dispatch_started,
+                worker_timing.entered,
+            )
+            worker_wall_ms = _duration_ms(
+                worker_timing.entered,
+                worker_timing.completed,
+            )
+            return_delay_ms = _duration_ms(
+                worker_timing.completed,
+                outer_completed,
+            )
+            rss_delta = (
+                None
+                if rss_before is None or rss_after is None
+                else rss_after - rss_before
+            )
+            LOGGER.info(
+                "parquet flush complete reason=%s flush_id=%s status=%s "
+                "outer_start=%s outer_end=%s outer_wall_ms=%.3f "
+                "worker_dispatch_delay_ms=%s worker_wall_ms=%s "
+                "return_to_loop_delay_ms=%s process_cpu_ms=%.3f "
+                "rss_before=%s rss_after=%s rss_delta=%s files=%d pending=%d",
+                reason,
+                flush_id,
+                "success" if succeeded else "failed",
+                outer_start_at,
+                outer_end_at,
+                (outer_completed - outer_started) * 1000.0,
+                dispatch_delay_ms,
+                worker_wall_ms,
+                return_delay_ms,
+                cpu_after - cpu_before,
+                rss_before,
+                rss_after,
+                rss_delta,
+                files_written,
+                self.storage.pending_count,
+            )
 
     async def _wait_until_next_boundary(
         self,

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import threading
+import time
 import uuid
 from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -19,6 +23,7 @@ from radar.models import (
 )
 
 UTC = timezone.utc
+LOGGER = logging.getLogger(__name__)
 DATASET_NAMES = ("market", "funding", "hourly_context", "quoted_market")
 NormalizedRecord = (
     MarketSnapshot
@@ -111,6 +116,18 @@ def _as_utc(value: datetime, field_name: str) -> datetime:
     return value.astimezone(UTC)
 
 
+@dataclass
+class _DatasetFlushTelemetry:
+    rows: int = 0
+    rows_by_partition: dict[str, int] = field(default_factory=dict)
+    mkdir_ms: float = 0.0
+    table_from_pylist_ms: float = 0.0
+    parquet_write_ms: float = 0.0
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 class ParquetStorage:
     """Buffered date-partitioned Parquet storage for normalized snapshots."""
 
@@ -182,40 +199,122 @@ class ParquetStorage:
         key = (dataset, partition_date)
         self._pending.setdefault(key, []).append(record.model_dump(mode="python"))
 
-    def flush(self, *, now: datetime | None = None) -> int:
+    def flush(
+        self,
+        *,
+        now: datetime | None = None,
+        flush_id: str | None = None,
+    ) -> int:
         """Write pending rows with atomic file replacement, then prune."""
+        resolved_flush_id = uuid.uuid4().hex if flush_id is None else flush_id
+        worker_started = time.perf_counter()
         current_time = _as_utc(
             datetime.now(UTC) if now is None else now,
             "now",
         )
+        lock_started = time.perf_counter()
         with self._pending_lock:
+            lock_acquired = time.perf_counter()
             if not self._pending:
                 pending = None
             else:
                 pending = self._pending
                 self._pending = {}
+            swap_finished = time.perf_counter()
+        lock_wait_ms = (lock_acquired - lock_started) * 1000.0
+        swap_hold_ms = (swap_finished - lock_acquired) * 1000.0
+
         if pending is None:
-            self.prune(now=current_time)
+            prune_started = time.perf_counter()
+            try:
+                self.prune(now=current_time)
+            except Exception as error:
+                self._log_phase_failure(
+                    flush_id=resolved_flush_id,
+                    phase="prune",
+                    dataset=None,
+                    rows=0,
+                    worker_started=worker_started,
+                    error=error,
+                )
+                raise
+            prune_ms = (time.perf_counter() - prune_started) * 1000.0
+            self._log_telemetry(
+                flush_id=resolved_flush_id,
+                worker_started=worker_started,
+                lock_wait_ms=lock_wait_ms,
+                swap_hold_ms=swap_hold_ms,
+                rows_total=0,
+                dataset_telemetry={},
+                files_written=0,
+                replace_ms=0.0,
+                prune_ms=prune_ms,
+                pending_empty=True,
+            )
             return 0
 
-        staged: list[tuple[Path, Path]] = []
+        dataset_telemetry: dict[str, _DatasetFlushTelemetry] = {}
+        rows_total = 0
+        for (dataset, partition_date), rows in pending.items():
+            metrics = dataset_telemetry.setdefault(
+                dataset,
+                _DatasetFlushTelemetry(),
+            )
+            row_count = len(rows)
+            rows_total += row_count
+            metrics.rows += row_count
+            metrics.rows_by_partition[partition_date.isoformat()] = row_count
+
+        staged: list[tuple[str, date, int, Path, Path]] = []
         replaced: list[Path] = []
+        phase = "pending_swap"
+        phase_dataset: str | None = None
+        phase_rows = rows_total
         try:
             for (dataset, partition_date), rows in pending.items():
+                phase_dataset = dataset
+                phase_rows = len(rows)
+                metrics = dataset_telemetry[dataset]
+                mkdir_started = time.perf_counter()
+                phase = "mkdir"
                 partition = self.root / dataset / f"date={partition_date.isoformat()}"
                 partition.mkdir(parents=True, exist_ok=True)
+                metrics.mkdir_ms += (time.perf_counter() - mkdir_started) * 1000.0
                 filename = f"part-{uuid.uuid4().hex}.parquet"
                 final_path = partition / filename
                 temp_path = partition / f".{filename}.tmp"
-                staged.append((temp_path, final_path))
+                staged.append((dataset, partition_date, len(rows), temp_path, final_path))
+                phase = "table_from_pylist"
+                table_started = time.perf_counter()
                 table = pa.Table.from_pylist(rows, schema=DATASET_SCHEMAS[dataset])
+                metrics.table_from_pylist_ms += (
+                    time.perf_counter() - table_started
+                ) * 1000.0
+                phase = "parquet_write"
+                write_started = time.perf_counter()
                 pq.write_table(table, temp_path, compression="zstd")
+                metrics.parquet_write_ms += (
+                    time.perf_counter() - write_started
+                ) * 1000.0
 
-            for temp_path, final_path in staged:
+            phase = "os_replace"
+            replace_started = time.perf_counter()
+            for dataset, partition_date, row_count, temp_path, final_path in staged:
+                phase_dataset = dataset
+                phase_rows = row_count
                 os.replace(temp_path, final_path)
                 replaced.append(final_path)
-        except Exception:
-            for temp_path, _ in staged:
+            replace_ms = (time.perf_counter() - replace_started) * 1000.0
+        except Exception as error:
+            self._log_phase_failure(
+                flush_id=resolved_flush_id,
+                phase=phase,
+                dataset=phase_dataset,
+                rows=phase_rows,
+                worker_started=worker_started,
+                error=error,
+            )
+            for _, _, _, temp_path, _ in staged:
                 temp_path.unlink(missing_ok=True)
             for final_path in replaced:
                 final_path.unlink(missing_ok=True)
@@ -229,8 +328,94 @@ class ParquetStorage:
                 self._pending = restored
             raise
 
-        self.prune(now=current_time)
+        prune_started = time.perf_counter()
+        try:
+            self.prune(now=current_time)
+        except Exception as error:
+            self._log_phase_failure(
+                flush_id=resolved_flush_id,
+                phase="prune",
+                dataset=None,
+                rows=rows_total,
+                worker_started=worker_started,
+                error=error,
+            )
+            raise
+        prune_ms = (time.perf_counter() - prune_started) * 1000.0
+        self._log_telemetry(
+            flush_id=resolved_flush_id,
+            worker_started=worker_started,
+            lock_wait_ms=lock_wait_ms,
+            swap_hold_ms=swap_hold_ms,
+            rows_total=rows_total,
+            dataset_telemetry=dataset_telemetry,
+            files_written=len(staged),
+            replace_ms=replace_ms,
+            prune_ms=prune_ms,
+            pending_empty=False,
+        )
         return len(staged)
+
+    def _log_telemetry(
+        self,
+        *,
+        flush_id: str,
+        worker_started: float,
+        lock_wait_ms: float,
+        swap_hold_ms: float,
+        rows_total: int,
+        dataset_telemetry: dict[str, _DatasetFlushTelemetry],
+        files_written: int,
+        replace_ms: float,
+        prune_ms: float,
+        pending_empty: bool,
+    ) -> None:
+        worker_total_ms = (time.perf_counter() - worker_started) * 1000.0
+        dataset_metrics = json.dumps(
+            {
+                dataset: metrics.as_dict()
+                for dataset, metrics in dataset_telemetry.items()
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        LOGGER.info(
+            "parquet flush telemetry flush_id=%s pending_empty=%s "
+            "worker_total_ms=%.3f pending_lock_wait_ms=%.3f "
+            "pending_swap_hold_ms=%.3f rows_total=%d files_written=%d "
+            "dataset_metrics=%s replace_ms=%.3f prune_ms=%.3f",
+            flush_id,
+            str(pending_empty).lower(),
+            worker_total_ms,
+            lock_wait_ms,
+            swap_hold_ms,
+            rows_total,
+            files_written,
+            dataset_metrics,
+            replace_ms,
+            prune_ms,
+        )
+
+    def _log_phase_failure(
+        self,
+        *,
+        flush_id: str,
+        phase: str,
+        dataset: str | None,
+        rows: int,
+        worker_started: float,
+        error: BaseException | None,
+    ) -> None:
+        LOGGER.error(
+            "parquet flush phase failure flush_id=%s phase=%s dataset=%s "
+            "rows=%d elapsed_worker_ms=%.3f error_type=%s",
+            flush_id,
+            phase,
+            "-" if dataset is None else dataset,
+            rows,
+            (time.perf_counter() - worker_started) * 1000.0,
+            type(error).__name__ if error is not None else "UnknownError",
+        )
 
     def prune(self, *, now: datetime | None = None) -> int:
         """Delete complete date partitions older than the retention cutoff."""

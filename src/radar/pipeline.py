@@ -318,9 +318,18 @@ class MarketDataPipeline:
             ):
                 raise result
 
-    def flush_storage(self, *, now: datetime | None = None) -> int:
+    def flush_storage(
+        self,
+        *,
+        now: datetime | None = None,
+        flush_id: str | None = None,
+    ) -> int:
         """Flush the optional storage buffer at an application-owned boundary."""
-        return 0 if self.storage is None else self.storage.flush(now=now)
+        return (
+            0
+            if self.storage is None
+            else self.storage.flush(now=now, flush_id=flush_id)
+        )
 
     async def collect_once(
         self,

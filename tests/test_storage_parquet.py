@@ -1,4 +1,7 @@
+import json
+import logging
 import os
+from types import SimpleNamespace
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -105,6 +108,115 @@ def query_dataset(root, dataset: str, columns: str):
         return connection.execute(
             f"SELECT {columns} FROM read_parquet('{glob}') ORDER BY venue_symbol"
         ).fetchall()
+
+
+def storage_telemetry_payload(caplog, flush_id: str) -> dict[str, object]:
+    record = next(
+        record
+        for record in caplog.records
+        if record.name == "radar.storage.parquet"
+        and "parquet flush telemetry" in record.getMessage()
+        and f"flush_id={flush_id}" in record.getMessage()
+    )
+    message = record.getMessage()
+    payload_text = message.split(" dataset_metrics=", 1)[1].split(
+        " replace_ms=", 1
+    )[0]
+    return {
+        "message": message,
+        "payload": json.loads(payload_text),
+    }
+
+
+def test_flush_emits_correlated_machine_readable_phase_telemetry(
+    tmp_path, caplog
+):
+    caplog.set_level(logging.INFO, logger="radar.storage.parquet")
+    root = tmp_path / "data"
+    timestamp = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    flush_id = "flush-success"
+    store = ParquetStorage(root)
+    store.append(
+        CollectorBatch(
+            market_snapshots=(make_market(timestamp),),
+            funding_snapshots=(make_funding(timestamp),),
+            hourly_contexts=(make_hourly(timestamp),),
+        )
+    )
+    store.append(make_quoted(timestamp))
+
+    assert store.flush(now=timestamp, flush_id=flush_id) == 4
+
+    telemetry = storage_telemetry_payload(caplog, flush_id)
+    message = telemetry["message"]
+    payload = telemetry["payload"]
+    assert "pending_empty=false" in message
+    assert "rows_total=4" in message
+    assert "pending_lock_wait_ms=" in message
+    assert "pending_swap_hold_ms=" in message
+    assert "worker_total_ms=" in message
+    assert "prune_ms=" in message
+    assert payload["market"]["rows"] == 1
+    assert payload["funding"]["rows"] == 1
+    assert payload["hourly_context"]["rows"] == 1
+    assert payload["quoted_market"]["rows"] == 1
+    assert payload["market"]["rows_by_partition"] == {
+        "2026-09-15": 1
+    }
+    for dataset in ("market", "funding", "hourly_context", "quoted_market"):
+        assert payload[dataset]["table_from_pylist_ms"] >= 0
+        assert payload[dataset]["parquet_write_ms"] >= 0
+
+
+def test_empty_flush_emits_prune_and_worker_telemetry(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="radar.storage.parquet")
+    timestamp = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    flush_id = "flush-empty"
+
+    assert ParquetStorage(tmp_path / "data").flush(
+        now=timestamp,
+        flush_id=flush_id,
+    ) == 0
+
+    telemetry = storage_telemetry_payload(caplog, flush_id)
+    message = telemetry["message"]
+    assert "pending_empty=true" in message
+    assert "rows_total=0" in message
+    assert "prune_ms=" in message
+    assert telemetry["payload"] == {}
+
+
+def test_flush_failure_logs_phase_without_changing_restore_behavior(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO, logger="radar.storage.parquet")
+    timestamp = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    flush_id = "flush-failure"
+    store = ParquetStorage(tmp_path / "data")
+    store.append(make_market(timestamp))
+
+    def fail_table(*args, **kwargs):
+        raise ValueError("simulated conversion failure")
+
+    import radar.storage.parquet as parquet_storage
+
+    monkeypatch.setattr(
+        parquet_storage,
+        "pa",
+        SimpleNamespace(Table=SimpleNamespace(from_pylist=fail_table)),
+    )
+    with pytest.raises(ValueError, match="simulated conversion failure"):
+        store.flush(now=timestamp, flush_id=flush_id)
+
+    assert store.pending_count == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        f"flush_id={flush_id}" in message
+        and "phase=table_from_pylist" in message
+        and "dataset=market" in message
+        and "rows=1" in message
+        for message in messages
+    )
 
 
 def test_batch_append_flushes_separate_queryable_datasets_without_tiny_files(tmp_path):
@@ -328,7 +440,10 @@ def test_hourly_nullable_values_have_stable_float_schema(tmp_path):
     ]
 
 
-def test_failed_write_leaves_existing_parquet_untouched(tmp_path, monkeypatch):
+def test_failed_write_leaves_existing_parquet_untouched(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO, logger="radar.storage.parquet")
     root = tmp_path / "data"
     timestamp = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
     store = ParquetStorage(root)
@@ -344,12 +459,21 @@ def test_failed_write_leaves_existing_parquet_untouched(tmp_path, monkeypatch):
 
     monkeypatch.setattr("radar.storage.parquet.pq.write_table", fail_write)
     with pytest.raises(OSError, match="simulated"):
-        store.flush(now=timestamp + timedelta(seconds=10))
+        store.flush(
+            now=timestamp + timedelta(seconds=10),
+            flush_id="write-failure",
+        )
 
     assert existing_file.read_bytes() == existing_bytes
     assert store.pending_count == 1
     assert not tuple((root / "market").glob("date=*/*.tmp"))
     assert len(query_dataset(root, "market", "*")) == 1
+    assert any(
+        "flush_id=write-failure" in record.getMessage()
+        and "phase=parquet_write" in record.getMessage()
+        and "dataset=market" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_append_during_flush_remains_pending_for_the_next_flush(tmp_path, monkeypatch):
@@ -401,7 +525,56 @@ def test_append_during_flush_remains_pending_for_the_next_flush(tmp_path, monkey
     }
 
 
-def test_partial_file_commit_rolls_back_without_duplicate_retry_rows(tmp_path, monkeypatch):
+def test_failed_flush_merges_rows_appended_during_write_without_duplicates(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "data"
+    first_time = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    second_time = first_time + timedelta(seconds=10)
+    store = ParquetStorage(root)
+    store.append(make_market(first_time, "BTC"))
+
+    write_started = threading.Event()
+    release_write = threading.Event()
+    original_write = pq.write_table
+
+    def failing_write(*args, **kwargs):
+        write_started.set()
+        assert release_write.wait(timeout=1.0)
+        raise OSError("simulated concurrent write failure")
+
+    monkeypatch.setattr("radar.storage.parquet.pq.write_table", failing_write)
+    flush_error: list[BaseException] = []
+
+    def flush_in_worker() -> None:
+        try:
+            store.flush(now=first_time, flush_id="concurrent-failure")
+        except BaseException as error:  # pragma: no cover - diagnostic only
+            flush_error.append(error)
+
+    worker = threading.Thread(target=flush_in_worker)
+    worker.start()
+    assert write_started.wait(timeout=1.0)
+    store.append(make_market(second_time, "ETH"))
+    release_write.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert [str(error) for error in flush_error] == [
+        "simulated concurrent write failure"
+    ]
+    assert store.pending_count == 2
+    assert not tuple(root.glob("**/*.parquet"))
+
+    monkeypatch.setattr("radar.storage.parquet.pq.write_table", original_write)
+    assert store.flush(now=second_time) == 1
+    assert query_dataset(root, "market", "venue_symbol") == [("BTC",), ("ETH",)]
+
+
+def test_partial_file_commit_rolls_back_without_duplicate_retry_rows(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO, logger="radar.storage.parquet")
     root = tmp_path / "data"
     timestamp = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
     store = ParquetStorage(root)
@@ -420,11 +593,17 @@ def test_partial_file_commit_rolls_back_without_duplicate_retry_rows(tmp_path, m
 
     monkeypatch.setattr("radar.storage.parquet.os.replace", fail_on_second_replace)
     with pytest.raises(OSError, match="simulated replace failure"):
-        store.flush(now=timestamp)
+        store.flush(now=timestamp, flush_id="replace-failure")
 
     assert store.pending_count == 2
     assert not tuple(root.glob("**/*.tmp"))
     assert not tuple(root.glob("**/*.parquet"))
+    assert any(
+        "flush_id=replace-failure" in record.getMessage()
+        and "phase=os_replace" in record.getMessage()
+        and "dataset=funding" in record.getMessage()
+        for record in caplog.records
+    )
 
     monkeypatch.setattr("radar.storage.parquet.os.replace", original_replace)
     assert store.flush(now=timestamp) == 2
