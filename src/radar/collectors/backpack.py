@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,12 +23,14 @@ from radar.collectors.base import (
 )
 from radar.collectors.http import request_json as default_request_json
 from radar.config import MarketConfig
+from radar.diagnostics import BackpackWorkloadStats
 from radar.market_data import LatestMarketData
 from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
 BACKPACK_WS_URL = "wss://ws.backpack.exchange"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -70,6 +74,18 @@ class _BackpackDepthUpdate:
     bids: tuple[tuple[float, float], ...]
     asks: tuple[tuple[float, float], ...]
     observed_at: datetime
+
+
+@dataclass
+class _BackpackMessageTiming:
+    payload_bytes: int
+    started_perf_ns: int
+    started_cpu_ns: int
+    symbol: str | None = None
+    parse_ns: int = 0
+    apply_update_ns: int = 0
+    snapshot_ns: int = 0
+    publish_callback_ns: int = 0
 
 
 def _optional_positive_float(value: object, field_name: str) -> float | None:
@@ -342,9 +358,13 @@ class BackpackOrderBookFeed:
         error_handler: CollectorErrorHandler | None = None,
         ws_url: str = BACKPACK_WS_URL,
         reconnect_delay_seconds: float = 1.0,
+        workload_stats: BackpackWorkloadStats | None = None,
+        workload_summary_interval_seconds: float = 60.0,
     ) -> None:
         if reconnect_delay_seconds < 0:
             raise ValueError("reconnect_delay_seconds must be non-negative")
+        if workload_summary_interval_seconds <= 0:
+            raise ValueError("workload_summary_interval_seconds must be positive")
         normalized_symbols = tuple(symbols)
         if any(not isinstance(symbol, str) or not symbol for symbol in normalized_symbols):
             raise ValueError("symbols must contain non-empty strings")
@@ -358,6 +378,10 @@ class BackpackOrderBookFeed:
         self._on_invalidate = on_invalidate
         self._error_handler = error_handler
         self._reconnect_delay_seconds = reconnect_delay_seconds
+        self.workload_stats = (
+            BackpackWorkloadStats() if workload_stats is None else workload_stats
+        )
+        self._workload_summary_interval_seconds = workload_summary_interval_seconds
         self._states = {symbol: BackpackOrderBookState() for symbol in self._symbols}
         self._pending: dict[str, list[_BackpackDepthUpdate]] = {
             symbol: [] for symbol in self._symbols
@@ -365,6 +389,7 @@ class BackpackOrderBookFeed:
         self._rebuild_tasks: dict[str, asyncio.Task[None]] = {}
         self._rebuild_again: set[str] = set()
         self._task: asyncio.Task[None] | None = None
+        self._workload_summary_task: asyncio.Task[None] | None = None
         self._websocket: Any | None = None
         self._stopping = False
         self.reconnect_count = 0
@@ -387,6 +412,9 @@ class BackpackOrderBookFeed:
         self._task = asyncio.create_task(
             self._run(), name="backpack-order-book"
         )
+        self._workload_summary_task = asyncio.create_task(
+            self._run_workload_summary(), name="backpack-workload-summary"
+        )
 
     async def stop(self) -> None:
         self._stopping = True
@@ -396,8 +424,13 @@ class BackpackOrderBookFeed:
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        summary_task = self._workload_summary_task
+        if summary_task is not None:
+            summary_task.cancel()
+            await asyncio.gather(summary_task, return_exceptions=True)
         await self._cancel_rebuild_tasks()
         self._task = None
+        self._workload_summary_task = None
         self._websocket = None
         self._clear_all()
 
@@ -484,7 +517,71 @@ class BackpackOrderBookFeed:
             self.reconnect_count += 1
             await asyncio.sleep(self._reconnect_delay_seconds)
 
+    async def _run_workload_summary(self) -> None:
+        while not self._stopping:
+            await asyncio.sleep(self._workload_summary_interval_seconds)
+            if self._stopping:
+                return
+            summary = self.workload_stats.summary()
+            selected_symbols = {
+                symbol: summary["symbols"][symbol]
+                for symbol in (
+                    "BTC_USDC_PERP",
+                    "ETH_USDC_PERP",
+                    "SOL_USDC_PERP",
+                    "ZEC_USDC_PERP",
+                )
+                if symbol in summary["symbols"]
+            }
+            LOGGER.info(
+                "backpack workload messages=%d msg_per_sec=%.3f "
+                "bytes_per_sec=%.3f handler_wall_ms=%.3f "
+                "handler_cpu_ms=%.3f handler_utilization_pct=%.3f "
+                "max_handler_ms=%.3f publishes=%d rebuilds=%d gaps=%d "
+                "symbols=%s",
+                summary["messages"],
+                summary["msg_per_sec"],
+                summary["bytes_per_sec"],
+                summary["handler_wall_ms"],
+                summary["handler_cpu_ms"],
+                summary["handler_utilization_pct"],
+                summary["max_handler_ms"],
+                summary["publishes"],
+                summary["rebuilds"],
+                summary["gaps"],
+                selected_symbols,
+            )
+
     async def _handle_message(self, raw_message: object) -> None:
+        payload_bytes = (
+            len(raw_message)
+            if isinstance(raw_message, (bytes, str))
+            else 0
+        )
+        timing = _BackpackMessageTiming(
+            payload_bytes=payload_bytes,
+            started_perf_ns=time.perf_counter_ns(),
+            started_cpu_ns=time.thread_time_ns(),
+        )
+        try:
+            await self._handle_message_inner(raw_message, timing)
+        finally:
+            self.workload_stats.record_handler(
+                symbol=timing.symbol,
+                payload_bytes=timing.payload_bytes,
+                handler_wall_ns=time.perf_counter_ns() - timing.started_perf_ns,
+                handler_cpu_ns=time.thread_time_ns() - timing.started_cpu_ns,
+                parse_ns=timing.parse_ns,
+                apply_update_ns=timing.apply_update_ns,
+                snapshot_ns=timing.snapshot_ns,
+                publish_callback_ns=timing.publish_callback_ns,
+            )
+
+    async def _handle_message_inner(
+        self,
+        raw_message: object,
+        timing: _BackpackMessageTiming,
+    ) -> None:
         if isinstance(raw_message, bytes):
             try:
                 raw_message = raw_message.decode()
@@ -498,6 +595,7 @@ class BackpackOrderBookFeed:
                 ValueError("websocket message must be text"),
             )
             return
+        parse_started = time.perf_counter_ns()
         try:
             message = json.loads(raw_message)
         except json.JSONDecodeError as exc:
@@ -515,6 +613,7 @@ class BackpackOrderBookFeed:
         if not isinstance(stream, str) or not stream.startswith("depth."):
             return
         symbol = stream.removeprefix("depth.")
+        timing.symbol = symbol
         if symbol not in self._symbol_set:
             report_collector_error(
                 self._error_handler,
@@ -524,10 +623,12 @@ class BackpackOrderBookFeed:
             return
         try:
             update = self._parse_update(message, symbol)
+            timing.parse_ns = time.perf_counter_ns() - parse_started
         except Exception as error:  # noqa: BLE001
+            timing.parse_ns = time.perf_counter_ns() - parse_started
             self._fail_symbol(symbol, error)
             return
-        self._receive_update(symbol, update)
+        self._receive_update(symbol, update, timing=timing)
 
     @staticmethod
     def _parse_update(message: dict[str, object], symbol: str) -> _BackpackDepthUpdate:
@@ -546,7 +647,13 @@ class BackpackOrderBookFeed:
             observed_at=datetime.now(UTC),
         )
 
-    def _receive_update(self, symbol: str, update: _BackpackDepthUpdate) -> None:
+    def _receive_update(
+        self,
+        symbol: str,
+        update: _BackpackDepthUpdate,
+        *,
+        timing: _BackpackMessageTiming | None = None,
+    ) -> None:
         update = _BackpackDepthUpdate(
             first_update_id=update.first_update_id,
             final_update_id=update.final_update_id,
@@ -561,6 +668,7 @@ class BackpackOrderBookFeed:
             if rebuild is None or rebuild.done():
                 self._schedule_rebuild(symbol)
             return
+        apply_started = time.perf_counter_ns()
         try:
             result = state.apply_update(
                 first_update_id=update.first_update_id,
@@ -572,15 +680,21 @@ class BackpackOrderBookFeed:
         except Exception as error:  # noqa: BLE001
             self._fail_symbol(symbol, error)
             return
+        finally:
+            if timing is not None:
+                timing.apply_update_ns += time.perf_counter_ns() - apply_started
         if result == "gap":
+            self.workload_stats.record_gap(symbol)
             self._fail_symbol(
                 symbol, ValueError(f"depth sequence gap for {symbol}")
             )
             return
         if result in {"ready", "updated"}:
-            self._publish(symbol)
+            self.workload_stats.record_update_applied(symbol)
+            self._publish(symbol, timing=timing)
 
     async def _rebuild(self, symbol: str) -> None:
+        self.workload_stats.record_rebuild(symbol)
         while not self._stopping:
             try:
                 raw_snapshot = self._snapshot_loader(symbol)
@@ -616,9 +730,11 @@ class BackpackOrderBookFeed:
                     self._fail_symbol(symbol, error)
                     return
                 if result == "gap":
+                    self.workload_stats.record_gap(symbol)
                     gap = True
                     break
                 if result in {"ready", "updated"}:
+                    self.workload_stats.record_update_applied(symbol)
                     self._publish(symbol)
             if not gap:
                 return
@@ -658,14 +774,29 @@ class BackpackOrderBookFeed:
             )
         raise ValueError("snapshot loader returned an invalid snapshot")
 
-    def _publish(self, symbol: str) -> None:
+    def _publish(
+        self,
+        symbol: str,
+        *,
+        timing: _BackpackMessageTiming | None = None,
+    ) -> None:
+        snapshot_started = time.perf_counter_ns()
         snapshot = self._states[symbol].snapshot()
+        if timing is not None:
+            timing.snapshot_ns += time.perf_counter_ns() - snapshot_started
         if snapshot is None or self._on_book is None:
             return
+        self.workload_stats.record_publish(symbol)
+        callback_started = time.perf_counter_ns()
         try:
             self._on_book(symbol, snapshot)
         except Exception as error:  # noqa: BLE001
             self._fail_symbol(symbol, error)
+        finally:
+            if timing is not None:
+                timing.publish_callback_ns += (
+                    time.perf_counter_ns() - callback_started
+                )
 
     def _fail_symbol(self, symbol: str, error: Exception) -> None:
         self._invalidate_symbol(symbol)

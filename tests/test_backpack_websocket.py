@@ -12,6 +12,7 @@ from radar.collectors.backpack import (
     BackpackOrderBookState,
 )
 from radar.config import MarketConfig
+from radar.diagnostics import BackpackWorkloadStats
 from radar.market_data import LatestMarketData
 from radar.vwap import BookLevel
 
@@ -93,6 +94,50 @@ async def wait_until(predicate) -> None:
             return
         await asyncio.sleep(0)
     raise AssertionError("predicate was not satisfied")
+
+
+@pytest.mark.asyncio
+async def test_backpack_workload_telemetry_preserves_book_and_records_phases():
+    symbol = "BTC_USDC_PERP"
+    websocket = FixtureWebSocket(
+        [
+            {"id": 1, "result": None},
+            depth_update(symbol, first_update_id=10, final_update_id=11),
+        ]
+    )
+    stats = BackpackWorkloadStats()
+
+    async def snapshot_loader(_symbol: str):
+        return snapshot_payload(10)
+
+    feed = BackpackOrderBookFeed(
+        [symbol],
+        connect=lambda _url: websocket,
+        snapshot_loader=snapshot_loader,
+        clock=lambda: OBSERVED_AT,
+        on_book=lambda _symbol, _snapshot: None,
+        workload_stats=stats,
+        workload_summary_interval_seconds=60.0,
+    )
+
+    await feed.start()
+    try:
+        await wait_until(lambda: feed.snapshot(symbol) is not None)
+        snapshot = feed.snapshot(symbol)
+        assert snapshot is not None
+        assert snapshot.observed_at == OBSERVED_AT
+        summary = stats.summary()
+        assert summary["messages"] >= 1
+        assert summary["symbols"][symbol]["messages"] >= 1
+        assert summary["updates_applied"] >= 1
+        assert summary["publishes"] >= 1
+        assert summary["handler_wall_ms"] >= 0.0
+        assert summary["parse_ms"] >= 0.0
+        assert summary["apply_update_ms"] >= 0.0
+        assert summary["snapshot_ms"] >= 0.0
+        assert summary["publish_callback_ms"] >= 0.0
+    finally:
+        await feed.stop()
 
 
 def test_backpack_update_requires_bridge_then_contiguous_ids():

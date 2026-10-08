@@ -20,6 +20,14 @@ from radar.alerts.telegram import TelegramTransport
 from radar.alerts.worker import AlertProcessor, AlertRouter, AlertWorker
 from radar.collectors.base import CollectorBatch
 from radar.config import RadarConfig, load_config
+from radar.diagnostics import (
+    DiagnosticLogSession,
+    EventLoopLagWatchdog,
+    GCTelemetry,
+    ResourceSnapshot,
+    advance_scheduled_sample_time,
+    install_diagnostic_logging,
+)
 from radar.history.spread import SpreadHistory
 from radar.history.manual_opportunity import (
     ManualOpportunityHistory,
@@ -38,6 +46,7 @@ from radar.storage.sqlite import SQLiteRuntimeStore
 LOGGER = logging.getLogger(__name__)
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_DB = Path("runtime/radar.sqlite3")
+DEFAULT_DIAGNOSTIC_LOG = Path("runtime/radar-diagnostics.log")
 DEFAULT_PARQUET_FLUSH_SECONDS = 60
 
 
@@ -142,6 +151,8 @@ class RadarApplication:
         clock: Callable[[], datetime] = utc_now,
         flush_interval_seconds: int = DEFAULT_PARQUET_FLUSH_SECONDS,
         stats: PilotStats | None = None,
+        diagnostic_log_path: Path | None = None,
+        diagnostic_session_id: str | None = None,
     ) -> None:
         if flush_interval_seconds <= 0:
             raise ValueError("flush_interval_seconds must be positive")
@@ -156,11 +167,74 @@ class RadarApplication:
         self.clock = clock
         self.flush_interval_seconds = flush_interval_seconds
         self.stats = PilotStats() if stats is None else stats
+        self.diagnostic_log_path = diagnostic_log_path
+        self.diagnostic_session_id = diagnostic_session_id
         self._last_flush_at: datetime | None = None
         self._periodic_flush_task: asyncio.Task[None] | None = None
         self._next_scheduled_sample_time: datetime | None = None
         self._last_cycle_timing: _CycleTiming | None = None
         self._last_monitors_run: tuple[str, ...] = ()
+        self._event_loop_watchdog: EventLoopLagWatchdog | None = None
+        self._event_loop_watchdog_task: asyncio.Task[None] | None = None
+        self._gc_telemetry: GCTelemetry | None = None
+        self._diagnostic_log_session: DiagnosticLogSession | None = None
+
+    def _diagnostic_resource_snapshot(self) -> ResourceSnapshot:
+        try:
+            load_average_1m = os.getloadavg()[0]
+        except OSError:
+            load_average_1m = None
+        return ResourceSnapshot(
+            rss_bytes=_current_rss_bytes(),
+            process_cpu_ms=_process_cpu_ms(),
+            load_average_1m=load_average_1m,
+        )
+
+    def _poll_gc_diagnostics(self) -> None:
+        if self._gc_telemetry is not None:
+            self._gc_telemetry.emit_long_pause_warnings()
+
+    def _log_diagnostic_summary(
+        self,
+        summary: dict[str, float | int | None],
+    ) -> None:
+        del summary
+        if self._gc_telemetry is None:
+            return
+        LOGGER.info("gc summary %s", self._gc_telemetry.summary())
+
+    def _start_diagnostics(self, stop_event: asyncio.Event) -> None:
+        if self.diagnostic_log_path is not None:
+            self._diagnostic_log_session = install_diagnostic_logging(
+                self.diagnostic_log_path,
+                logger=logging.getLogger(),
+                session_id=self.diagnostic_session_id,
+            )
+        self._gc_telemetry = GCTelemetry(logger=LOGGER)
+        self._gc_telemetry.start()
+        self._event_loop_watchdog = EventLoopLagWatchdog(
+            logger=LOGGER,
+            resource_snapshot=self._diagnostic_resource_snapshot,
+            cycle_number=lambda: self.stats.collection_cycles,
+            on_tick=self._poll_gc_diagnostics,
+            on_summary=self._log_diagnostic_summary,
+        )
+        self._event_loop_watchdog_task = asyncio.create_task(
+            self._event_loop_watchdog.run(stop_event),
+            name="radar-event-loop-watchdog",
+        )
+
+    async def _stop_diagnostics(self) -> None:
+        task = self._event_loop_watchdog_task
+        self._event_loop_watchdog_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self._gc_telemetry is not None:
+            self._gc_telemetry.emit_long_pause_warnings()
+            self._gc_telemetry.stop()
+            self._gc_telemetry = None
+        self._event_loop_watchdog = None
 
     async def collect_and_evaluate_once(
         self,
@@ -356,6 +430,7 @@ class RadarApplication:
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:
         event = asyncio.Event() if stop_event is None else stop_event
+        self._start_diagnostics(event)
         worker_task = asyncio.create_task(self.alert_worker.run_forever())
         await asyncio.sleep(0)
         self._next_scheduled_sample_time = None
@@ -380,6 +455,7 @@ class RadarApplication:
                     (cycle_time - scheduled_sample_time).total_seconds() * 1000.0,
                 )
                 critical_started = time.perf_counter()
+                scheduler_critical_ms: float | None = None
                 try:
                     batch = await self.collect_and_evaluate_once(
                         cycle_time,
@@ -414,17 +490,59 @@ class RadarApplication:
                 except Exception as error:  # noqa: BLE001
                     LOGGER.error("application cycle failed", exc_info=error)
                 finally:
-                    next_sample_time = scheduled_sample_time + timedelta(
-                        seconds=self.pipeline.sampling_seconds
-                    )
                     after_cycle = _as_utc(self.clock(), "now")
-                    if after_cycle >= next_sample_time:
-                        next_sample_time = aligned_sample_time(
-                            after_cycle, self.pipeline.sampling_seconds
-                        ) + timedelta(seconds=self.pipeline.sampling_seconds)
-                    self._next_scheduled_sample_time = next_sample_time
+                    advance = advance_scheduled_sample_time(
+                        scheduled_sample_time,
+                        after_cycle,
+                        sampling_seconds=self.pipeline.sampling_seconds,
+                    )
+                    previous_cycle_ms = (
+                        scheduler_critical_ms
+                        if scheduler_critical_ms is not None
+                        else _elapsed_ms(critical_started)
+                    )
+                    recent_lag = (
+                        None
+                        if self._event_loop_watchdog is None
+                        else self._event_loop_watchdog.summary()["max_lag_ms"]
+                    )
+                    skipped_slots_text = ",".join(
+                        slot.isoformat() for slot in advance.skipped_slots
+                    ) or "none"
+                    LOGGER.info(
+                        "scheduler slot previous_scheduled_sample_time=%s "
+                        "actual_wake_time=%s cycle_start_time=%s "
+                        "cycle_finish_time=%s wake_lateness_ms=%.3f "
+                        "previous_cycle_ms=%.3f skipped_slot_count=%d "
+                        "exact_skipped_slots=%s next_scheduled_sample_time=%s",
+                        advance.previous_sample_time,
+                        cycle_time,
+                        cycle_time,
+                        after_cycle,
+                        boundary_lateness_ms,
+                        previous_cycle_ms,
+                        len(advance.skipped_slots),
+                        skipped_slots_text,
+                        advance.next_sample_time,
+                    )
+                    if advance.skipped_slots:
+                        LOGGER.warning(
+                            "scheduler skipped slots count=%d slots=%s "
+                            "wake_lateness_ms=%.3f previous_cycle_ms=%.3f "
+                            "event_loop_recent_max_lag_ms=%s",
+                            len(advance.skipped_slots),
+                            skipped_slots_text,
+                            boundary_lateness_ms,
+                            previous_cycle_ms,
+                            recent_lag,
+                        )
+                    self._next_scheduled_sample_time = advance.next_sample_time
         finally:
             event.set()
+            try:
+                await self._stop_diagnostics()
+            except Exception as error:  # noqa: BLE001
+                LOGGER.error("diagnostic shutdown failed", exc_info=error)
             try:
                 stop_pipeline = getattr(self.pipeline, "stop", None)
                 if callable(stop_pipeline):
@@ -458,6 +576,10 @@ class RadarApplication:
                 self.monitor_runner.queue.qsize(),
             )
             self._next_scheduled_sample_time = None
+            session = self._diagnostic_log_session
+            self._diagnostic_log_session = None
+            if session is not None:
+                session.close()
 
 
 def _configured_fee_bps(config: RadarConfig, venue: str) -> float:
@@ -796,6 +918,7 @@ def build_application(
         config=config,
         clock=clock,
         stats=stats,
+        diagnostic_log_path=DEFAULT_DIAGNOSTIC_LOG,
     )
 
 

@@ -865,6 +865,90 @@ async def test_application_starts_and_stops_pipeline_lifecycle_hooks():
     assert events[:2] == ["pipeline.start", "pipeline.stop"]
 
 
+@pytest.mark.asyncio
+async def test_application_diagnostic_session_and_watchdog_stop_cleanly(tmp_path):
+    from radar.app import RadarApplication
+
+    logging.getLogger("radar.app").setLevel(logging.INFO)
+    events: list[str] = []
+    pipeline = LifecycleRecordingPipeline(events)
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    app = RadarApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=FakeRuntimeStore(events),  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+        diagnostic_log_path=tmp_path / "radar-diagnostics.log",
+        diagnostic_session_id="test-app-run",
+    )
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    await app.run(stop_event=stop_event)
+
+    text = (tmp_path / "radar-diagnostics.log").read_text()
+    assert "diagnostic session start session_id=test-app-run" in text
+    assert "diagnostic session end session_id=test-app-run" in text
+    assert app._event_loop_watchdog_task is None
+    assert app._gc_telemetry is None
+
+
+@pytest.mark.asyncio
+async def test_application_logs_exact_scheduler_skip_chronology(caplog):
+    from radar.app import RadarApplication
+
+    logger = logging.getLogger("radar.app")
+    logger.setLevel(logging.INFO)
+    caplog.set_level(logging.INFO, logger="radar.app")
+    events: list[str] = []
+    pipeline = RecordingPipeline(events)
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    runner = RecordingRunner(queue)
+    runner.state = pipeline.state
+    stop_event = asyncio.Event()
+    pipeline.shutdown_event = stop_event
+    clock_values = iter((NOW, NOW + timedelta(seconds=31)))
+
+    class OneCycleApplication(RadarApplication):
+        async def _wait_until_next_boundary(self, event: asyncio.Event) -> bool:
+            if self._next_scheduled_sample_time is None:
+                self._next_scheduled_sample_time = NOW
+                return False
+            event.set()
+            return True
+
+    app = OneCycleApplication(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        monitor_runner=runner,  # type: ignore[arg-type]
+        alert_worker=FakeWorker(),  # type: ignore[arg-type]
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        runtime_store=FakeRuntimeStore(events),  # type: ignore[arg-type]
+        processor=object(),  # type: ignore[arg-type]
+        clock=lambda: next(clock_values, NOW + timedelta(seconds=31)),
+    )
+
+    await app.run(stop_event=stop_event)
+
+    messages = [record.getMessage() for record in caplog.records]
+    slot_message = next(
+        message for message in messages if "scheduler slot previous_" in message
+    )
+    assert "skipped_slot_count=3" in slot_message
+    assert "2026-09-17T12:00:10+00:00" in slot_message
+    assert "2026-09-17T12:00:20+00:00" in slot_message
+    assert "2026-09-17T12:00:30+00:00" in slot_message
+    assert "next_scheduled_sample_time=2026-09-17 12:00:40+00:00" in slot_message
+    warning = next(
+        message for message in messages if "scheduler skipped slots" in message
+    )
+    assert "count=3" in warning
+
+
 def test_build_application_wires_monitor_runner_and_worker_to_one_queue(tmp_path):
     from radar.app import build_application
 
