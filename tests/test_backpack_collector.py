@@ -296,6 +296,51 @@ async def test_backpack_collector_uses_ws_books_and_keeps_depth_out_of_sampling(
     ]
 
 
+@pytest.mark.asyncio
+async def test_backpack_collector_prepare_sample_publishes_cache_without_network():
+    transport = FixtureTransport()
+    websocket = collector_websocket()
+    latest = LatestMarketData()
+    markets = configured_markets()
+    collector = BackpackCollector(
+        markets,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        websocket_connect=lambda _url: websocket,
+        latest_market_data=latest,
+    )
+
+    await collector.start()
+    try:
+        await wait_until(
+            lambda: all(
+                collector._order_book_feed.snapshot(symbol) is not None
+                for symbol in ("SNDK.US_USDC_PERP", "NVDA.US_USDC_PERP")
+            )
+        )
+        depth_calls_before = sum(
+            url == BackpackCollector.DEPTH_URL for url, _, _ in transport.calls
+        )
+        collector.prepare_sample()
+        depth_calls_after = sum(
+            url == BackpackCollector.DEPTH_URL for url, _, _ in transport.calls
+        )
+        batch = latest.build_batch(
+            markets,
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+    finally:
+        await collector.stop()
+
+    assert depth_calls_after == depth_calls_before
+    assert {snapshot.canonical_symbol for snapshot in batch.market_snapshots} == {
+        "SNDK",
+        "NVDA",
+    }
+
+
 class MetadataFailureTransport(FixtureTransport):
     def __init__(self) -> None:
         super().__init__()

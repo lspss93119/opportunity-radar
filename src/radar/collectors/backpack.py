@@ -438,6 +438,12 @@ class BackpackOrderBookFeed:
         state = self._states.get(symbol)
         return None if state is None else state.snapshot()
 
+    def publish_current_books(self) -> None:
+        """Publish each currently ready book at an application sample boundary."""
+        for symbol in self._symbols:
+            if self._states[symbol].ready:
+                self._publish(symbol)
+
     def _notify_invalidate(self, symbol: str) -> None:
         if self._on_invalidate is None:
             return
@@ -691,7 +697,6 @@ class BackpackOrderBookFeed:
             return
         if result in {"ready", "updated"}:
             self.workload_stats.record_update_applied(symbol)
-            self._publish(symbol, timing=timing)
 
     async def _rebuild(self, symbol: str) -> None:
         self.workload_stats.record_rebuild(symbol)
@@ -735,7 +740,6 @@ class BackpackOrderBookFeed:
                     break
                 if result in {"ready", "updated"}:
                     self.workload_stats.record_update_applied(symbol)
-                    self._publish(symbol)
             if not gap:
                 return
             self._invalidate_symbol(symbol)
@@ -982,6 +986,10 @@ class BackpackCollector:
             await asyncio.gather(metadata_task, return_exceptions=True)
         self._metadata_task = None
         await self._order_book_feed.stop()
+
+    def prepare_sample(self) -> None:
+        """Publish ready WebSocket books without performing network I/O."""
+        self._order_book_feed.publish_current_books()
 
     async def _load_depth_snapshot(self, symbol: str) -> BackpackRestSnapshot:
         payload = await self._request_json(

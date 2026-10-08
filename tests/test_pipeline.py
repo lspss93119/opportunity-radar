@@ -236,6 +236,39 @@ class NetworkOnlyCollector:
         raise AssertionError("cache-only sampling must not call collectors")
 
 
+class PreparationCollector:
+    venue = "backpack"
+
+    def __init__(self, latest: LatestMarketData, events: list[str]) -> None:
+        self._latest = latest
+        self._events = events
+
+    def prepare_sample(self) -> None:
+        self._events.append("prepare")
+        self._latest.update_book(
+            venue="backpack",
+            venue_symbol="BTC_USDC_PERP",
+            bids=(BookLevel(price=99.0, base_size=200.0),),
+            asks=(BookLevel(price=101.0, base_size=200.0),),
+            observed_at=NOW,
+        )
+
+    async def collect(
+        self, *, sample_time: datetime, include_hourly_context: bool
+    ) -> CollectorBatch:
+        raise AssertionError("cache-only sampling must not collect")
+
+
+class RecordingLatestMarketData(LatestMarketData):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+
+    def build_batch_with_diagnostics(self, *args, **kwargs):
+        self._events.append("build")
+        return super().build_batch_with_diagnostics(*args, **kwargs)
+
+
 class BlockingQuotedCollector:
     def __init__(self, snapshot: QuotedMarketSnapshot) -> None:
         self.snapshot = snapshot
@@ -399,6 +432,27 @@ async def test_collect_once_reads_latest_cache_without_invoking_collectors():
     assert len(batch.market_snapshots) == 1
     assert batch.market_snapshots[0].observed_at == NOW
     assert state.get_market("lighter", "BTC") == batch.market_snapshots[0]
+
+
+@pytest.mark.asyncio
+async def test_collect_once_prepares_cache_before_building_sample():
+    events: list[str] = []
+    latest = RecordingLatestMarketData(events)
+    market = MarketConfig(
+        venue="backpack", venue_symbol="BTC_USDC_PERP", canonical_symbol="BTC"
+    )
+    pipeline = MarketDataPipeline(
+        [PreparationCollector(latest, events)],
+        RadarState(),
+        markets=[market],
+        latest_market_data=latest,
+    )
+
+    batch = await pipeline.collect_once(now=NOW)
+
+    assert events == ["prepare", "build"]
+    assert len(batch.market_snapshots) == 1
+    assert batch.market_snapshots[0].venue_symbol == "BTC_USDC_PERP"
 
 
 @pytest.mark.asyncio

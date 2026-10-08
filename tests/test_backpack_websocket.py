@@ -123,6 +123,7 @@ async def test_backpack_workload_telemetry_preserves_book_and_records_phases():
     await feed.start()
     try:
         await wait_until(lambda: feed.snapshot(symbol) is not None)
+        feed.publish_current_books()
         snapshot = feed.snapshot(symbol)
         assert snapshot is not None
         assert snapshot.observed_at == OBSERVED_AT
@@ -311,7 +312,9 @@ async def test_backpack_feed_subscribes_once_buffers_updates_and_publishes_cache
         assert websocket.sent == [
             {"method": "SUBSCRIBE", "params": [f"depth.{symbol}"]}
         ]
-        assert published
+        assert published == []
+        feed.publish_current_books()
+        assert published == [symbol]
         assert invalidated
         batch = latest.build_batch(
             [MarketConfig(venue="backpack", venue_symbol=symbol, canonical_symbol="SNDK")],
@@ -373,6 +376,14 @@ async def test_backpack_feed_gap_rebuilds_only_affected_symbol():
     await feed.start()
     try:
         await wait_until(lambda: loader_calls.count(btc) >= 2)
+        before_boundary = latest.build_batch(
+            markets,
+            sample_time=OBSERVED_AT,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+        assert before_boundary.market_snapshots == ()
+        feed.publish_current_books()
         before_recovery = latest.build_batch(
             markets,
             sample_time=OBSERVED_AT,
@@ -394,6 +405,7 @@ async def test_backpack_feed_gap_rebuilds_only_affected_symbol():
         await wait_until(lambda: feed.snapshot(btc) is not None)
         assert feed.reconnect_count == 0
         assert feed.snapshot(eth) is not None
+        feed.publish_current_books()
         assert latest.build_batch(
             markets,
             sample_time=OBSERVED_AT,
@@ -492,6 +504,7 @@ async def test_backpack_feed_reconnect_clears_cache_and_resubscribes():
     await feed.start()
     try:
         await wait_until(lambda: feed.snapshot(symbol) is not None)
+        feed.publish_current_books()
         assert len(
             latest.build_batch(
                 [market],
@@ -515,6 +528,7 @@ async def test_backpack_feed_reconnect_clears_cache_and_resubscribes():
             depth_update(symbol, first_update_id=10, final_update_id=11)
         )
         await wait_until(lambda: feed.snapshot(symbol) is not None)
+        feed.publish_current_books()
         assert feed.reconnect_count >= 1
     finally:
         await feed.stop()
@@ -522,3 +536,155 @@ async def test_backpack_feed_reconnect_clears_cache_and_resubscribes():
     assert second.closed
     assert feed.snapshot(symbol) is None
     assert not feed.rebuild_tasks
+
+
+@pytest.mark.asyncio
+async def test_backpack_feed_publishes_latest_ready_book_once_per_boundary():
+    first_symbol = "BTC_USDC_PERP"
+    second_symbol = "ETH_USDC_PERP"
+    websocket = FixtureWebSocket(
+        [
+            {"id": 1, "result": None},
+            depth_update(first_symbol, first_update_id=10, final_update_id=11),
+            depth_update(
+                first_symbol,
+                first_update_id=12,
+                final_update_id=12,
+                bids=((98.0, 3.0),),
+            ),
+            depth_update(second_symbol, first_update_id=20, final_update_id=21),
+        ]
+    )
+    published: list[tuple[str, datetime]] = []
+
+    async def snapshot_loader(symbol: str):
+        return snapshot_payload(10 if symbol == first_symbol else 20)
+
+    feed = BackpackOrderBookFeed(
+        [first_symbol, second_symbol],
+        connect=lambda _url: websocket,
+        snapshot_loader=snapshot_loader,
+        clock=lambda: OBSERVED_AT,
+        on_book=lambda symbol, snapshot: published.append(
+            (symbol, snapshot.observed_at)
+        ),
+    )
+
+    await feed.start()
+    try:
+        await wait_until(
+            lambda: feed.snapshot(first_symbol) is not None
+            and feed.snapshot(second_symbol) is not None
+        )
+        assert published == []
+
+        feed.publish_current_books()
+        assert published == [
+            (first_symbol, OBSERVED_AT),
+            (second_symbol, OBSERVED_AT),
+        ]
+
+        websocket.push(
+            depth_update(
+                first_symbol,
+                first_update_id=13,
+                final_update_id=13,
+                asks=((101.0, 0.0), (100.0, 2.0)),
+            )
+        )
+        await asyncio.sleep(0)
+        assert len(published) == 2
+
+        feed.publish_current_books()
+        assert len(published) == 4
+        assert published[-2:] == [
+            (first_symbol, OBSERVED_AT),
+            (second_symbol, OBSERVED_AT),
+        ]
+    finally:
+        await feed.stop()
+
+
+@pytest.mark.asyncio
+async def test_backpack_feed_boundary_publish_keeps_symbols_isolated_on_callback_failure():
+    first_symbol = "BTC_USDC_PERP"
+    second_symbol = "ETH_USDC_PERP"
+    published: list[str] = []
+    invalidated: list[str] = []
+
+    feed = BackpackOrderBookFeed(
+        [first_symbol, second_symbol],
+        connect=lambda _url: (_ for _ in ()).throw(AssertionError("no network")),
+        snapshot_loader=lambda _symbol: (_ for _ in ()).throw(
+            AssertionError("no network")
+        ),
+        clock=lambda: OBSERVED_AT,
+        on_book=lambda symbol, _snapshot: (
+            (_ for _ in ()).throw(ValueError("first callback failed"))
+            if symbol == first_symbol
+            else published.append(symbol)
+        ),
+        on_invalidate=lambda symbol: invalidated.append(symbol),
+    )
+    for symbol, update_id in ((first_symbol, 10), (second_symbol, 20)):
+        feed._states[symbol].seed(
+            last_update_id=update_id,
+            bids=(BookLevel(99.0, 200.0),),
+            asks=(BookLevel(101.0, 200.0),),
+            observed_at=OBSERVED_AT,
+        )
+        assert (
+            feed._states[symbol].apply_update(
+                first_update_id=update_id,
+                final_update_id=update_id + 1,
+                bids=(),
+                asks=(),
+                observed_at=OBSERVED_AT,
+            )
+            == "ready"
+        )
+
+    try:
+        feed.publish_current_books()
+        assert published == [second_symbol]
+        assert first_symbol in invalidated
+        assert feed.snapshot(first_symbol) is None
+        assert feed.snapshot(second_symbol) is not None
+    finally:
+        await feed.stop()
+
+
+def test_backpack_feed_boundary_publish_does_not_perform_network_io():
+    calls: list[str] = []
+
+    def fail_network(_value):
+        calls.append("network")
+        raise AssertionError("boundary publication must be cache-only")
+
+    feed = BackpackOrderBookFeed(
+        ["BTC_USDC_PERP"],
+        connect=fail_network,
+        snapshot_loader=fail_network,
+        on_book=lambda _symbol, _snapshot: calls.append("publish"),
+        clock=lambda: OBSERVED_AT,
+    )
+    feed._states["BTC_USDC_PERP"].seed(
+        last_update_id=10,
+        bids=(BookLevel(99.0, 200.0),),
+        asks=(BookLevel(101.0, 200.0),),
+        observed_at=OBSERVED_AT,
+    )
+    assert (
+        feed._states["BTC_USDC_PERP"].apply_update(
+            first_update_id=10,
+            final_update_id=11,
+            bids=(),
+            asks=(),
+            observed_at=OBSERVED_AT,
+        )
+        == "ready"
+    )
+
+    feed.publish_current_books()
+
+    assert calls == ["publish"]

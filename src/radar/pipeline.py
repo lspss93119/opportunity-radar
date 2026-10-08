@@ -350,6 +350,10 @@ class MarketDataPipeline:
                 resolved_sample_time, self.sampling_seconds
             ) != resolved_sample_time:
                 raise ValueError("sample_time must be aligned to a 10-second boundary")
+        for collector in self._collectors:
+            prepare_sample = getattr(collector, "prepare_sample", None)
+            if callable(prepare_sample):
+                prepare_sample()
         candidate_batch, diagnostics = (
             self._latest_market_data.build_batch_with_diagnostics(
                 self._markets,
