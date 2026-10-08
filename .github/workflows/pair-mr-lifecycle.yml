@@ -1,0 +1,30 @@
+name: Pair MR Lifecycle
+
+on:
+  push:
+    branches:
+      - research/pair-mr-long-backtest-20261008
+    paths:
+      - "research/pair_mr_lifecycle.py"
+      - ".github/workflows/pair-mr-lifecycle.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip pandas numpy pyarrow requests
+      - run: python research/pair_mr_lifecycle.py
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pair-mr-lifecycle
+          path: research_outputs/pair_mr_lifecycle/
+          if-no-files-found: warn
