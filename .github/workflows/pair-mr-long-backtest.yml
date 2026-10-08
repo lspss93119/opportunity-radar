@@ -1,0 +1,33 @@
+name: Pair MR Long Backtest
+
+on:
+  push:
+    branches:
+      - research/pair-mr-long-backtest-20261008
+    paths:
+      - "research/pair_mr_long_backtest.py"
+      - ".github/workflows/pair-mr-long-backtest.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install research dependencies
+        run: python -m pip install --upgrade pip pandas numpy pyarrow requests
+      - name: Run frozen Episode MR long backtest
+        run: python research/pair_mr_long_backtest.py
+      - name: Upload research outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pair-mr-long-backtest
+          path: research_outputs/pair_mr_long_backtest/
+          if-no-files-found: warn
