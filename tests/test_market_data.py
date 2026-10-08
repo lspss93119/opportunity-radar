@@ -256,3 +256,92 @@ def test_latest_market_view_is_immutable():
 
     with pytest.raises(AttributeError):
         view.ready = False
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected_reason"),
+    [
+        ("missing", "missing_view"),
+        ("unready", "unready"),
+        ("stale", "stale"),
+        ("insufficient_buy", "insufficient_buy_10k_depth"),
+        ("insufficient_sell", "insufficient_sell_10k_depth"),
+        ("insufficient_both", "insufficient_both_10k_depth"),
+        ("included", "included"),
+    ],
+)
+def test_build_batch_with_diagnostics_classifies_each_enabled_market(
+    setup: str, expected_reason: str
+):
+    market = MarketConfig(
+        venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+    )
+    latest = LatestMarketData()
+    if setup == "unready":
+        latest.invalidate(venue="lighter", venue_symbol="BTC")
+    elif setup == "stale":
+        seed_book(
+            latest,
+            observed_at=NOW - timedelta(seconds=31),
+        )
+    elif setup == "insufficient_buy":
+        seed_book(
+            latest,
+            asks=(BookLevel(101.0, 50.0),),
+            bids=(BookLevel(99.0, 200.0),),
+        )
+    elif setup == "insufficient_sell":
+        seed_book(
+            latest,
+            asks=(BookLevel(101.0, 200.0),),
+            bids=(BookLevel(99.0, 50.0),),
+        )
+    elif setup == "insufficient_both":
+        seed_book(
+            latest,
+            asks=(BookLevel(101.0, 50.0),),
+            bids=(BookLevel(99.0, 50.0),),
+        )
+    elif setup == "included":
+        seed_book(latest)
+
+    batch, diagnostics = latest.build_batch_with_diagnostics(
+        [market],
+        sample_time=SAMPLE_TIME,
+        now=NOW,
+        stale_after_seconds=30,
+    )
+
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.venue == "lighter"
+    assert diagnostic.venue_symbol == "BTC"
+    assert diagnostic.canonical_symbol == "BTC"
+    assert diagnostic.reason == expected_reason
+    if setup in {"missing", "unready", "stale"}:
+        assert batch.market_snapshots == ()
+    else:
+        assert len(batch.market_snapshots) == 1
+
+
+def test_build_batch_with_diagnostics_preserves_candidate_snapshot_for_depth_omission():
+    market = MarketConfig(
+        venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+    )
+    latest = LatestMarketData()
+    seed_book(
+        latest,
+        asks=(BookLevel(101.0, 50.0),),
+        bids=(BookLevel(99.0, 200.0),),
+    )
+
+    batch, diagnostics = latest.build_batch_with_diagnostics(
+        [market],
+        sample_time=SAMPLE_TIME,
+        now=NOW,
+        stale_after_seconds=30,
+    )
+
+    assert diagnostics[0].reason == "insufficient_buy_10k_depth"
+    assert batch.market_snapshots[0].buy_10k_vwap is None
+    assert batch.market_snapshots[0].sell_10k_vwap == pytest.approx(99.0)

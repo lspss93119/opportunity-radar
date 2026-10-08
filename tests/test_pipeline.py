@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -398,6 +399,51 @@ async def test_collect_once_reads_latest_cache_without_invoking_collectors():
     assert len(batch.market_snapshots) == 1
     assert batch.market_snapshots[0].observed_at == NOW
     assert state.get_market("lighter", "BTC") == batch.market_snapshots[0]
+
+
+@pytest.mark.asyncio
+async def test_collect_once_logs_reason_coded_market_availability_summary(caplog):
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="BTC",
+        bids=(BookLevel(price=99.0, base_size=200.0),),
+        asks=(BookLevel(price=101.0, base_size=200.0),),
+        observed_at=NOW,
+    )
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="ETH",
+        bids=(BookLevel(price=99.0, base_size=200.0),),
+        asks=(BookLevel(price=101.0, base_size=50.0),),
+        observed_at=NOW,
+    )
+    pipeline = MarketDataPipeline(
+        [],
+        RadarState(),
+        markets=(
+            MarketConfig(
+                venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+            ),
+            MarketConfig(
+                venue="lighter", venue_symbol="ETH", canonical_symbol="ETH"
+            ),
+        ),
+        latest_market_data=latest,
+    )
+
+    caplog.set_level(logging.INFO, logger="radar.pipeline")
+    batch = await pipeline.collect_once(now=NOW)
+
+    assert [snapshot.venue_symbol for snapshot in batch.market_snapshots] == ["BTC"]
+    summary = next(
+        record.getMessage()
+        for record in caplog.records
+        if "market availability cycle" in record.getMessage()
+    )
+    assert "configured=2" in summary
+    assert "included=1" in summary
+    assert "insufficient_buy_10k=1" in summary
 
 
 @pytest.mark.asyncio

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from radar.collectors.hyperliquid import (
     HyperliquidOrderBookFeed,
     HyperliquidOrderBookSnapshot,
+    _HyperliquidSession,
 )
 from radar.config import MarketConfig
 from radar.market_data import LatestMarketData
@@ -809,3 +810,206 @@ async def test_hyperliquid_family_domains_do_not_invalidate_each_other():
         assert feeds[2].snapshot("io:SNDK") is not None
     finally:
         await asyncio.gather(*(feed.stop() for feed in feeds))
+
+
+def make_session(
+    feed: HyperliquidOrderBookFeed, websocket: FixtureWebSocket
+) -> _HyperliquidSession:
+    return _HyperliquidSession(
+        generation=1,
+        websocket=websocket,
+        started_at=OBSERVED_AT,
+        started_at_monotonic=0.0,
+        coin_seen_initial_l2book={coin: False for coin in feed.coins},
+        coin_first_l2book_at={coin: None for coin in feed.coins},
+        coin_last_l2book_at={coin: None for coin in feed.coins},
+        coin_last_l2book_monotonic={coin: None for coin in feed.coins},
+    )
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_tracks_each_coin_l2book_state_independently():
+    websocket = FixtureWebSocket([])
+    monotonic = [0.0]
+    feed = HyperliquidOrderBookFeed(
+        "wss://test.invalid/ws",
+        ["BTC", "UNI"],
+        connect=lambda _url, **_kwargs: websocket,
+        monotonic=lambda: monotonic[0],
+    )
+    session = make_session(feed, websocket)
+
+    await feed._handle_message(
+        session,
+        json.dumps(
+            l2_book_message(
+                "BTC", bids=((99.0, 1.0),), asks=((101.0, 1.0),)
+            )
+        ),
+        OBSERVED_AT,
+    )
+    monotonic[0] = 5.0
+    later = OBSERVED_AT + timedelta(seconds=5)
+    await feed._handle_message(
+        session,
+        json.dumps(
+            l2_book_message(
+                "BTC", bids=((98.0, 1.0),), asks=((102.0, 1.0),)
+            )
+        ),
+        later,
+    )
+
+    assert session.coin_seen_initial_l2book == {"BTC": True, "UNI": False}
+    assert session.coin_first_l2book_at["BTC"] == OBSERVED_AT
+    assert session.coin_first_l2book_at["UNI"] is None
+    assert session.coin_last_l2book_at["BTC"] == later
+    assert session.coin_last_l2book_at["UNI"] is None
+    assert session.coin_last_l2book_monotonic["BTC"] == 5.0
+    assert session.coin_last_l2book_monotonic["UNI"] is None
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_logs_one_coin_silence_and_one_recovery_while_session_is_live(
+    caplog,
+):
+    websocket = FixtureWebSocket([])
+    monotonic = [0.0]
+    feed = HyperliquidOrderBookFeed(
+        "wss://test.invalid/ws",
+        ["BTC", "UNI"],
+        connect=lambda _url, **_kwargs: websocket,
+        monotonic=lambda: monotonic[0],
+        l2_silence_timeout_seconds=100.0,
+    )
+    session = make_session(feed, websocket)
+    caplog.set_level("WARNING", logger="radar.collectors.hyperliquid")
+
+    await feed._handle_message(
+        session,
+        json.dumps(
+            l2_book_message(
+                "BTC", bids=((99.0, 1.0),), asks=((101.0, 1.0),)
+            )
+        ),
+        OBSERVED_AT,
+    )
+    monotonic[0] = 21.0
+    await feed._handle_message(
+        session,
+        json.dumps(
+            l2_book_message(
+                "BTC", bids=((99.0, 1.0),), asks=((101.0, 1.0),)
+            )
+        ),
+        OBSERVED_AT + timedelta(seconds=21),
+    )
+    monotonic[0] = 22.0
+    await feed._handle_message(
+        session,
+        json.dumps(
+            l2_book_message(
+                "BTC", bids=((99.0, 1.0),), asks=((101.0, 1.0),)
+            )
+        ),
+        OBSERVED_AT + timedelta(seconds=22),
+    )
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "hyperliquid coin silence" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "coin=UNI" in warnings[0]
+
+    caplog.set_level("INFO", logger="radar.collectors.hyperliquid")
+    monotonic[0] = 23.0
+    await feed._handle_message(
+        session,
+        json.dumps(
+            l2_book_message(
+                "UNI", bids=((99.0, 1.0),), asks=((101.0, 1.0),)
+            )
+        ),
+        OBSERVED_AT + timedelta(seconds=23),
+    )
+    monotonic[0] = 24.0
+    await feed._handle_message(
+        session,
+        json.dumps(
+            l2_book_message(
+                "UNI", bids=((99.0, 1.0),), asks=((101.0, 1.0),)
+            )
+        ),
+        OBSERVED_AT + timedelta(seconds=24),
+    )
+
+    recoveries = [
+        record.getMessage()
+        for record in caplog.records
+        if "hyperliquid coin silence recovered" in record.getMessage()
+    ]
+    assert len(recoveries) == 1
+    assert "coin=UNI" in recoveries[0]
+    assert session.coin_silent == set()
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_subscription_response_validates_configured_request():
+    websocket = FixtureWebSocket([])
+    failures: list[tuple[str, Exception]] = []
+    feed = HyperliquidOrderBookFeed(
+        "wss://test.invalid/ws",
+        ["BTC"],
+        connect=lambda _url, **_kwargs: websocket,
+        error_handler=lambda venue, error: failures.append((venue, error)),
+    )
+    session = make_session(feed, websocket)
+
+    await feed._handle_message(
+        session,
+        json.dumps(subscription_ack("BTC")),
+        OBSERVED_AT,
+    )
+    assert failures == []
+    assert session.healthy is False
+
+    await feed._handle_message(
+        session,
+        json.dumps(
+            {
+                "channel": "subscriptionResponse",
+                "data": {
+                    "method": "subscribe",
+                    "subscription": {"type": "l2Book", "coin": "UNI"},
+                },
+            }
+        ),
+        OBSERVED_AT,
+    )
+    await feed._handle_message(
+        session,
+        json.dumps({"channel": "subscriptionResponse", "data": None}),
+        OBSERVED_AT,
+    )
+
+    assert len(failures) == 2
+    assert all(venue == "hyperliquid" for venue, _error in failures)
+
+
+def test_hyperliquid_new_session_resets_per_coin_readiness_and_silence_state():
+    feed = HyperliquidOrderBookFeed("wss://test.invalid/ws", ["BTC", "UNI"])
+
+    first = feed._new_session()
+    first.coin_seen_initial_l2book["BTC"] = True
+    first.coin_silent.add("UNI")
+    second = feed._new_session()
+
+    assert second.generation == first.generation + 1
+    assert second is not first
+    assert second.coin_seen_initial_l2book == {"BTC": False, "UNI": False}
+    assert second.coin_first_l2book_at == {"BTC": None, "UNI": None}
+    assert second.coin_last_l2book_at == {"BTC": None, "UNI": None}
+    assert second.coin_last_l2book_monotonic == {"BTC": None, "UNI": None}
+    assert second.coin_silent == set()

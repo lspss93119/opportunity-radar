@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypedDict
@@ -14,13 +16,15 @@ from radar.collectors.base import (
 )
 from radar.collectors.variational import VariationalCollector
 from radar.config import MarketConfig, RadarConfig
-from radar.market_data import LatestMarketData
+from radar.market_data import LatestMarketData, MarketAvailabilityDiagnostic
 from radar.state import RadarState
 from radar.storage.parquet import ParquetStorage
 
 UTC = timezone.utc
 SAMPLE_INTERVAL_SECONDS = 10
 HOURLY_CONTEXT_GRACE_SECONDS = 60
+MARKET_AVAILABILITY_FEED_SUMMARY_INTERVAL = 60
+LOGGER = logging.getLogger(__name__)
 
 
 class _CollectorOptions(TypedDict, total=False):
@@ -133,6 +137,11 @@ class MarketDataPipeline:
         )
         self._quoted_market_task: asyncio.Task[None] | None = None
         self._started = False
+        self._market_availability_reasons: dict[tuple[str, str, str], str] = {}
+        self._market_availability_counts: dict[
+            tuple[str, str, str], Counter[str]
+        ] = {}
+        self._market_availability_cycles = 0
 
     @classmethod
     def from_config(
@@ -332,24 +341,109 @@ class MarketDataPipeline:
                 resolved_sample_time, self.sampling_seconds
             ) != resolved_sample_time:
                 raise ValueError("sample_time must be aligned to a 10-second boundary")
-        batch = self._latest_market_data.build_batch(
-            self._markets,
-            sample_time=resolved_sample_time,
-            now=current_time,
-            stale_after_seconds=self._stale_after_seconds,
+        candidate_batch, diagnostics = (
+            self._latest_market_data.build_batch_with_diagnostics(
+                self._markets,
+                sample_time=resolved_sample_time,
+                now=current_time,
+                stale_after_seconds=self._stale_after_seconds,
+            )
         )
+        included_keys = {
+            (
+                diagnostic.venue,
+                diagnostic.venue_symbol,
+                diagnostic.canonical_symbol,
+            )
+            for diagnostic in diagnostics
+            if diagnostic.reason == "included"
+        }
+        self._record_market_availability(diagnostics)
         batch = CollectorBatch(
             market_snapshots=tuple(
                 snapshot
-                for snapshot in batch.market_snapshots
-                if snapshot.buy_10k_vwap is not None
-                and snapshot.sell_10k_vwap is not None
+                for snapshot in candidate_batch.market_snapshots
+                if (
+                    snapshot.venue,
+                    snapshot.venue_symbol,
+                    snapshot.canonical_symbol,
+                )
+                in included_keys
             )
         )
         self.state.apply_market_batch(batch)
         if self.storage is not None:
             self.storage.append(batch)
         return batch
+
+    def _record_market_availability(
+        self, diagnostics: Sequence[MarketAvailabilityDiagnostic]
+    ) -> None:
+        counts = Counter(diagnostic.reason for diagnostic in diagnostics)
+        self._market_availability_cycles += 1
+        LOGGER.info(
+            "market availability cycle configured=%d included=%d missing_view=%d "
+            "unready=%d stale=%d insufficient_buy_10k=%d "
+            "insufficient_sell_10k=%d insufficient_both_10k=%d",
+            len(diagnostics),
+            counts["included"],
+            counts["missing_view"],
+            counts["unready"],
+            counts["stale"],
+            counts["insufficient_buy_10k_depth"],
+            counts["insufficient_sell_10k_depth"],
+            counts["insufficient_both_10k_depth"],
+        )
+
+        for diagnostic in diagnostics:
+            key = (
+                diagnostic.venue,
+                diagnostic.venue_symbol,
+                diagnostic.canonical_symbol,
+            )
+            feed_counts = self._market_availability_counts.setdefault(key, Counter())
+            feed_counts[diagnostic.reason] += 1
+            previous_reason = self._market_availability_reasons.get(key)
+            if previous_reason != diagnostic.reason and (
+                diagnostic.reason != "included" or previous_reason is not None
+            ):
+                LOGGER.info(
+                    "market availability transition venue=%s venue_symbol=%s "
+                    "canonical_symbol=%s previous=%s reason=%s",
+                    diagnostic.venue,
+                    diagnostic.venue_symbol,
+                    diagnostic.canonical_symbol,
+                    previous_reason or "none",
+                    diagnostic.reason,
+                )
+            self._market_availability_reasons[key] = diagnostic.reason
+
+        if self._market_availability_cycles % MARKET_AVAILABILITY_FEED_SUMMARY_INTERVAL:
+            return
+        for key in sorted(self._market_availability_counts):
+            venue, venue_symbol, canonical_symbol = key
+            feed_counts = self._market_availability_counts[key]
+            if not any(
+                reason != "included" and count > 0
+                for reason, count in feed_counts.items()
+            ):
+                continue
+            LOGGER.info(
+                "market availability feed summary venue=%s venue_symbol=%s "
+                "canonical_symbol=%s included=%d missing_view=%d unready=%d "
+                "stale=%d insufficient_buy_10k=%d insufficient_sell_10k=%d "
+                "insufficient_both_10k=%d",
+                venue,
+                venue_symbol,
+                canonical_symbol,
+                feed_counts["included"],
+                feed_counts["missing_view"],
+                feed_counts["unready"],
+                feed_counts["stale"],
+                feed_counts["insufficient_buy_10k_depth"],
+                feed_counts["insufficient_sell_10k_depth"],
+                feed_counts["insufficient_both_10k_depth"],
+            )
 
     async def collect_hourly_once(
         self, *, now: datetime | None = None

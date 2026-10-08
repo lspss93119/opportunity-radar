@@ -75,6 +75,14 @@ class LatestMarketView:
         )
 
 
+@dataclass(frozen=True)
+class MarketAvailabilityDiagnostic:
+    venue: str
+    venue_symbol: str
+    canonical_symbol: str
+    reason: str
+
+
 class LatestMarketData:
     """Keep the newest complete normalized book for each configured feed."""
 
@@ -175,40 +183,116 @@ class LatestMarketData:
         now: datetime,
         stale_after_seconds: int,
     ) -> CollectorBatch:
+        batch, _diagnostics = self.build_batch_with_diagnostics(
+            markets,
+            sample_time=sample_time,
+            now=now,
+            stale_after_seconds=stale_after_seconds,
+        )
+        return batch
+
+    def build_batch_with_diagnostics(
+        self,
+        markets: Sequence[MarketConfig],
+        *,
+        sample_time: datetime,
+        now: datetime,
+        stale_after_seconds: int,
+    ) -> tuple[CollectorBatch, tuple[MarketAvailabilityDiagnostic, ...]]:
         sample_time = _require_utc(sample_time, "sample_time")
         now = _require_utc(now, "now")
         self._validate_stale_after(stale_after_seconds)
 
         snapshots: list[MarketSnapshot] = []
+        diagnostics: list[MarketAvailabilityDiagnostic] = []
         for market in markets:
             if not market.enabled:
                 continue
             view = self._views.get((market.venue, market.venue_symbol))
-            if view is None or not self._is_fresh(view, now, stale_after_seconds):
+            if view is None:
+                diagnostics.append(
+                    MarketAvailabilityDiagnostic(
+                        venue=market.venue,
+                        venue_symbol=market.venue_symbol,
+                        canonical_symbol=market.canonical_symbol,
+                        reason="missing_view",
+                    )
+                )
                 continue
 
-            snapshots.append(
-                MarketSnapshot(
-                    sample_time=sample_time,
-                    observed_at=view.observed_at,
-                    venue=view.venue,
-                    venue_symbol=view.venue_symbol,
+            snapshot, reason = self._build_market_snapshot(
+                market,
+                view,
+                sample_time=sample_time,
+                now=now,
+                stale_after_seconds=stale_after_seconds,
+            )
+            diagnostics.append(
+                MarketAvailabilityDiagnostic(
+                    venue=market.venue,
+                    venue_symbol=market.venue_symbol,
                     canonical_symbol=market.canonical_symbol,
-                    best_bid=view.bids[0].price,
-                    best_bid_size=view.bids[0].base_size,
-                    best_ask=view.asks[0].price,
-                    best_ask_size=view.asks[0].base_size,
-                    mark_price=view.mark_price,
-                    index_price=view.index_price,
-                    buy_1k_vwap=buy_vwap(list(view.asks), 1_000),
-                    sell_1k_vwap=sell_vwap(list(view.bids), 1_000),
-                    buy_5k_vwap=buy_vwap(list(view.asks), 5_000),
-                    sell_5k_vwap=sell_vwap(list(view.bids), 5_000),
-                    buy_10k_vwap=buy_vwap(list(view.asks), 10_000),
-                    sell_10k_vwap=sell_vwap(list(view.bids), 10_000),
+                    reason=reason,
                 )
             )
-        return CollectorBatch(market_snapshots=tuple(snapshots))
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return (
+            CollectorBatch(market_snapshots=tuple(snapshots)),
+            tuple(diagnostics),
+        )
+
+    def _build_market_snapshot(
+        self,
+        market: MarketConfig,
+        view: LatestMarketView,
+        *,
+        sample_time: datetime,
+        now: datetime,
+        stale_after_seconds: int,
+    ) -> tuple[MarketSnapshot | None, str]:
+        if not view.ready or not view.bids or not view.asks:
+            return None, "unready"
+        age_seconds = (now - view.observed_at).total_seconds()
+        if age_seconds < 0 or age_seconds > stale_after_seconds:
+            return None, "stale"
+
+        bids = list(view.bids)
+        asks = list(view.asks)
+        buy_1k = buy_vwap(asks, 1_000)
+        sell_1k = sell_vwap(bids, 1_000)
+        buy_5k = buy_vwap(asks, 5_000)
+        sell_5k = sell_vwap(bids, 5_000)
+        buy_10k = buy_vwap(asks, 10_000)
+        sell_10k = sell_vwap(bids, 10_000)
+        snapshot = MarketSnapshot(
+            sample_time=sample_time,
+            observed_at=view.observed_at,
+            venue=view.venue,
+            venue_symbol=view.venue_symbol,
+            canonical_symbol=market.canonical_symbol,
+            best_bid=bids[0].price,
+            best_bid_size=bids[0].base_size,
+            best_ask=asks[0].price,
+            best_ask_size=asks[0].base_size,
+            mark_price=view.mark_price,
+            index_price=view.index_price,
+            buy_1k_vwap=buy_1k,
+            sell_1k_vwap=sell_1k,
+            buy_5k_vwap=buy_5k,
+            sell_5k_vwap=sell_5k,
+            buy_10k_vwap=buy_10k,
+            sell_10k_vwap=sell_10k,
+        )
+        if buy_10k is None and sell_10k is None:
+            reason = "insufficient_both_10k_depth"
+        elif buy_10k is None:
+            reason = "insufficient_buy_10k_depth"
+        elif sell_10k is None:
+            reason = "insufficient_sell_10k_depth"
+        else:
+            reason = "included"
+        return snapshot, reason
 
     def ready_venues(
         self,

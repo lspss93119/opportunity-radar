@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,6 +32,7 @@ HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
 HYPERLIQUID_HEARTBEAT_INTERVAL_SECONDS = 50.0
 HYPERLIQUID_RECONNECT_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 L2_SILENCE_TIMEOUT_SECONDS = 20.0
+COIN_SILENCE_DIAGNOSTIC_SECONDS = 20.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -74,6 +75,13 @@ class _HyperliquidSession:
     pongs_received: int = 0
     healthy: bool = False
     disconnect_reason: str = "unknown"
+    coin_seen_initial_l2book: dict[str, bool] = field(default_factory=dict)
+    coin_first_l2book_at: dict[str, datetime | None] = field(default_factory=dict)
+    coin_last_l2book_at: dict[str, datetime | None] = field(default_factory=dict)
+    coin_last_l2book_monotonic: dict[str, float | None] = field(
+        default_factory=dict
+    )
+    coin_silent: set[str] = field(default_factory=set)
 
 
 def parse_hyperliquid_meta_and_asset_ctxs(
@@ -211,6 +219,7 @@ class HyperliquidOrderBookFeed:
         self._websocket: Any | None = None
         self._stopping = False
         self._session_generation = 0
+        self._active_session: _HyperliquidSession | None = None
         self.reconnect_count = 0
 
     @property
@@ -238,6 +247,7 @@ class HyperliquidOrderBookFeed:
             await asyncio.gather(task, return_exceptions=True)
         self._task = None
         self._websocket = None
+        self._active_session = None
         self._clear_snapshots()
 
     def snapshot(self, coin: str) -> HyperliquidOrderBookSnapshot | None:
@@ -261,6 +271,18 @@ class HyperliquidOrderBookFeed:
     def _invalidate_coin(self, coin: str) -> None:
         self._snapshots.pop(coin, None)
         self._notify_invalidate(coin)
+
+    def _new_session(self) -> _HyperliquidSession:
+        self._session_generation += 1
+        return _HyperliquidSession(
+            generation=self._session_generation,
+            websocket=None,
+            started_at=self._clock(),
+            coin_seen_initial_l2book={coin: False for coin in self._coins},
+            coin_first_l2book_at={coin: None for coin in self._coins},
+            coin_last_l2book_at={coin: None for coin in self._coins},
+            coin_last_l2book_monotonic={coin: None for coin in self._coins},
+        )
 
     async def _run(self) -> None:
         backoff_index = 0
@@ -289,12 +311,7 @@ class HyperliquidOrderBookFeed:
                 backoff_index = min(backoff_index + 1, len(self._reconnect_delays) - 1)
 
     async def _run_connection(self) -> bool:
-        self._session_generation += 1
-        session = _HyperliquidSession(
-            generation=self._session_generation,
-            websocket=None,
-            started_at=self._clock(),
-        )
+        session = self._new_session()
         receiver_task: asyncio.Task[None] | None = None
         heartbeat_task: asyncio.Task[None] | None = None
         l2_watchdog_task: asyncio.Task[None] | None = None
@@ -305,6 +322,7 @@ class HyperliquidOrderBookFeed:
                 session.last_l2_activity_monotonic = session.started_at_monotonic
                 session.l2_activity_event = asyncio.Event()
                 self._websocket = websocket
+                self._active_session = session
                 LOGGER.info(
                     "hyperliquid websocket connected venue=%s session=%d",
                     self._venue,
@@ -363,6 +381,8 @@ class HyperliquidOrderBookFeed:
                 await asyncio.gather(*tasks, return_exceptions=True)
             if self._websocket is session.websocket:
                 self._websocket = None
+            if self._active_session is session:
+                self._active_session = None
             now = self._clock()
             session_seconds = max(
                 0.0, (now - session.started_at).total_seconds()
@@ -377,11 +397,16 @@ class HyperliquidOrderBookFeed:
                 last_l2book_age = max(
                     0.0, (now - session.last_l2book_at).total_seconds()
                 )
+            missing_initial_l2books = ",".join(
+                coin
+                for coin in self._coins
+                if not session.coin_seen_initial_l2book.get(coin, False)
+            ) or "none"
             LOGGER.info(
                 "hyperliquid websocket disconnected venue=%s session=%d "
                 "reason=%s session_seconds=%.3f last_message_age_seconds=%s "
                 "last_l2book_age_seconds=%s pings_sent=%d pongs_received=%d "
-                "healthy=%s",
+                "healthy=%s missing_initial_l2books=%s",
                 self._venue,
                 session.generation,
                 session.disconnect_reason,
@@ -391,6 +416,7 @@ class HyperliquidOrderBookFeed:
                 session.pings_sent,
                 session.pongs_received,
                 session.healthy,
+                missing_initial_l2books,
             )
         return session.healthy
 
@@ -492,6 +518,7 @@ class HyperliquidOrderBookFeed:
 
         channel = message.get("channel")
         if channel == "subscriptionResponse":
+            self._handle_subscription_response(session, message)
             return
         if message.get("method") == "ping":
             await websocket.send(json.dumps({"method": "pong"}))
@@ -535,10 +562,13 @@ class HyperliquidOrderBookFeed:
             observed_at=received_at,
         )
         self._snapshots[coin] = snapshot
-        session.last_l2_activity_monotonic = self._monotonic()
+        monotonic_now = self._monotonic()
+        session.last_l2_activity_monotonic = monotonic_now
         if session.l2_activity_event is not None:
             session.l2_activity_event.set()
         session.last_l2book_at = received_at
+        self._record_coin_l2book(session, coin, received_at, monotonic_now)
+        self._check_coin_silence(session, monotonic_now)
         if session.first_l2book_at is None:
             session.first_l2book_at = received_at
             first_l2book_seconds = max(
@@ -575,6 +605,111 @@ class HyperliquidOrderBookFeed:
         except Exception as error:  # noqa: BLE001
             self._invalidate_coin(coin)
             report_collector_error(self._error_handler, self._venue, error)
+
+    def _handle_subscription_response(
+        self, session: _HyperliquidSession, message: dict[str, object]
+    ) -> None:
+        data = message.get("data")
+        if not isinstance(data, dict):
+            report_collector_error(
+                self._error_handler,
+                self._venue,
+                ValueError("subscriptionResponse data must be an object"),
+            )
+            return
+        method = data.get("method")
+        subscription = data.get("subscription")
+        subscription_type = (
+            subscription.get("type") if isinstance(subscription, dict) else None
+        )
+        coin = subscription.get("coin") if isinstance(subscription, dict) else None
+        if (
+            method != "subscribe"
+            or subscription_type != "l2Book"
+            or not isinstance(coin, str)
+            or coin not in self._coin_set
+        ):
+            report_collector_error(
+                self._error_handler,
+                self._venue,
+                ValueError(
+                    "unexpected subscriptionResponse "
+                    f"method={method!r} type={subscription_type!r} coin={coin!r}"
+                ),
+            )
+            return
+        LOGGER.debug(
+            "hyperliquid websocket subscription response venue=%s session=%d "
+            "method=%s subscription_type=%s coin=%s",
+            self._venue,
+            session.generation,
+            method,
+            subscription_type,
+            coin,
+        )
+
+    def _record_coin_l2book(
+        self,
+        session: _HyperliquidSession,
+        coin: str,
+        received_at: datetime,
+        monotonic_now: float,
+    ) -> None:
+        previous_monotonic = session.coin_last_l2book_monotonic.get(coin)
+        if coin in session.coin_silent:
+            silence_reference = (
+                session.started_at_monotonic
+                if previous_monotonic is None
+                else previous_monotonic
+            )
+            LOGGER.info(
+                "hyperliquid coin silence recovered venue=%s coin=%s "
+                "age_seconds=%.3f session=%d",
+                self._venue,
+                coin,
+                max(0.0, monotonic_now - silence_reference),
+                session.generation,
+            )
+            session.coin_silent.remove(coin)
+        session.coin_seen_initial_l2book[coin] = True
+        if session.coin_first_l2book_at.get(coin) is None:
+            session.coin_first_l2book_at[coin] = received_at
+        session.coin_last_l2book_at[coin] = received_at
+        session.coin_last_l2book_monotonic[coin] = monotonic_now
+
+    def _check_coin_silence(
+        self, session: _HyperliquidSession, monotonic_now: float
+    ) -> None:
+        for coin in self._coins:
+            if coin in session.coin_silent:
+                continue
+            if session.coin_seen_initial_l2book.get(coin, False):
+                reference = session.coin_last_l2book_monotonic.get(coin)
+                if reference is None:
+                    continue
+                state = "last_l2book"
+            else:
+                if not any(
+                    other != coin
+                    and session.coin_seen_initial_l2book.get(other, False)
+                    for other in self._coins
+                ):
+                    continue
+                reference = session.started_at_monotonic
+                state = "initial_missing"
+            age_seconds = monotonic_now - reference
+            if age_seconds <= COIN_SILENCE_DIAGNOSTIC_SECONDS:
+                continue
+            session.coin_silent.add(coin)
+            LOGGER.warning(
+                "hyperliquid coin silence venue=%s coin=%s state=%s "
+                "age_seconds=%.3f session=%d",
+                self._venue,
+                coin,
+                state,
+                age_seconds,
+                session.generation,
+            )
 
 
 class HyperliquidCollector:
