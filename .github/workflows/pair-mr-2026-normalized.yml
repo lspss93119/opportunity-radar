@@ -1,0 +1,30 @@
+name: Pair MR 2026 Normalized
+
+on:
+  push:
+    branches:
+      - research/pair-mr-long-backtest-20261008
+    paths:
+      - "research/pair_mr_2026_normalized.py"
+      - ".github/workflows/pair-mr-2026-normalized.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip pandas numpy requests
+      - run: python research/pair_mr_2026_normalized.py
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pair-mr-2026-normalized
+          path: research_outputs/pair_mr_2026_normalized/
+          if-no-files-found: warn
