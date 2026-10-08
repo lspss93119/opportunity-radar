@@ -25,8 +25,12 @@ def load_symbol(sym):
         url=f"https://data.binance.vision/data/spot/daily/klines/{sym}/1m/{sym}-1m-2026-10-{d:02d}.zip"
         frames.append(read_zip_csv(url))
     df=pd.concat(frames,ignore_index=True)
-    ts=pd.to_datetime(df.open_time,unit="ms",utc=True)
-    s=pd.Series(df.close.astype(float).to_numpy(),index=ts,name=sym)
+    raw=pd.to_numeric(df.open_time, errors="coerce")
+    # Binance Vision switched spot archive timestamps to microseconds in 2025.
+    unit="us" if raw.dropna().median() > 1e14 else "ms"
+    ts=pd.to_datetime(raw,unit=unit,utc=True,errors="coerce")
+    s=pd.Series(pd.to_numeric(df.close, errors="coerce").to_numpy(),index=ts,name=sym)
+    s=s[~s.index.isna()]
     s=s[(s.index>=START)&(s.index<=END)]
     return s[~s.index.duplicated(keep="last")].sort_index()
 
@@ -54,6 +58,9 @@ for i,(ts,r) in enumerate(df.iterrows()):
         rows.append((i,ts,x,r.btc,r.eth,r.btc24,r.rv24))
         armed=False
 ep=pd.DataFrame(rows,columns=["i","entry_time","d4h","btc0","eth0","btc24","rv24"])
+if ep.empty:
+    raise RuntimeError(f"No episodes generated; BTC rows={len(btc)} ETH rows={len(eth)} first_btc={btc.index.min()} last_btc={btc.index.max()}")
+ep["entry_time"]=pd.to_datetime(ep["entry_time"],utc=True)
 
 b=df.btc.to_numpy(); e=df.eth.to_numpy()
 def pnl(row,h):
