@@ -230,25 +230,79 @@ nav a[aria-current="page"] { background: #374151; color: #fff; }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 18px; }
 .card { background: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 14px; overflow-wrap: anywhere; }
 .metric-value { margin-top: 6px; font-size: 1rem; }
-#filters, #anomaly-filters { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; margin-bottom: 16px; }
+#filters, #anomaly-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 9px 10px; align-items: end; margin-bottom: 12px; }
 label { display: grid; gap: 5px; font-size: .78rem; color: #cbd5e1; }
 input, button { font: inherit; color: #e5e7eb; background: #1f2937; border: 1px solid #4b5563; border-radius: 5px; padding: 8px; }
 input { width: 130px; }
 input[type="checkbox"] { width: auto; }
 .check { display: flex; align-items: center; padding: 8px 0; }
-button { cursor: pointer; }
+button { cursor: pointer; min-height: 36px; }
+.filter-actions { display: flex; gap: 8px; align-items: end; }
 a:focus-visible, input:focus-visible, button:focus-visible { outline: 2px solid #93c5fd; outline-offset: 3px; }
 .section { min-width: 0; margin-bottom: 20px; }
-.table-wrap { overflow-x: auto; border: 1px solid #374151; border-radius: 8px; }
+.table-wrap { position: relative; overflow-x: auto; border: 1px solid #374151; border-radius: 8px; scrollbar-color: #64748b #1f2937; }
 table { width: 100%; border-collapse: collapse; background: #1f2937; font-size: .8rem; }
 th, td { padding: 10px; text-align: left; border-bottom: 1px solid #374151; white-space: nowrap; font-variant-numeric: tabular-nums; }
 th { color: #cbd5e1; font-size: .74rem; }
 tr:last-child td { border-bottom: 0; }
 td small { display: block; color: #94a3b8; margin-top: 3px; }
+.table-scroll-hint { display: block; margin: 6px 2px 0; text-align: right; color: #64748b; font-size: .7rem; }
 .healthy { color: #6ee7b7; }
 .degraded { color: #fcd34d; }
 .down, .error { color: #fca5a5; }
 .error { margin: 8px 0; overflow-wrap: anywhere; font-size: .82rem; }
+.state-badge { display: inline-flex; align-items: center; min-height: 23px; padding: 3px 7px; border: 1px solid currentColor; border-radius: 999px; font-size: .7rem; font-weight: 600; line-height: 1.1; }
+.state-eligible { color: #6ee7b7; background: #064e3b; }
+.state-pending, .state-unavailable { color: #fcd34d; background: #422006; }
+.state-stale { color: #fca5a5; background: #450a0a; }
+.state-depth-unavailable { color: #fdba74; background: #431407; }
+.state-cell { white-space: normal; }
+.direction-label { display: block; color: #94a3b8; font-size: .65rem; font-weight: 700; letter-spacing: .08em; }
+.route-cell { min-width: 150px; white-space: normal; }
+.numeric { text-align: right; }
+.edge-value { font-weight: 700; }
+.edge-positive { color: #6ee7b7; }
+.edge-negative { color: #fca5a5; }
+.edge-zero { color: #e5e7eb; }
+.edge-unavailable { color: #94a3b8; }
+.unavailable { color: #94a3b8; }
+#opportunities-view { --opportunity-symbol-width: 82px; --opportunity-long-width: 160px; --opportunity-short-width: 160px; --opportunity-state-width: 140px; }
+.opportunity-table { min-width: 1320px; border-collapse: separate; border-spacing: 0; }
+.opportunity-table th, .opportunity-table td { position: relative; }
+.opportunity-table th:nth-child(1), .opportunity-table td:nth-child(1) { width: var(--opportunity-symbol-width); min-width: var(--opportunity-symbol-width); max-width: var(--opportunity-symbol-width); }
+.opportunity-table th:nth-child(2), .opportunity-table td:nth-child(2) { width: var(--opportunity-long-width); min-width: var(--opportunity-long-width); }
+.opportunity-table th:nth-child(3), .opportunity-table td:nth-child(3) { width: var(--opportunity-short-width); min-width: var(--opportunity-short-width); }
+.opportunity-table th:nth-child(4), .opportunity-table td:nth-child(4) { width: var(--opportunity-state-width); min-width: var(--opportunity-state-width); }
+.opportunity-table th:nth-child(5), .opportunity-table td:nth-child(5) { min-width: 105px; }
+.opportunity-table th:nth-child(6), .opportunity-table td:nth-child(6) { min-width: 105px; }
+.opportunity-table th:nth-child(7), .opportunity-table td:nth-child(7) { min-width: 140px; }
+.opportunity-table th:nth-child(8), .opportunity-table td:nth-child(8) { min-width: 125px; }
+.opportunity-table th:nth-child(9), .opportunity-table td:nth-child(9) { min-width: 90px; }
+.opportunity-table th:nth-child(10), .opportunity-table td:nth-child(10) { min-width: 95px; }
+.opportunity-table th:nth-child(11), .opportunity-table td:nth-child(11) { min-width: 80px; }
+.opportunity-table th:nth-child(12), .opportunity-table td:nth-child(12) { min-width: 80px; }
+.opportunity-table thead th { position: sticky; top: 0; z-index: 10; background: #243244; }
+.opportunity-table th:nth-child(-n+4), .opportunity-table td:nth-child(-n+4) { position: sticky; z-index: 4; background: #1f2937; }
+.opportunity-table thead th:nth-child(-n+4) { z-index: 20; background: #243244; }
+.opportunity-table th:nth-child(1), .opportunity-table td:nth-child(1) { left: 0; }
+.opportunity-table th:nth-child(2), .opportunity-table td:nth-child(2) { left: var(--opportunity-symbol-width); }
+.opportunity-table th:nth-child(3), .opportunity-table td:nth-child(3) { left: calc(var(--opportunity-symbol-width) + var(--opportunity-long-width)); }
+.opportunity-table th:nth-child(4), .opportunity-table td:nth-child(4) { left: calc(var(--opportunity-symbol-width) + var(--opportunity-long-width) + var(--opportunity-short-width)); box-shadow: 7px 0 12px -10px #020617; }
+.opportunity-table tbody tr:hover td:nth-child(-n+4) { background: #26364a; }
+.opportunity-table .symbol-cell { overflow: hidden; text-overflow: ellipsis; }
+.opportunity-table .edge-value { font-size: .84rem; }
+#anomalies-view { --anomaly-symbol-width: 82px; --anomaly-long-width: 180px; --anomaly-short-width: 180px; }
+.anomaly-table { min-width: 1080px; border-collapse: separate; border-spacing: 0; }
+.anomaly-table thead th { position: sticky; top: 0; z-index: 10; background: #243244; }
+.anomaly-table th:nth-child(-n+3), .anomaly-table td:nth-child(-n+3) { position: sticky; z-index: 4; background: #1f2937; }
+.anomaly-table thead th:nth-child(-n+3) { z-index: 20; background: #243244; }
+.anomaly-table th:nth-child(1), .anomaly-table td:nth-child(1) { width: var(--anomaly-symbol-width); min-width: var(--anomaly-symbol-width); left: 0; }
+.anomaly-table th:nth-child(2), .anomaly-table td:nth-child(2) { width: var(--anomaly-long-width); min-width: var(--anomaly-long-width); left: var(--anomaly-symbol-width); }
+.anomaly-table th:nth-child(3), .anomaly-table td:nth-child(3) { width: var(--anomaly-short-width); min-width: var(--anomaly-short-width); left: calc(var(--anomaly-symbol-width) + var(--anomaly-long-width)); box-shadow: 7px 0 12px -10px #020617; }
+#pair-summary .card:nth-child(-n+3) { border-color: #475569; }
+#pair-chart { overflow: hidden; }
+#pair-chart svg text { font-variant-numeric: tabular-nums; }
+#pair-chart .axis-tick { stroke: #334155; }
 [data-view="opportunities"] #status-view, [data-view="opportunities"] #pair-view, [data-view="opportunities"] #anomalies-view,
 [data-view="status"] #opportunities-view, [data-view="status"] #pair-view, [data-view="status"] #anomalies-view,
 [data-view="pair"] #opportunities-view, [data-view="pair"] #status-view, [data-view="pair"] #anomalies-view,
@@ -258,6 +312,7 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 .chart-legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0; font-size: .8rem; }
 .raw-color { color: #93c5fd; } .mean-color { color: #fcd34d; } .current-color { color: #6ee7b7; }
 @media(max-width: 760px) { main { padding: 14px; } #filters label:not(.check), #anomaly-filters label:not(.check) { flex: 1 1 130px; } input { width: 100%; } }
+@media(max-width: 760px) { #opportunities-view { --opportunity-symbol-width: 72px; --opportunity-long-width: 128px; --opportunity-short-width: 128px; --opportunity-state-width: 120px; } th, td { padding: 8px; } .table-scroll-hint { text-align: left; } }
 </style>
 </head>
 <body data-view="__VIEW__">
@@ -274,9 +329,10 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 <label>Long venue<input id="anomaly-long-venue" name="long_venue" placeholder="All venues"></label>
 <label>Short venue<input id="anomaly-short-venue" name="short_venue" placeholder="All venues"></label>
 <label class="check"><input id="anomaly-eligible-only" name="eligible_only" type="checkbox">TG eligible only</label>
-<button type="submit">Apply filters</button><button id="anomaly-reset" type="button">Reset</button>
+<span class="filter-actions"><button type="submit">Apply filters</button><button id="anomaly-reset" type="button">Reset</button></span>
 </form>
-<div class="table-wrap"><table aria-label="Active anomalies"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>Current</th><th>Reference</th><th>Deviation</th><th>Age</th><th>Peak</th><th>12h / 24h / 48h</th><th>Alignment</th><th>Telegram</th></tr></thead><tbody id="anomaly-rows"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody></table></div>
+<div class="table-wrap"><table class="anomaly-table" aria-label="Active anomalies"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>Current</th><th>Reference</th><th>Deviation</th><th>Age</th><th>Peak</th><th>12h / 24h / 48h</th><th>Alignment</th><th>Telegram</th></tr></thead><tbody id="anomaly-rows"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody></table></div>
+<span class="table-scroll-hint">Scroll horizontally for lifecycle detail →</span>
 </section>
 <section id="opportunities-view">
 <form id="filters">
@@ -289,17 +345,18 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 <label>Basis state<select id="basis_state" name="basis_state"><option value="">All states</option><option value="eligible">Eligible</option><option value="pending">Baseline pending</option><option value="unavailable">Baseline unavailable</option></select></label>
 <label>Limit<input id="limit" name="limit" type="number" min="1" max="512" step="1" placeholder="512"></label>
 <label class="check"><input id="active_only" name="active_only" type="checkbox">Active only</label>
-<button type="submit">Apply filters</button><button id="reset" type="button">Reset</button>
+<span class="filter-actions"><button type="submit">Apply filters</button><button id="reset" type="button">Reset</button></span>
 </form>
 <p class="muted">Actionable routes first · convergence edge after RT fee descending · RT fee and edge are display-only · Duration comes from persisted SQLite episodes.</p>
-<div class="table-wrap"><table aria-label="Opportunities"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>State</th><th>Raw spread</th><th>Current net spread</th><th>Baseline</th><th>Edge after RT fee</th><th>Std</th><th>RT Fee</th><th>Freshness / skew</th><th>Depth</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="12" class="muted">Loading…</td></tr></tbody></table></div>
+<div class="table-wrap"><table aria-label="Opportunities" class="opportunity-table"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>State</th><th>Edge after RT fee</th><th>Current net spread</th><th>Baseline</th><th>Freshness / skew</th><th>Depth</th><th>Raw spread</th><th>Std</th><th>RT Fee</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="12" class="muted">Loading…</td></tr></tbody></table></div>
+<span class="table-scroll-hint">Scroll horizontally for lower-priority spread detail →</span>
 </section>
 <section id="status-view">
 <div class="metrics">
 <div class="card"><div class="metric-label">Radar heartbeat</div><div id="heartbeat" class="metric-value">Unavailable</div></div>
 <div class="card"><div class="metric-label">Latest sample / age</div><div id="sample" class="metric-value">Unavailable</div></div>
-<div class="card"><div class="metric-label">Latest / configured feeds</div><div id="feeds" class="metric-value">Unavailable</div></div>
-<div class="card"><div class="metric-label">Healthy / primary VWAP ready</div><div id="primary" class="metric-value">Unavailable</div></div>
+<div class="card"><div class="metric-label">Rows at latest sample / configured feeds</div><div id="feeds" class="metric-value">Unavailable</div></div>
+<div class="card"><div class="metric-label">Healthy feeds / primary VWAP ready</div><div id="primary" class="metric-value">Unavailable</div></div>
 <div class="card"><div class="metric-label">Parquet read / file evidence</div><div id="parquet" class="metric-value">Unavailable</div></div>
 <div class="card"><div class="metric-label">SQLite read status</div><div id="sqlite" class="metric-value">Unavailable</div></div>
 <div class="card"><div class="metric-label">Active / confirmed / alerted episodes</div><div id="episodes-count" class="metric-value">Unavailable</div></div>
@@ -323,17 +380,25 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 <script>
 const byId = id => document.getElementById(id);
 const esc = value => String(value ?? 'Unavailable').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-const number = value => typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : 'Unavailable';
-const age = value => typeof value !== 'number' || !Number.isFinite(value) ? 'Unavailable' : value < 60 ? Math.round(value) + 's' : Math.floor(value / 60) + 'm ' + Math.round(value % 60) + 's';
+const number = value => typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : '—';
+const age = value => typeof value !== 'number' || !Number.isFinite(value) ? '—' : value < 60 ? Math.round(value) + 's' : Math.floor(value / 60) + 'm ' + Math.round(value % 60) + 's';
+const compactUtc = value => {
+  if (typeof value !== 'string' || !value) return '—';
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(value) || !Number.isFinite(Date.parse(value))) return value;
+  const date = new Date(value), pad = part => String(part).padStart(2, '0');
+  return date.getUTCFullYear() + '-' + pad(date.getUTCMonth() + 1) + '-' + pad(date.getUTCDate()) +
+    ' ' + pad(date.getUTCHours()) + ':' + pad(date.getUTCMinutes()) + ':' + pad(date.getUTCSeconds()) + 'Z';
+};
 const statusClass = value => ['healthy','degraded','down'].includes(value) ? value : 'degraded';
 const text = (id, value) => { byId(id).textContent = value ?? 'Unavailable'; };
 const emptyRow = (columns, message) => '<tr><td colspan="' + columns + '" class="muted">' + esc(message) + '</td></tr>';
-const cell = value => '<td>' + esc(value) + '</td>';
+const cell = (value, className = '') => '<td class="' + className + (value === null || value === undefined || value === '' ? ' unavailable' : '') + '">' + esc(value === null || value === undefined || value === '' ? '—' : value) + '</td>';
 const filterNames = ['symbol','long_venue','short_venue','max_std','min_edge','min_duration','basis_state','limit'];
 const anomalyFilterNames = ['symbol','long_venue','short_venue'];
 const isStatus = location.pathname === '/status';
 const isPair = location.pathname === '/pair';
 const isAnomalies = location.pathname === '/anomalies';
+const isOpportunities = !isStatus && !isPair && !isAnomalies;
 if (!isPair) byId(isAnomalies ? 'nav-anomalies' : isStatus ? 'nav-status' : 'nav-opportunities').setAttribute?.('aria-current', 'page');
 function restoreFilters() {
   const query = new URLSearchParams(location.search);
@@ -381,30 +446,40 @@ function pairLink(row) {
 function pairCell(row, symbolField) {
   const link = pairLink(row);
   const symbol = esc(row[symbolField]);
-  return link ? '<td><a href="' + esc(link) + '">' + symbol + '</a></td>' : '<td>' + symbol + '<small>Exact identity unavailable</small></td>';
+  return link ? '<td class="symbol-cell"><a href="' + esc(link) + '">' + symbol + '</a></td>' : '<td class="symbol-cell">' + symbol + '<small>Exact identity unavailable</small></td>';
+}
+function directionCell(row, venueField, symbolField, direction) {
+  return '<td class="route-cell"><span class="direction-label">' + direction + '</span>' + esc(row[venueField]) + '<small>' + esc(row[symbolField]) + '</small></td>';
 }
 function renderOpportunities(data) {
   const stateLabel = state => ({eligible:'Eligible',pending:'Baseline pending',unavailable:'Baseline unavailable',stale:'Stale',depth_unavailable:'Depth unavailable'}[state] ?? 'Unavailable');
-  const stateClass = state => state === 'eligible' ? 'healthy' : state === 'stale' || state === 'depth_unavailable' ? 'down' : 'degraded';
-  const baseline = row => number(row.rolling_mean_bps) + '<small>' + (typeof row.basis_coverage === 'number' ? number(row.basis_coverage * 100) + '% coverage' : 'Coverage unavailable') + '</small>';
-  const freshness = row => age(row.freshness_seconds) + ' / ' + age(row.observed_at_skew_seconds);
+  const stateClass = state => 'state-badge state-' + ({eligible:'eligible',pending:'pending',unavailable:'unavailable',stale:'stale',depth_unavailable:'depth-unavailable'}[state] ?? 'unavailable');
+  const baseline = row => row.basis_state === 'eligible' && typeof row.rolling_mean_bps === 'number'
+    ? number(row.rolling_mean_bps) + '<small>' + (typeof row.basis_coverage === 'number' ? number(row.basis_coverage * 100) + '% cov' : '—') + '</small>'
+    : '<span class="unavailable">—</span>';
+  const freshness = row => 'age ' + age(row.freshness_seconds) + ' · skew ' + age(row.observed_at_skew_seconds);
+  const edgeClass = value => typeof value !== 'number' || !Number.isFinite(value) ? 'edge-unavailable' : value > 0 ? 'edge-positive' : value < 0 ? 'edge-negative' : 'edge-zero';
+  const sampleTitle = row => typeof row.sample_time === 'string' ? esc(row.sample_time) : '';
   byId('opportunity-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
     pairCell(row, 'canonical_symbol') +
-    '<td>' + esc(row.long_venue) + '<small>' + esc(row.long_venue_symbol) + '</small></td>' +
-    '<td>' + esc(row.short_venue) + '<small>' + esc(row.short_venue_symbol) + '</small></td>' +
-    '<td class="' + stateClass(row.state) + '">' + esc(stateLabel(row.state)) + '</td>' +
-    cell(number(row.current_raw_spread_bps)) + cell(number(row.current_net_spread_bps)) +
-    '<td>' + baseline(row) + '</td>' + cell(number(row.convergence_edge_bps)) +
-    cell(number(row.rolling_std_bps)) + cell(number(row.round_trip_fee_bps)) +
-    '<td title="' + esc(row.sample_time) + '">' + esc(freshness(row)) + '</td>' +
-    '<td class="' + (row.primary_depth_status === 'available' ? 'healthy' : 'down') + '">' + esc(row.primary_depth_status ?? 'Unavailable') + '</td></tr>'
+    directionCell(row, 'long_venue', 'long_venue_symbol', 'LONG') +
+    directionCell(row, 'short_venue', 'short_venue_symbol', 'SHORT') +
+    '<td class="state-cell"><span class="' + stateClass(row.state) + '">' + esc(stateLabel(row.state)) + '</span></td>' +
+    cell(number(row.convergence_edge_bps), 'numeric edge-value ' + edgeClass(row.convergence_edge_bps)) +
+    cell(number(row.current_net_spread_bps), 'numeric') +
+    '<td>' + baseline(row) + '</td>' +
+    '<td title="' + sampleTitle(row) + '">' + esc(freshness(row)) + '</td>' +
+    cell(row.primary_depth_status === 'available' ? 'available' : '—', row.primary_depth_status === 'available' ? 'healthy' : 'unavailable') +
+    cell(number(row.current_raw_spread_bps), 'numeric') +
+    cell(number(row.rolling_std_bps), 'numeric') +
+    cell(number(row.round_trip_fee_bps), 'numeric') + '</tr>'
   ).join('') || emptyRow(12, data.status === 'healthy' ? 'No matching opportunities' : 'No matching rows — degraded or unavailable data');
 }
 function renderAnomalies(data) {
   byId('anomaly-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
     pairCell({...row, canonical_symbol: row.symbol}, 'symbol') +
-    cell((row.long_venue ?? 'Unavailable') + ' · ' + (row.long_venue_symbol ?? 'Unavailable')) +
-    cell((row.short_venue ?? 'Unavailable') + ' · ' + (row.short_venue_symbol ?? 'Unavailable')) +
+    directionCell(row, 'long_venue', 'long_venue_symbol', 'LONG') +
+    directionCell(row, 'short_venue', 'short_venue_symbol', 'SHORT') +
     cell(number(row.current_spread_bps)) + cell(number(row.reference_mean_bps)) +
     cell(number(row.current_deviation_bps)) + cell(age(row.episode_age_seconds)) +
     cell(number(row.post_confirmation_peak_deviation_bps)) +
@@ -413,14 +488,15 @@ function renderAnomalies(data) {
 }
 function renderStatus(data) {
   const overall = data.overall || {}, heartbeat = data.heartbeat || {};
-  text('heartbeat', (heartbeat.status ?? 'Unavailable') + ' · ' + age(heartbeat.age_seconds) + ' · ' + (heartbeat.updated_at ?? 'Unavailable'));
-  text('sample', (data.data_as_of ?? 'Unavailable') + ' · ' + age(data.sample_age_seconds));
-  text('feeds', (overall.latest_feeds ?? 'Unavailable') + ' / ' + (overall.configured_feeds ?? 'Unavailable'));
-  text('primary', (overall.healthy_feeds ?? 'Unavailable') + ' / ' + (overall.primary_vwap_ready ?? 'Unavailable'));
+  const metric = (id, value, title) => { const element = byId(id); element.textContent = value ?? '—'; if (title) element.title = title; };
+  metric('heartbeat', (heartbeat.status ?? '—') + ' · age ' + age(heartbeat.age_seconds) + ' · ' + compactUtc(heartbeat.updated_at), heartbeat.updated_at);
+  metric('sample', compactUtc(data.data_as_of) + ' · age ' + age(data.sample_age_seconds), data.data_as_of);
+  metric('feeds', (overall.latest_feeds ?? '—') + ' / ' + (overall.configured_feeds ?? '—'));
+  metric('primary', (overall.healthy_feeds ?? '—') + ' / ' + (overall.primary_vwap_ready ?? '—'));
   const parquet = data.parquet || {};
-  text('parquet', (parquet.status ?? 'Unavailable') + ' · files: ' + (parquet.files_considered ?? 'Unavailable') + ' · latest file mtime: ' + (parquet.latest_file_mtime ?? 'Unavailable'));
-  text('sqlite', data.sqlite?.status);
-  text('episodes-count', [overall.active_episodes,overall.confirmed_candidates,overall.active_alerted_episodes].map(value => value ?? 'Unavailable').join(' / '));
+  metric('parquet', (parquet.status ?? '—') + ' · files: ' + (parquet.files_considered ?? '—') + ' · latest file mtime: ' + compactUtc(parquet.latest_file_mtime), parquet.latest_file_mtime);
+  metric('sqlite', data.sqlite?.status);
+  metric('episodes-count', [overall.active_episodes,overall.confirmed_candidates,overall.active_alerted_episodes].map(value => value ?? '—').join(' / '));
   byId('venues').innerHTML = Object.entries(data.venues || {}).map(([venue, value]) => '<tr>' +
     [venue,value.expected,value.available,value.latest,value.missing,age(value.max_observation_age_seconds)].map(cell).join('') + '</tr>').join('') || emptyRow(6, 'Venue evidence unavailable');
   byId('feed-rows').innerHTML = (data.feeds || []).map(feed => '<tr>' +
@@ -440,16 +516,19 @@ function restorePairRange() {
 }
 function renderPair(data) {
   const identity = data.identity || {}, current = data.current || {}, basis = data.basis || {}, lifecycle = data.lifecycle || {};
-  text('pair-identity', (identity.canonical_symbol ?? 'Unavailable') + ' · Long ' +
-    (identity.long_venue ?? 'Unavailable') + ' / ' + (identity.long_venue_symbol ?? 'Unavailable') + ' → Short ' +
-    (identity.short_venue ?? 'Unavailable') + ' / ' + (identity.short_venue_symbol ?? 'Unavailable'));
+  const disabledMapping = (data.errors || []).some(error => String(error).includes('not an enabled configured mapping'));
+  text('pair-identity', disabledMapping
+    ? 'This persisted route is no longer an enabled mapping in the current production universe.'
+    : (identity.canonical_symbol ?? 'Unavailable') + ' · Long ' +
+      (identity.long_venue ?? 'Unavailable') + ' / ' + (identity.long_venue_symbol ?? 'Unavailable') + ' → Short ' +
+      (identity.short_venue ?? 'Unavailable') + ' / ' + (identity.short_venue_symbol ?? 'Unavailable'));
   const metrics = [
-    ['Raw spread (bps)',number(current.raw_spread_bps)], ['Current net spread (bps)',number(current.current_net_spread_bps)], ['24h Mean (bps)',number(current.rolling_mean_bps)],
-    ['24h Std (bps)',number(current.rolling_std_bps)], ['Deviation (bps)',number(current.deviation_bps)],
+    ['Raw spread (bps)',number(current.raw_spread_bps)], ['Current net spread (bps)',number(current.current_net_spread_bps)], ['Convergence edge after RT fee (bps, display-only)',number(current.theoretical_edge_bps)],
+    ['24h Mean (bps)',number(current.rolling_mean_bps)], ['24h Std (bps)',number(current.rolling_std_bps)], ['Deviation (bps)',number(current.deviation_bps)],
+    ['Observed skew (s)',number(current.observed_at_skew_seconds)], ['Freshness (s)',number(current.freshness_seconds)],
     ['Signal duration (persisted)',age(current.signal_duration_seconds)],
     ['Long $10k buy VWAP',number(current.long_buy_vwap)], ['Short $10k sell VWAP',number(current.short_sell_vwap)],
-    ['RT Fee (bps, display-only)',number(current.round_trip_fee_bps)], ['Convergence edge after RT fee (bps, display-only)',number(current.theoretical_edge_bps)],
-    ['Observed skew (s)',number(current.observed_at_skew_seconds)], ['Freshness (s)',number(current.freshness_seconds)],
+    ['RT Fee (bps, display-only)',number(current.round_trip_fee_bps)],
     ['Sample time (UTC)',current.sample_time ?? 'Unavailable'],
     ['Lifecycle (persisted)',lifecycle.available ? 'Active · confirmed: ' + (lifecycle.candidate_confirmed ? 'yes' : 'no') + ' · alerted: ' + (lifecycle.alerted ? 'yes' : 'no') + ' · ' + (lifecycle.episode_id ?? 'Unavailable') : 'Inactive / unavailable']
   ];
@@ -483,22 +562,37 @@ function renderPairChart(data) {
   const x = time => 70 + (Date.parse(time) - start) / Math.max(end - start, 1) * 840;
   const y = value => 290 - (value - low) / (high - low) * 260;
   function series(rows, field, name, color) {
-    let path = '', previous = null, dots = '';
+    let path = '', previous = null;
     for (const point of rows) {
       if (!finite(point[field]) || !Number.isFinite(Date.parse(point.sample_time))) { previous = null; continue; }
       const px = x(point.sample_time).toFixed(2), py = y(point[field]).toFixed(2);
       path += (previous && previous.segment === point.segment ? 'L' : 'M') + px + ',' + py + ' ';
-      // Dots keep singleton segments visible without joining missing slots.
-      dots += '<circle cx="' + px + '" cy="' + py + '" r="1.5" fill="' + color + '"><title>' + esc(point.sample_time) + ' · ' + number(point[field]) + ' bps</title></circle>';
       previous = point;
     }
-    return path ? '<g><path data-series="' + name + '" d="' + path + '" fill="none" stroke="' + color + '" stroke-width="1.6"/>' + dots + '</g>' : '';
+    return path ? '<g><path data-series="' + name + '" d="' + path + '" fill="none" stroke="' + color + '" stroke-width="1.6"/></g>' : '';
   }
   let svg = '<svg viewBox="0 0 960 350" role="img" aria-label="Executable spread and prior-only rolling 24h mean in basis points"><title>Exact sampled executable spread history</title>';
   for (let i = 0; i <= 4; i++) {
     const value = low + (high - low) * i / 4, py = y(value).toFixed(2);
     svg += '<line x1="70" x2="910" y1="' + py + '" y2="' + py + '" stroke="#374151"/><text x="60" y="' + py + '" text-anchor="end" fill="#94a3b8" font-size="11">' + number(value) + '</text>';
   }
+  const duration = Math.max(end - start, 1);
+  const axisLabel = timestamp => {
+    const date = new Date(timestamp), pad = part => String(part).padStart(2, '0');
+    const clock = pad(date.getUTCHours()) + ':' + pad(date.getUTCMinutes());
+    if (duration <= 6 * 60 * 60 * 1000) return clock + ':' + pad(date.getUTCSeconds()) + 'Z';
+    if (duration <= 3 * 24 * 60 * 60 * 1000) return clock + 'Z';
+    return pad(date.getUTCMonth() + 1) + '-' + pad(date.getUTCDate()) + ' ' + clock + 'Z';
+  };
+  svg += '<g data-axis="x">';
+  const tickCount = duration <= 6 * 60 * 60 * 1000 ? 5 : 6;
+  for (let index = 0; index < tickCount; index++) {
+    const timestamp = start + duration * index / (tickCount - 1);
+    const px = x(new Date(timestamp).toISOString()).toFixed(2);
+    svg += '<line class="axis-tick" x1="' + px + '" x2="' + px + '" y1="290" y2="296"/>';
+    svg += '<text data-axis-tick="' + index + '" x="' + px + '" y="320" text-anchor="middle" fill="#94a3b8" font-size="11">' + axisLabel(timestamp) + '</text>';
+  }
+  svg += '</g>';
   svg += series(points, 'raw_spread_bps', 'raw', '#93c5fd') + series(means, 'rolling_mean_bps', 'mean', '#fcd34d');
   if (v2Reference !== null) {
     const py = y(v2Reference).toFixed(2);
@@ -506,9 +600,12 @@ function renderPairChart(data) {
     svg += '<text x="905" y="' + (Number(py) - 4) + '" text-anchor="end" fill="#c084fc" font-size="11">Reference</text>';
   }
   if (current && finite(current.raw_spread_bps) && Date.parse(current.sample_time) >= start && Date.parse(current.sample_time) <= end) {
-    svg += '<circle data-series="current" data-marker="current" cx="' + x(current.sample_time).toFixed(2) + '" cy="' + y(current.raw_spread_bps).toFixed(2) + '" r="5" fill="#6ee7b7"><title>Current · ' + esc(current.sample_time) + ' · ' + number(current.raw_spread_bps) + ' bps</title></circle>';
+    const currentX = x(current.sample_time), currentY = y(current.raw_spread_bps);
+    const currentAnchor = currentX > 840 ? 'end' : 'start';
+    svg += '<circle data-series="current" data-marker="current" cx="' + currentX.toFixed(2) + '" cy="' + currentY.toFixed(2) + '" r="5" fill="#6ee7b7"><title>Current · ' + esc(current.sample_time) + ' · ' + number(current.raw_spread_bps) + ' bps</title></circle>';
+    svg += '<text data-marker-label="current" x="' + (currentX + (currentAnchor === 'end' ? -8 : 8)).toFixed(2) + '" y="' + Math.max(18, currentY - 10).toFixed(2) + '" text-anchor="' + currentAnchor + '" fill="#6ee7b7" font-size="10">current</text>';
   }
-  if (v2Reference !== null) {
+  if (v2Reference !== null || lifecycle.available) {
     const rawAt = timestamp => {
       const point = points.find(item => item.sample_time === timestamp);
       return point && finite(point.raw_spread_bps) ? point.raw_spread_bps : null;
@@ -523,12 +620,15 @@ function renderPairChart(data) {
       if (typeof timestamp !== 'string' || !finite(value)) continue;
       const time = Date.parse(timestamp);
       if (!Number.isFinite(time) || time < start || time > end) continue;
-      const px = x(timestamp).toFixed(2), py = y(value).toFixed(2);
-      svg += '<circle data-marker="' + label + '" cx="' + px + '" cy="' + py + '" r="4" fill="' + color + '"><title>' + esc(label) + ' · ' + esc(timestamp) + ' · ' + number(value) + ' bps</title></circle>';
-      svg += '<text x="' + px + '" y="' + (Number(py) - 7) + '" text-anchor="middle" fill="' + color + '" font-size="10">' + label + '</text>';
+      const markerX = x(timestamp), markerY = y(value);
+      const anchor = markerX < 130 ? 'start' : markerX > 850 ? 'end' : 'middle';
+      const labelX = markerX + (anchor === 'start' ? 7 : anchor === 'end' ? -7 : 0);
+      const labelY = Math.max(18, Math.min(markerY - 7, 282));
+      svg += '<circle data-marker="' + label + '" cx="' + markerX.toFixed(2) + '" cy="' + markerY.toFixed(2) + '" r="4" fill="' + color + '"><title>' + esc(label) + ' · ' + esc(timestamp) + ' · ' + number(value) + ' bps</title></circle>';
+      svg += '<text data-marker-label="' + label + '" x="' + labelX.toFixed(2) + '" y="' + labelY.toFixed(2) + '" text-anchor="' + anchor + '" fill="' + color + '" font-size="10">' + label + '</text>';
     }
   }
-  svg += '<text x="70" y="320" fill="#94a3b8" font-size="11">' + esc(points[0].sample_time) + '</text><text x="910" y="338" text-anchor="end" fill="#94a3b8" font-size="11">' + esc(points.at(-1).sample_time) + '</text></svg>';
+  svg += '</svg>';
   byId('pair-chart').innerHTML = svg;
 }
 let requestSequence = 0;
@@ -541,7 +641,8 @@ async function refresh(query = new URLSearchParams(location.search)) {
     const data = await response.json();
     if (sequence !== requestSequence) return;
     const status = isStatus ? data.overall?.status : data.status;
-    text('overall', (status ?? 'degraded').toUpperCase());
+    const statusLabel = isOpportunities && status === 'degraded' ? 'SCANNER DATA DEGRADED' : (status ?? 'degraded').toUpperCase();
+    text('overall', statusLabel);
     byId('overall').className = statusClass(status);
     const scannerAsOf = data.scanner_data_as_of === undefined ? '' : ' · Scanner: ' + (data.scanner_data_as_of ?? 'Unavailable');
     text('data-as-of', 'Data as of: ' + (data.data_as_of ?? 'Unavailable') + scannerAsOf);

@@ -504,6 +504,66 @@ def test_opportunities_http_exposes_v3_scanner_fields_and_root_is_opportunities(
     assert ">Depth<" in html
 
 
+def test_opportunities_ui_orders_scan_columns_and_exposes_sticky_hooks(scanner_http):
+    with urlopen(scanner_http + "/opportunities") as response:
+        html = response.read().decode()
+
+    headers = re.search(r'<table[^>]*aria-label="Opportunities"[^>]*>.*?<thead><tr>(.*?)</tr>', html, re.S)
+    assert headers is not None
+    assert re.findall(r"<th>(.*?)</th>", headers.group(1)) == [
+        "Symbol", "Long", "Short", "State", "Edge after RT fee",
+        "Current net spread", "Baseline", "Freshness / skew", "Depth",
+        "Raw spread", "Std", "RT Fee",
+    ]
+    for hook in (
+        "--opportunity-symbol-width",
+        "--opportunity-long-width",
+        "--opportunity-short-width",
+        "--opportunity-state-width",
+        "opportunity-table",
+        "table-scroll-hint",
+        "state-badge",
+        "edge-value",
+    ):
+        assert hook in html
+
+
+def test_opportunities_ui_uses_explicit_missing_and_freshness_labels(scanner_http):
+    with urlopen(scanner_http + "/opportunities") as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+renderOpportunities({status:'healthy', rows:[{
+  canonical_symbol:'BTC', long_venue:'lighter', long_venue_symbol:'BTC',
+  short_venue:'hyperliquid', short_venue_symbol:'BTC', state:'stale',
+  current_raw_spread_bps:0, current_net_spread_bps:null, rolling_mean_bps:null,
+  basis_coverage:null, convergence_edge_bps:null, rolling_std_bps:0,
+  round_trip_fee_bps:0, freshness_seconds:69, observed_at_skew_seconds:0,
+  primary_depth_status:'unavailable'
+}]});
+console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
+""", setup="location.pathname='/opportunities';\n")
+    rendered = result
+    assert 'class="state-badge state-stale"' in rendered
+    assert 'age 1m 9s · skew 0s' in rendered
+    assert '>0.00<' in rendered
+    assert '>—<' in rendered
+    assert 'Unavailable' not in rendered
+
+
+def test_status_ui_distinguishes_latest_rows_from_configured_feeds(scanner_http):
+    with urlopen(scanner_http + "/status") as response:
+        html = response.read().decode()
+    assert "Rows at latest sample / configured feeds" in html
+    assert "Healthy feeds / primary VWAP ready" in html
+
+
+def test_anomalies_ui_reuses_scroll_and_identity_table_presentation(scanner_http):
+    with urlopen(scanner_http + "/anomalies") as response:
+        html = response.read().decode()
+    for hook in ("anomaly-table", "--anomaly-symbol-width", "table-scroll-hint"):
+        assert hook in html
+
+
 def test_opportunities_http_filters_by_basis_state_and_exposes_the_filter(scanner_http):
     all_rows = http_json(scanner_http, "/api/opportunities")["rows"]
     expected = [row for row in all_rows if row["basis_state"] == "eligible"]
@@ -953,6 +1013,52 @@ console.log(JSON.stringify({summary, chart, search:location.search, requests:req
     assert parse_qs(urlparse(result["requests"][-1]).query)["range"] == ["7d"]
 
 
+def test_pair_ui_prioritizes_decision_metrics_and_keeps_lifecycle_markers(scanner_http):
+    with urlopen(scanner_http + "/pair?" + urlencode(PAIR_QUERY)) as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+renderPair({
+  identity:{canonical_symbol:'BTC',long_venue:'lighter',long_venue_symbol:'BTC',short_venue:'hyperliquid',short_venue_symbol:'BTC'},
+  current:{raw_spread_bps:5,current_net_spread_bps:1,rolling_mean_bps:2,rolling_std_bps:1,deviation_bps:3,theoretical_edge_bps:4,
+    signal_duration_seconds:60,long_buy_vwap:100,short_sell_vwap:101,round_trip_fee_bps:4,observed_at_skew_seconds:0,
+    freshness_seconds:1,sample_time:'2026-09-23T12:00:00Z'},
+  basis:{eligible:true, sample_count:10, coverage:1},
+  history:[
+    {sample_time:'2026-09-23T11:58:00Z',raw_spread_bps:2,segment:0},
+    {sample_time:'2026-09-23T11:59:00Z',raw_spread_bps:3,segment:0},
+    {sample_time:'2026-09-23T12:00:00Z',raw_spread_bps:5,segment:0}],
+  rolling_mean_series:[
+    {sample_time:'2026-09-23T11:58:00Z',rolling_mean_bps:2,segment:0},
+    {sample_time:'2026-09-23T11:59:00Z',rolling_mean_bps:2,segment:0},
+    {sample_time:'2026-09-23T12:00:00Z',rolling_mean_bps:2,segment:0}],
+  lifecycle:{available:true,reference_mean_bps:2,candidate_started_at:'2026-09-23T11:58:00Z',confirmed_at:'2026-09-23T11:59:00Z'}
+});
+console.log(JSON.stringify({summary:byId('pair-summary').innerHTML, chart:byId('pair-chart').innerHTML}));
+""", setup="location.pathname='/pair';\n")
+    labels = re.findall(r'class="metric-label">([^<]+)', result["summary"])
+    assert labels[:3] == [
+        "Raw spread (bps)",
+        "Current net spread (bps)",
+        "Convergence edge after RT fee (bps, display-only)",
+    ]
+    assert 'data-marker="current"' in result["chart"]
+    assert 'data-marker="candidate"' in result["chart"]
+    assert 'data-marker="confirmation"' in result["chart"]
+    assert not re.search(r'<circle(?![^>]*data-marker=)', result["chart"])
+    assert result["chart"].count('data-axis-tick=') >= 2
+
+
+def test_pair_ui_explains_disabled_persisted_route_without_guessing_identity(scanner_http):
+    with urlopen(scanner_http + "/pair") as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+renderPair({identity:{canonical_symbol:'USO',long_venue:'lighter_robinhood',long_venue_symbol:'USO',short_venue:'arcus',short_venue_symbol:'USO-USD'},
+  errors:['pair identity is not an enabled configured mapping'], current:null, history:[], rolling_mean_series:[]});
+console.log(JSON.stringify(byId('pair-identity').textContent + '|' + byId('pair-chart').textContent));
+""", setup="location.pathname='/pair';\n")
+    assert "no longer an enabled mapping" in result
+
+
 def test_pair_ui_gaps_unavailable_mean_and_current_are_not_synthesized(scanner_http):
     with urlopen(scanner_http + "/pair?" + urlencode(PAIR_QUERY)) as response:
         html = response.read().decode()
@@ -968,7 +1074,7 @@ console.log(JSON.stringify({chart:byId('pair-chart').innerHTML,summary:byId('pai
     assert 'data-series="mean"' not in result["chart"]
     raw_paths = re.findall(r'<path[^>]*data-series="raw"[^>]*d="([^"]*)"', result["chart"])
     assert raw_paths and all("L" not in path for path in raw_paths)
-    assert "Unavailable" in result["summary"]
+    assert "—" in result["summary"]
 
 
 @pytest.mark.parametrize("check", ["payload", "svg"])
