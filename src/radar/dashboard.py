@@ -125,7 +125,8 @@ def parse_pair_query(query: str) -> dict[str, str]:
 def parse_opportunities_filters(query: str) -> OpportunitiesFilters:
     """Reject malformed/duplicate input before accessing persisted sources."""
     allowed = {"symbol", "long_venue", "short_venue", "max_std", "min_deviation",
-               "min_edge", "min_convergence_edge", "min_duration", "active_only", "limit"}
+               "min_edge", "min_convergence_edge", "min_duration", "basis_state",
+               "active_only", "limit"}
     if re.search(r"%(?![0-9a-fA-F]{2})", query):
         raise ValueError("invalid percent encoding")
     values: dict[str, str] = {}
@@ -165,6 +166,11 @@ def parse_opportunities_filters(query: str) -> OpportunitiesFilters:
     active_only = values.get("active_only", "false")
     if active_only not in ("true", "false"):
         raise ValueError("active_only must be true or false")
+    basis_state = values.get("basis_state")
+    if basis_state is not None and basis_state not in {
+        "eligible", "pending", "unavailable",
+    }:
+        raise ValueError("basis_state must be eligible, pending, or unavailable")
     return OpportunitiesFilters(
         symbol=values["symbol"].upper() if "symbol" in values else None,
         long_venue=values["long_venue"].lower() if "long_venue" in values else None,
@@ -175,6 +181,7 @@ def parse_opportunities_filters(query: str) -> OpportunitiesFilters:
             "min_edge", numbers.get("min_convergence_edge")
         ),
         min_duration_seconds=integers.get("min_duration"),
+        basis_state=basis_state,
         active_only=active_only == "true", limit=limit,
     )
 
@@ -279,6 +286,7 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 <label>Max 24h std (bps)<input id="max_std" name="max_std" type="number" min="0" step="any"></label>
 <label>Min convergence edge (bps)<input id="min_edge" name="min_edge" type="number" min="0" step="any"></label>
 <label>Min duration (s)<input id="min_duration" name="min_duration" type="number" min="0" step="1"></label>
+<label>Basis state<select id="basis_state" name="basis_state"><option value="">All states</option><option value="eligible">Eligible</option><option value="pending">Baseline pending</option><option value="unavailable">Baseline unavailable</option></select></label>
 <label>Limit<input id="limit" name="limit" type="number" min="1" max="512" step="1" placeholder="512"></label>
 <label class="check"><input id="active_only" name="active_only" type="checkbox">Active only</label>
 <button type="submit">Apply filters</button><button id="reset" type="button">Reset</button>
@@ -321,7 +329,7 @@ const statusClass = value => ['healthy','degraded','down'].includes(value) ? val
 const text = (id, value) => { byId(id).textContent = value ?? 'Unavailable'; };
 const emptyRow = (columns, message) => '<tr><td colspan="' + columns + '" class="muted">' + esc(message) + '</td></tr>';
 const cell = value => '<td>' + esc(value) + '</td>';
-const filterNames = ['symbol','long_venue','short_venue','max_std','min_edge','min_duration','limit'];
+const filterNames = ['symbol','long_venue','short_venue','max_std','min_edge','min_duration','basis_state','limit'];
 const anomalyFilterNames = ['symbol','long_venue','short_venue'];
 const isStatus = location.pathname === '/status';
 const isPair = location.pathname === '/pair';

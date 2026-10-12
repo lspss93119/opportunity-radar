@@ -504,6 +504,22 @@ def test_opportunities_http_exposes_v3_scanner_fields_and_root_is_opportunities(
     assert ">Depth<" in html
 
 
+def test_opportunities_http_filters_by_basis_state_and_exposes_the_filter(scanner_http):
+    all_rows = http_json(scanner_http, "/api/opportunities")["rows"]
+    expected = [row for row in all_rows if row["basis_state"] == "eligible"]
+
+    filtered = http_json(scanner_http, "/api/opportunities?basis_state=eligible")
+
+    assert [row["canonical_symbol"] for row in filtered["rows"]] == [
+        row["canonical_symbol"] for row in expected
+    ]
+    assert all(row["basis_state"] == "eligible" for row in filtered["rows"])
+    with urlopen(scanner_http + "/") as response:
+        html = response.read().decode()
+    assert 'id="basis_state"' in html
+    assert "Basis state" in html
+
+
 @pytest.mark.parametrize(("query", "count", "first_symbol"), [
     ("symbol=%20eth%20", 2, "ETH"), ("long_venue=%20LIGHTER%20", 2, "BTC"),
     ("short_venue=HYPERLIQUID", 2, "BTC"), ("max_std=99", 2, "BTC"),
@@ -529,6 +545,7 @@ def test_opportunities_http_filters(scanner_http, query, count, first_symbol):
     "min_deviation=nope", "min_deviation=-1", "min_deviation=-inf", "min_deviation=1e999",
     "min_duration=-1", "min_duration=1.5", "min_duration=nan",
     "active_only=1", "active_only=yes", "active_only=", "active_only=TRUE",
+    "basis_state=other", "basis_state=",
     "limit=0", "limit=-1", "limit=513", "limit=1.5", "limit=NaN", "limit=",
     "score=1", "symbol=", "long_venue=", "short_venue=", "symbol=BTC&symbol=ETH",
     "limit=1&limit=1", "long_venue_symbol=BTC", "canonical_symbol=BTC", "symbol=%FF",

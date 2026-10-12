@@ -141,6 +141,7 @@ class OpportunitiesFilters:
     min_deviation_bps: float | None = None
     min_convergence_edge_bps: float | None = None
     min_duration_seconds: int | None = None
+    basis_state: str | None = None
     active_only: bool = False
     limit: int = MAX_OPPORTUNITY_LIMIT
 
@@ -625,6 +626,7 @@ class DashboardQueryService:
             filters.min_deviation_bps,
             filters.min_convergence_edge_bps,
             filters.min_duration_seconds,
+            filters.basis_state,
             filters.active_only,
             filters.limit,
         )
@@ -771,6 +773,12 @@ class DashboardQueryService:
             raise ValueError("min_duration_seconds must be a non-negative integer")
         if not isinstance(filters.active_only, bool):
             raise ValueError("active_only must be boolean")
+        if filters.basis_state is not None and filters.basis_state not in {
+            "eligible", "pending", "unavailable",
+        }:
+            raise ValueError(
+                "basis_state must be eligible, pending, or unavailable"
+            )
         if (
             isinstance(filters.limit, bool)
             or not isinstance(filters.limit, int)
@@ -2463,6 +2471,11 @@ class DashboardQueryService:
             value = row["signal_duration_seconds"]
             if not isinstance(value, int) or value < filters.min_duration_seconds:
                 return False
+        if (
+            filters.basis_state is not None
+            and row["basis_state"] != filters.basis_state
+        ):
+            return False
         return not filters.active_only or row["active"] is True
 
     @staticmethod
