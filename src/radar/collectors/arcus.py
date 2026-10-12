@@ -437,7 +437,7 @@ class ArcusCollector:
             payload = await self._request_json(
                 self.FUNDING_RATES_URL,
                 method="GET",
-                params={"market": market.venue_symbol},
+                params={"market": market.venue_symbol, "limit": 1},
             )
             point = parse_arcus_funding_rates(
                 payload, expected_market_id=detail.market_id
