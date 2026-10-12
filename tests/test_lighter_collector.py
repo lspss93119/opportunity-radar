@@ -248,6 +248,15 @@ async def wait_for_books(collector: LighterCollector, market_ids: tuple[int, ...
     raise AssertionError("fixture websocket books were not populated")
 
 
+async def wait_for_bid_price(collector: LighterCollector, market_id: int, price: float) -> None:
+    for _ in range(100):
+        snapshot = collector._order_book_feed.snapshot(market_id)
+        if snapshot is not None and snapshot.bids[0].price == price:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("fixture websocket book did not receive the expected update")
+
+
 def cache_pipeline(
     collector: LighterCollector,
     markets: list[MarketConfig],
@@ -260,6 +269,117 @@ def cache_pipeline(
         latest_market_data=latest,
         clock=lambda: OBSERVED_AT,
     )
+
+
+@pytest.mark.parametrize(
+    ("venue", "base_url"),
+    [
+        ("lighter", LighterCollector.BASE_URL),
+        ("lighter_robinhood", ROBINHOOD_BASE_URL),
+    ],
+)
+@pytest.mark.asyncio
+async def test_lighter_prepare_sample_publishes_ready_book_at_boundary(
+    venue: str, base_url: str
+):
+    transport = FixtureTransport(base_url)
+    websocket, websocket_connect = fixture_websocket(include_symbols=("btc",))
+    latest = LatestMarketData()
+    market = MarketConfig(venue=venue, venue_symbol="BTC", canonical_symbol="BTC")
+    collector = LighterCollector(
+        [market],
+        venue=venue,
+        base_url=base_url,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        websocket_connect=websocket_connect,
+        latest_market_data=latest,
+    )
+
+    try:
+        await collector.start()
+        await wait_for_books(collector, (1,))
+        assert latest.build_batch(
+            [market],
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        ).market_snapshots == ()
+
+        collector.prepare_sample()
+        first = latest.build_batch(
+            [market],
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+        collector.prepare_sample()
+        second = latest.build_batch(
+            [market],
+            sample_time=SAMPLE_TIME,
+            now=OBSERVED_AT,
+            stale_after_seconds=30,
+        )
+    finally:
+        await collector.stop()
+
+    assert len(first.market_snapshots) == 1
+    assert second.market_snapshots == first.market_snapshots
+
+
+@pytest.mark.parametrize(
+    ("venue", "base_url"),
+    [
+        ("lighter", LighterCollector.BASE_URL),
+        ("lighter_robinhood", ROBINHOOD_BASE_URL),
+    ],
+)
+@pytest.mark.asyncio
+async def test_lighter_invalid_boundary_publication_is_not_republished(
+    venue: str, base_url: str
+):
+    transport = FixtureTransport(base_url)
+    websocket, websocket_connect = fixture_websocket(include_symbols=("btc",))
+    latest = LatestMarketData()
+    market = MarketConfig(venue=venue, venue_symbol="BTC", canonical_symbol="BTC")
+    collector = LighterCollector(
+        [market],
+        venue=venue,
+        base_url=base_url,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        websocket_connect=websocket_connect,
+        latest_market_data=latest,
+    )
+
+    try:
+        await collector.start()
+        await wait_for_books(collector, (1,))
+        collector.prepare_sample()
+
+        websocket.push(
+            {
+                "type": "update/order_book",
+                "channel": "order_book:1",
+                "order_book": {
+                    "code": 0,
+                    "asks": [],
+                    "bids": [{"price": "101", "size": "1"}],
+                    "begin_nonce": 1,
+                    "nonce": 2,
+                },
+            }
+        )
+        await wait_for_bid_price(collector, 1, 101.0)
+
+        collector.prepare_sample()
+        assert latest._views[(venue, "BTC")].ready is False
+        assert collector._order_book_feed.snapshot(1) is None
+
+        collector.prepare_sample()
+        assert latest._views[(venue, "BTC")].ready is False
+    finally:
+        await collector.stop()
 
 
 @pytest.mark.parametrize(

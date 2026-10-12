@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -16,6 +16,7 @@ from radar.config import MarketConfig
 from radar.market_data import LatestMarketData
 from radar.pipeline import MarketDataPipeline
 from radar.state import RadarState
+from radar.vwap import buy_vwap, sell_vwap
 
 OBSERVED_AT = datetime(2026, 9, 24, 10, 0, 1, 123000, tzinfo=UTC)
 
@@ -59,6 +60,24 @@ def update_message(
     }
 
 
+def snapshot_metrics(snapshot: LighterOrderBookSnapshot) -> tuple[object, ...]:
+    bids = list(snapshot.bids)
+    asks = list(snapshot.asks)
+    return (
+        bids[0].price,
+        bids[0].base_size,
+        asks[0].price,
+        asks[0].base_size,
+        buy_vwap(asks, 1_000),
+        sell_vwap(bids, 1_000),
+        buy_vwap(asks, 5_000),
+        sell_vwap(bids, 5_000),
+        buy_vwap(asks, 10_000),
+        sell_vwap(bids, 10_000),
+        snapshot.observed_at,
+    )
+
+
 def test_lighter_order_book_state_applies_snapshot_delta_and_deletes_levels():
     state = LighterOrderBookState(market_id=1)
 
@@ -90,6 +109,34 @@ def test_lighter_order_book_state_rejects_delta_nonce_gap_and_stays_unready():
 
     state.clear()
     assert state.snapshot() is None
+
+
+@pytest.mark.parametrize("venue", ["lighter", "lighter_robinhood"])
+def test_lighter_boundary_model_matches_eager_reference(venue: str):
+    del venue  # The shared state machine is used by both logical venues.
+    raw_snapshot = snapshot_message(1)
+    for level in raw_snapshot["order_book"]["asks"] + raw_snapshot["order_book"]["bids"]:
+        level["size"] = "200"
+    raw_deltas = [
+        update_message(1, begin_nonce=10, nonce=11),
+        update_message(1, begin_nonce=11, nonce=12),
+        update_message(1, begin_nonce=12, nonce=13),
+    ]
+    eager = LighterOrderBookState(market_id=1)
+    boundary = LighterOrderBookState(market_id=1)
+    eager.apply_snapshot(raw_snapshot["order_book"], OBSERVED_AT)
+    boundary.apply_snapshot(raw_snapshot["order_book"], OBSERVED_AT)
+
+    for index, message in enumerate(raw_deltas):
+        observed_at = OBSERVED_AT + timedelta(seconds=index + 1)
+        eager.apply_delta(message["order_book"], observed_at)
+        eager_view = eager.snapshot()
+        assert eager_view is not None
+        boundary.apply_delta(message["order_book"], observed_at)
+        if index in {0, 2}:
+            boundary_view = boundary.snapshot()
+            assert boundary_view is not None
+            assert snapshot_metrics(boundary_view) == snapshot_metrics(eager_view)
 
 
 class FakeWebSocket:
@@ -159,11 +206,70 @@ async def test_full_lighter_snapshot_is_ready_without_followup_delta():
     try:
         await feed.start()
         await wait_until(lambda: feed.snapshot(1) is not None)
+        assert published == []
+
+        feed.publish_current_books()
+
         assert len(published) == 1
         assert published[0][0] == 1
         assert published[0][1].bids[0].price == 99.0
     finally:
         await feed.stop()
+
+
+@pytest.mark.asyncio
+async def test_lighter_deltas_wait_for_boundary_and_publish_latest_book_once():
+    websocket = FakeWebSocket([{"type": "connected"}, snapshot_message(1)])
+    published: list[LighterOrderBookSnapshot] = []
+    feed = LighterOrderBookFeed(
+        "wss://test.invalid/stream",
+        [1],
+        connect=lambda _url: websocket,
+        on_book=lambda _market_id, snapshot: published.append(snapshot),
+    )
+
+    try:
+        await feed.start()
+        await wait_until(lambda: feed.snapshot(1) is not None)
+        websocket.push(update_message(1, begin_nonce=10, nonce=11))
+        websocket.push(update_message(1, begin_nonce=11, nonce=12))
+        websocket.push(update_message(1, begin_nonce=12, nonce=13))
+        await wait_until(lambda: feed.snapshot(1) is not None and feed.snapshot(1).bids[0].base_size == 1.0)
+
+        assert published == []
+
+        feed.publish_current_books()
+        assert len(published) == 1
+        assert published[0].bids[0].base_size == 1.0
+
+        feed.publish_current_books()
+        assert len(published) == 2
+        assert published[1] == published[0]
+    finally:
+        await feed.stop()
+
+
+def test_lighter_boundary_publication_materializes_each_ready_market_once(monkeypatch):
+    feed = LighterOrderBookFeed("wss://test.invalid/stream", [1, 2])
+    snapshots = {
+        1: snapshot_message(1)["order_book"],
+        2: snapshot_message(2)["order_book"],
+    }
+    for market_id, raw_order_book in snapshots.items():
+        feed._states[market_id].apply_snapshot(raw_order_book, OBSERVED_AT)
+
+    calls: dict[int, int] = {1: 0, 2: 0}
+    for market_id, state in feed._states.items():
+        original_snapshot = state.snapshot
+
+        def counted_snapshot(original_snapshot=original_snapshot, market_id=market_id):
+            calls[market_id] += 1
+            return original_snapshot()
+
+        monkeypatch.setattr(state, "snapshot", counted_snapshot)
+
+    feed.publish_current_books()
+    assert calls == {1: 1, 2: 1}
 
 
 @pytest.mark.asyncio
@@ -217,6 +323,7 @@ async def test_lighter_order_book_feed_isolates_markets_and_resubscribes_after_r
             "order_book/1",
             "order_book/2",
         }
+        feed.publish_current_books()
         assert len(
             latest.build_batch(
                 [
@@ -255,6 +362,7 @@ async def test_lighter_order_book_feed_isolates_markets_and_resubscribes_after_r
 
         second.push(snapshot_message(1, nonce=30))
         await wait_for_book(feed, 1)
+        feed.publish_current_books()
         assert {message["channel"] for message in second.sent} == {
             "order_book/1",
             "order_book/2",
@@ -313,6 +421,7 @@ async def test_lighter_order_book_feed_invalidates_only_market_with_nonce_gap():
     try:
         await wait_for_book(feed, 1)
         await wait_for_book(feed, 2)
+        feed.publish_current_books()
         invalidations_before_gap = len(invalidated)
 
         first.push(update_message(1, begin_nonce=9, nonce=11))

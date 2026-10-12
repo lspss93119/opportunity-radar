@@ -257,6 +257,23 @@ class LighterOrderBookFeed:
         state = self._states.get(market_id)
         return None if state is None else state.snapshot()
 
+    def publish_current_books(self) -> None:
+        """Publish each ready local book once at an application sample boundary."""
+        for market_id in self._market_ids:
+            state = self._states.get(market_id)
+            if state is None:
+                continue
+            snapshot = state.snapshot()
+            if snapshot is None or self._on_book is None:
+                continue
+            try:
+                self._on_book(market_id, snapshot)
+            except Exception as error:  # noqa: BLE001
+                state.clear()
+                if self._on_invalidate is not None:
+                    self._on_invalidate(market_id)
+                report_collector_error(self._error_handler, self._venue, error)
+
     def _clear_states(self) -> None:
         for state in self._states.values():
             state.clear()
@@ -327,11 +344,6 @@ class LighterOrderBookFeed:
                 self._on_invalidate(market_id)
             report_collector_error(self._error_handler, self._venue, error)
             return
-        snapshot = state.snapshot()
-        if snapshot is None:
-            raise ValueError("valid websocket order_book did not produce a snapshot")
-        if self._on_book is not None:
-            self._on_book(market_id, snapshot)
 
     @staticmethod
     def _market_id_from_channel(channel: object) -> int:
@@ -526,6 +538,10 @@ class LighterCollector:
         await self._order_book_feed.stop()
         self._feed_started = False
 
+    def prepare_sample(self) -> None:
+        """Publish ready local books without performing network I/O."""
+        self._order_book_feed.publish_current_books()
+
     async def _fetch_market_details(
         self,
     ) -> tuple[dict[str, LighterMarketDetail], datetime]:
@@ -608,9 +624,9 @@ class LighterCollector:
                     asks=snapshot.asks,
                     observed_at=snapshot.observed_at,
                 )
-            except Exception as error:  # noqa: BLE001
-                report_collector_error(self._error_handler, self.venue, error)
+            except Exception:  # noqa: BLE001
                 self._invalidate_book(market_id)
+                raise
 
     def _invalidate_book(self, market_id: int) -> None:
         if self._latest_market_data is None:
