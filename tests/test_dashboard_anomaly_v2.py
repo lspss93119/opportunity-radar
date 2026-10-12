@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.request import urlopen
+
+import pytest
 
 from radar.config import (
     AnomalyV2Config,
@@ -14,7 +17,7 @@ from radar.config import (
     SpreadMonitorConfig,
 )
 from radar.dashboard import DashboardStatusService, create_dashboard_server
-from radar.dashboard_data import DashboardQueryService
+from radar.dashboard_data import DashboardQueryService, OpportunitiesFilters
 from radar.models import MarketSnapshot
 from radar.storage.parquet import ParquetStorage
 from radar.storage.sqlite import SQLiteRuntimeStore
@@ -30,7 +33,7 @@ IDENTITY = {
 }
 
 
-def make_config() -> RadarConfig:
+def make_config(*, anomaly_enabled: bool = True) -> RadarConfig:
     return RadarConfig(
         markets=[
             MarketConfig(
@@ -47,7 +50,7 @@ def make_config() -> RadarConfig:
         fees_bps={"arcus": 2.25, "lighter_robinhood": 0.0},
         monitors=MonitorConfig(
             spread=SpreadMonitorConfig(
-                anomaly_v2=AnomalyV2Config(enabled=True),
+                anomaly_v2=AnomalyV2Config(enabled=anomaly_enabled),
             )
         ),
     )
@@ -150,8 +153,291 @@ def write_v2_runtime(runtime_db: Path, *, malformed: bool = False) -> None:
             )
 
 
+def write_monitor_state(
+    runtime_db: Path,
+    state_key: str,
+    state: object,
+    *,
+    updated_at: datetime = NOW,
+) -> None:
+    with SQLiteRuntimeStore(runtime_db) as store:
+        store.set_monitor_state("spread", state_key, state, updated_at=updated_at)
+
+
+def write_legacy_state(
+    runtime_db: Path,
+    *,
+    confirmed: bool,
+    alerted: bool,
+    updated_at: datetime,
+) -> None:
+    first_seen = NOW - timedelta(seconds=120)
+    last_seen = NOW - timedelta(seconds=30)
+    write_monitor_state(
+        runtime_db,
+        "episodes",
+        {
+            "legacy-episode": {
+                "episode_id": "legacy-episode",
+                "key": IDENTITY,
+                "first_seen_at": first_seen.isoformat(),
+                "last_seen_at": last_seen.isoformat(),
+                "candidate": {
+                    **IDENTITY,
+                    "net_spread_bps": 100.0,
+                },
+                "candidate_confirmed": confirmed,
+                "candidate_confirmed_at": (
+                    (NOW - timedelta(seconds=60)).isoformat()
+                    if confirmed
+                    else None
+                ),
+                "alert_condition_since": (
+                    (NOW - timedelta(seconds=90)).isoformat()
+                    if confirmed
+                    else None
+                ),
+                "alerted": alerted,
+            }
+        },
+        updated_at=updated_at,
+    )
+
+
+def replace_state_json(runtime_db: Path, state_key: str, state_json: str) -> None:
+    with sqlite3.connect(runtime_db) as connection:
+        connection.execute(
+            """
+            UPDATE monitor_state
+            SET state_json = ?
+            WHERE monitor_name = 'spread' AND state_key = ?
+            """,
+            (state_json, state_key),
+        )
+        connection.commit()
+
+
 def confirmed_at() -> datetime:
     return NOW - timedelta(seconds=60)
+
+
+def status_for(
+    tmp_path: Path,
+    *,
+    config: RadarConfig,
+    runtime_db: Path,
+) -> dict[str, object]:
+    write_market_data(tmp_path / "data")
+    return DashboardQueryService(
+        config,
+        data_root=tmp_path / "data",
+        runtime_db=runtime_db,
+        clock=lambda: NOW,
+    ).get_status(now=NOW)
+
+
+def test_status_uses_fresh_v2_heartbeat_and_drops_stale_legacy_counts(tmp_path):
+    runtime_db = tmp_path / "runtime.sqlite3"
+    write_legacy_state(
+        runtime_db,
+        confirmed=True,
+        alerted=True,
+        updated_at=NOW - timedelta(hours=1),
+    )
+    write_monitor_state(runtime_db, "anomaly_episodes_v2", {}, updated_at=NOW)
+
+    status = status_for(tmp_path, config=make_config(), runtime_db=runtime_db)
+
+    assert status["heartbeat"] == {
+        "status": "healthy",
+        "updated_at": NOW.isoformat(),
+        "age_seconds": 0.0,
+    }
+    assert status["radar_heartbeat"] == status["heartbeat"]
+    assert status["overall"]["status"] == "healthy"
+    assert status["overall"]["active_episodes"] == 0
+    assert status["overall"]["confirmed_candidates"] == 0
+    assert status["overall"]["active_alerted_episodes"] == 0
+    assert status["episodes"] == []
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "expected"),
+    [(31, "degraded"), (61, "down")],
+)
+def test_status_uses_v2_heartbeat_age_boundaries(tmp_path, age_seconds, expected):
+    runtime_db = tmp_path / "runtime.sqlite3"
+    write_monitor_state(
+        runtime_db,
+        "anomaly_episodes_v2",
+        {},
+        updated_at=NOW - timedelta(seconds=age_seconds),
+    )
+
+    status = status_for(tmp_path, config=make_config(), runtime_db=runtime_db)
+
+    assert status["heartbeat"]["status"] == expected
+
+
+def test_v2_heartbeat_missing_does_not_fallback_to_legacy(tmp_path):
+    runtime_db = tmp_path / "runtime.sqlite3"
+    write_legacy_state(
+        runtime_db,
+        confirmed=True,
+        alerted=True,
+        updated_at=NOW,
+    )
+
+    status = status_for(tmp_path, config=make_config(), runtime_db=runtime_db)
+
+    assert status["heartbeat"]["status"] == "down"
+    assert status["heartbeat"]["updated_at"] is None
+
+
+@pytest.mark.parametrize(
+    "updated_at",
+    ["not-a-timestamp", (NOW + timedelta(seconds=1)).isoformat()],
+)
+def test_v2_heartbeat_invalid_or_future_timestamp_fails_closed(tmp_path, updated_at):
+    runtime_db = tmp_path / "runtime.sqlite3"
+    write_monitor_state(runtime_db, "anomaly_episodes_v2", {}, updated_at=NOW)
+    with sqlite3.connect(runtime_db) as connection:
+        connection.execute(
+            """
+            UPDATE monitor_state
+            SET updated_at = ?
+            WHERE monitor_name = 'spread' AND state_key = 'anomaly_episodes_v2'
+            """,
+            (updated_at,),
+        )
+        connection.commit()
+
+    status = status_for(tmp_path, config=make_config(), runtime_db=runtime_db)
+
+    assert status["heartbeat"]["status"] == "down"
+
+
+def test_legacy_mode_ignores_leftover_v2_state(tmp_path):
+    runtime_db = tmp_path / "runtime.sqlite3"
+    write_legacy_state(
+        runtime_db,
+        confirmed=False,
+        alerted=False,
+        updated_at=NOW,
+    )
+    write_monitor_state(
+        runtime_db,
+        "anomaly_episodes_v2",
+        {"stale": {"not": "used"}},
+        updated_at=NOW - timedelta(hours=1),
+    )
+
+    status = status_for(
+        tmp_path,
+        config=make_config(anomaly_enabled=False),
+        runtime_db=runtime_db,
+    )
+
+    assert status["heartbeat"]["status"] == "healthy"
+    assert status["heartbeat"]["updated_at"] == NOW.isoformat()
+    assert status["overall"]["active_episodes"] == 1
+
+
+def test_legacy_mode_stale_heartbeat_remains_down(tmp_path):
+    runtime_db = tmp_path / "runtime.sqlite3"
+    write_legacy_state(
+        runtime_db,
+        confirmed=False,
+        alerted=False,
+        updated_at=NOW - timedelta(seconds=61),
+    )
+
+    status = status_for(
+        tmp_path,
+        config=make_config(anomaly_enabled=False),
+        runtime_db=runtime_db,
+    )
+
+    assert status["heartbeat"]["status"] == "down"
+
+
+def test_malformed_selected_v2_state_is_not_exposed_as_lifecycle(tmp_path):
+    runtime_db = tmp_path / "runtime.sqlite3"
+    write_legacy_state(
+        runtime_db,
+        confirmed=True,
+        alerted=True,
+        updated_at=NOW,
+    )
+    write_monitor_state(runtime_db, "anomaly_episodes_v2", {}, updated_at=NOW)
+    replace_state_json(runtime_db, "anomaly_episodes_v2", "{malformed")
+
+    status = status_for(tmp_path, config=make_config(), runtime_db=runtime_db)
+
+    assert status["episodes"] == []
+    assert status["overall"]["active_episodes"] == 0
+    assert status["overall"]["status"] == "degraded"
+    assert status["errors"]
+
+
+def test_opportunities_use_v2_lifecycle_instead_of_stale_legacy_state(tmp_path):
+    write_market_data(tmp_path / "data")
+    runtime_db = tmp_path / "runtime.sqlite3"
+    write_legacy_state(
+        runtime_db,
+        confirmed=False,
+        alerted=False,
+        updated_at=NOW - timedelta(hours=1),
+    )
+    write_v2_runtime(runtime_db)
+    service = DashboardQueryService(
+        make_config(),
+        data_root=tmp_path / "data",
+        runtime_db=runtime_db,
+        clock=lambda: NOW,
+    )
+
+    payload = service.get_opportunities(OpportunitiesFilters(), now=NOW)
+
+    row = next(
+        row
+        for row in payload["rows"]
+        if (
+            row["canonical_symbol"] == "QQQ"
+            and row["long_venue"] == "arcus"
+            and row["short_venue"] == "lighter_robinhood"
+        )
+    )
+    assert row["active"] is True
+    assert row["candidate_confirmed"] is True
+    assert row["alerted"] is True
+    assert row["signal_duration_seconds"] == 60
+
+
+def test_status_http_api_uses_selected_v2_heartbeat(tmp_path):
+    write_market_data(tmp_path / "data")
+    runtime_db = tmp_path / "runtime.sqlite3"
+    write_monitor_state(runtime_db, "anomaly_episodes_v2", {}, updated_at=NOW)
+    service = DashboardStatusService(
+        make_config(),
+        data_root=tmp_path / "data",
+        runtime_db=runtime_db,
+        clock=lambda: NOW,
+    )
+    server = create_dashboard_server(service, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        with urlopen(f"http://{host}:{port}/api/status") as response:
+            payload = json.loads(response.read())
+        assert payload["heartbeat"]["status"] == "healthy"
+        assert payload["radar_heartbeat"] == payload["heartbeat"]
+        assert payload["overall"]["status"] == "healthy"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_anomalies_page_reads_persisted_v2_state_and_exact_identity(tmp_path, monkeypatch):

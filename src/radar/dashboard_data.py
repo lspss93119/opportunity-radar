@@ -865,6 +865,9 @@ class DashboardQueryService:
         scanner_data_as_of = snapshot.scanner_data_as_of
         runtime = self._read_runtime(now)
         current_by_key = {}
+        _v2_active, v2_by_key, _v2_notifications, v2_events, v2_errors = (
+            self._read_v2_runtime(now)
+        )
         for key, observation in snapshot.current_observations.items():
             if not self._is_current_observation(observation, now):
                 continue
@@ -875,12 +878,26 @@ class DashboardQueryService:
         output_rows: list[dict[str, object]] = []
         basis_unavailable = False
         for key, observation in current_by_key.items():
+            if self.config.monitors.spread.anomaly_v2.enabled:
+                lifecycle = self._anomaly_lifecycle_for(
+                    observation.key,
+                    v2_by_key,
+                    v2_events,
+                    now,
+                )
+            else:
+                lifecycle = self._lifecycle_for(
+                    observation.key,
+                    runtime.episodes_by_key,
+                    now,
+                )
             row = self._opportunity_payload(
                 observation,
                 (),
                 runtime.episodes_by_key,
                 now,
                 basis=snapshot.basis_by_key.get(key, self._unavailable_basis()),
+                lifecycle=lifecycle,
             )
             if not self._matches_filters(row, filters):
                 continue
@@ -889,7 +906,7 @@ class DashboardQueryService:
 
         output_rows.sort(key=self._opportunity_sort_key)
         output_rows = output_rows[: filters.limit]
-        errors = [*market_errors, *runtime.errors]
+        errors = [*market_errors, *runtime.errors, *v2_errors]
         status = "healthy"
         if errors or basis_unavailable or not current_by_key:
             status = "degraded"
@@ -1497,13 +1514,15 @@ class DashboardQueryService:
         now: datetime,
         *,
         basis: dict[str, object] | None = None,
+        lifecycle: dict[str, object] | None = None,
     ) -> dict[str, object]:
         basis = (
             self._basis_payload_for(all_observations, observation)
             if basis is None
             else basis
         )
-        lifecycle = self._lifecycle_for(observation.key, episodes_by_key, now)
+        if lifecycle is None:
+            lifecycle = self._lifecycle_for(observation.key, episodes_by_key, now)
         deviation = (
             observation.raw_spread_bps - float(basis["mean_bps"])
             if isinstance(basis["mean_bps"], (int, float))
@@ -1517,7 +1536,7 @@ class DashboardQueryService:
             "rolling_std_bps": basis["std_bps"],
             "deviation_bps": deviation,
             "basis_eligible": basis["eligible"],
-            "signal_duration_seconds": lifecycle["signal_duration_seconds"],
+            "signal_duration_seconds": lifecycle.get("signal_duration_seconds"),
             "round_trip_fee_bps": round_trip_fee_bps,
             "theoretical_edge_bps": (
                 deviation - round_trip_fee_bps
@@ -1531,9 +1550,9 @@ class DashboardQueryService:
             "short_sell_vwap": observation.short_sell_vwap,
             "long_fee_bps": observation.long_fee_bps,
             "short_fee_bps": observation.short_fee_bps,
-            "active": lifecycle["active"],
-            "alerted": lifecycle["alerted"],
-            "candidate_confirmed": lifecycle["candidate_confirmed"],
+            "active": lifecycle.get("active") is True,
+            "alerted": lifecycle.get("alerted") is True,
+            "candidate_confirmed": lifecycle.get("candidate_confirmed") is True,
         }
 
     def _current_payload(
@@ -1633,6 +1652,11 @@ class DashboardQueryService:
             "min_observations": MIN_HISTORY_OBSERVATIONS,
         }
 
+    def _heartbeat_state_key(self) -> str:
+        if self.config.monitors.spread.anomaly_v2.enabled:
+            return "anomaly_episodes_v2"
+        return "episodes"
+
     def _read_runtime(self, now: datetime) -> _RuntimeRead:
         heartbeat: dict[str, object] = {
             "status": "down",
@@ -1664,12 +1688,14 @@ class DashboardQueryService:
             # wal-index. If read-only exclusive access is impossible, fail
             # explicitly instead of ignoring WAL via immutable=1.
             connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+            heartbeat_state_key = self._heartbeat_state_key()
             state_row = connection.execute(
                 """
                 SELECT state_json, updated_at
                 FROM monitor_state
-                WHERE monitor_name = 'spread' AND state_key = 'episodes'
-                """
+                WHERE monitor_name = 'spread' AND state_key = ?
+                """,
+                (heartbeat_state_key,),
             ).fetchone()
             episodes_raw: object = {}
             if state_row is not None:
@@ -1689,7 +1715,13 @@ class DashboardQueryService:
                     errors.append(
                         f"monitor state read failed: {type(error).__name__}: {error}"
                     )
-            episodes, episodes_by_key = self._parse_episodes(episodes_raw, errors, now)
+            if heartbeat_state_key == "episodes":
+                episodes, episodes_by_key = self._parse_episodes(episodes_raw, errors, now)
+            else:
+                # V2 lifecycle parsing is owned by _read_v2_runtime. The selected
+                # state is still decoded here so malformed JSON fails closed for
+                # the dashboard heartbeat without exposing it as legacy episodes.
+                episodes, episodes_by_key = [], {}
             events = self._read_events(connection, errors)
         except sqlite3.Error as error:
             return _RuntimeRead(
