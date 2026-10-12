@@ -481,11 +481,35 @@ def test_opportunities_http_orders_by_deviation_and_has_finite_required_fields(s
             "sample_time", "freshness_seconds", "active", "alerted"} <= rows[0].keys()
 
 
+def test_opportunities_http_exposes_v3_scanner_fields_and_root_is_opportunities(scanner_http):
+    payload = http_json(scanner_http, "/api/opportunities")
+    row = payload["rows"][0]
+    assert {
+        "basis_state", "basis_sample_count", "basis_coverage",
+        "current_net_spread_bps", "convergence_edge_bps",
+        "primary_depth_status", "data_as_of", "scanner_data_as_of",
+    } <= row.keys()
+    assert row["current_net_spread_bps"] == pytest.approx(
+        row["current_raw_spread_bps"] - row["long_fee_bps"] - row["short_fee_bps"]
+    )
+    with urlopen(scanner_http + "/") as response:
+        html = response.read().decode()
+    assert 'href="/opportunities"' in html
+    assert 'id="nav-opportunities"' in html
+    assert ">State<" in html
+    assert ">Current net spread<" in html
+    assert ">Baseline<" in html
+    assert ">Edge after RT fee<" in html
+    assert ">Freshness / skew<" in html
+    assert ">Depth<" in html
+
+
 @pytest.mark.parametrize(("query", "count", "first_symbol"), [
     ("symbol=%20eth%20", 2, "ETH"), ("long_venue=%20LIGHTER%20", 2, "BTC"),
     ("short_venue=HYPERLIQUID", 2, "BTC"), ("max_std=99", 2, "BTC"),
     ("max_std=100.01", 4, "BTC"), ("min_deviation=200", 1, "BTC"),
-    ("min_duration=60", 1, "BTC"), ("active_only=true", 2, "BTC"),
+    ("min_duration=60", 1, "BTC"), ("min_edge=200", 1, "BTC"),
+    ("active_only=true", 2, "BTC"),
     ("active_only=false", 4, "BTC"), ("limit=1", 1, "BTC"),
     ("symbol=BTC&long_venue=lighter&short_venue=hyperliquid&max_std=101&min_deviation=250&min_duration=70&active_only=true", 1, "BTC"),
 ])
@@ -505,7 +529,7 @@ def test_opportunities_http_filters(scanner_http, query, count, first_symbol):
     "min_deviation=nope", "min_deviation=-1", "min_deviation=-inf", "min_deviation=1e999",
     "min_duration=-1", "min_duration=1.5", "min_duration=nan",
     "active_only=1", "active_only=yes", "active_only=", "active_only=TRUE",
-    "limit=0", "limit=-1", "limit=201", "limit=1.5", "limit=NaN", "limit=",
+    "limit=0", "limit=-1", "limit=513", "limit=1.5", "limit=NaN", "limit=",
     "score=1", "symbol=", "long_venue=", "short_venue=", "symbol=BTC&symbol=ETH",
     "limit=1&limit=1", "long_venue_symbol=BTC", "canonical_symbol=BTC", "symbol=%FF",
 ])
@@ -587,10 +611,10 @@ def test_dashboard_html_navigation_and_view_anchors(scanner_http, path):
     if path == "/status":
         for anchor in ("heartbeat", "venues", "parquet", "sqlite", "episode-rows", "event-rows", "unavailable"):
             assert f'id="{anchor}"' in html
-    elif path == "/opportunities":
+    elif path in ("/", "/opportunities"):
         for anchor in ("filters", "opportunity-rows", "data-as-of"):
             assert f'id="{anchor}"' in html
-        for column in ("Symbol", "Long", "Short", "Spread", "24h Mean", "24h Std", "Deviation", "Duration", "RT Fee", "Theo Edge", "Skew", "Freshness"):
+        for column in ("Symbol", "Long", "Short", "State", "Raw spread", "Current net spread", "Baseline", "Edge after RT fee", "Std", "RT Fee", "Freshness / skew", "Depth"):
             assert f">{column}<" in html
     else:
         for anchor in ("anomaly-filters", "anomaly-symbol", "anomaly-long-venue", "anomaly-short-venue", "anomaly-eligible-only", "anomaly-rows", "data-as-of"):
@@ -738,12 +762,12 @@ def test_scanner_restores_and_preserves_filters_without_navigation(scanner_http)
     with urlopen(scanner_http + "/opportunities") as response:
         html = response.read().decode()
     result = run_ui_script(html, """
-document.getElementById('min_deviation').value = '200';
+    document.getElementById('min_edge').value = '200';
 const query = filterQuery();
 console.log(JSON.stringify({symbol:document.getElementById('symbol').value, active:document.getElementById('active_only').checked, query:query.toString()}));
 """, setup="location.pathname = '/opportunities';\n")
     assert result["symbol"] == "ETH" and result["active"] is True
-    assert parse_qs(result["query"]) == {"symbol": ["ETH"], "active_only": ["true"], "min_deviation": ["200"]}
+    assert parse_qs(result["query"]) == {"symbol": ["ETH"], "active_only": ["true"], "min_edge": ["200"]}
 
 
 def test_anomaly_filters_round_trip_reset_and_browser_navigation(scanner_http):
@@ -902,7 +926,7 @@ byId('pair-range').value = '7d';
 byId('pair-range').listeners.change();
 console.log(JSON.stringify({summary, chart, search:location.search, requests:requests.map(r=>r.url)}));
 """, setup=POLLING_SETUP + "location.pathname='/pair'; location.search=" + json.dumps("?" + query) + "; const payload=" + json.dumps(payload) + ";\n")
-    for label in ("Raw spread", "24h Mean", "24h Std", "Deviation", "Signal duration", "Long $10k buy VWAP", "Short $10k sell VWAP", "RT Fee", "Theo Edge", "Observed skew", "Freshness", "Sample time", "Lifecycle"):
+    for label in ("Raw spread", "24h Mean", "24h Std", "Deviation", "Signal duration", "Long $10k buy VWAP", "Short $10k sell VWAP", "RT Fee", "Convergence edge after RT fee", "Observed skew", "Freshness", "Sample time", "Lifecycle"):
         assert label in result["summary"]
     assert "500.00" in result["summary"] and "294.00" in result["summary"]
     assert "<svg" in result["chart"] and 'data-series="raw"' in result["chart"]

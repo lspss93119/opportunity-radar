@@ -399,7 +399,17 @@ def test_missing_vwap_stale_future_and_missing_fee_fail_closed(tmp_path):
             runtime_db=root / "runtime.sqlite3",
             clock=lambda: NOW,
         ).get_opportunities(OpportunitiesFilters(), now=NOW)
-        assert result["rows"] == [], name
+        if name == "future":
+            assert result["rows"] == []
+            continue
+        assert result["rows"], name
+        assert all(row["current_net_spread_bps"] is None for row in result["rows"]), name
+        if name == "missing-vwap":
+            assert all(row["state"] == "depth_unavailable" for row in result["rows"])
+        elif name in {"stale", "future"}:
+            assert all(row["state"] == "stale" for row in result["rows"])
+        else:
+            assert all(row["state"] == "unavailable" for row in result["rows"])
 
 
 def test_latest_stale_exact_pair_sample_does_not_carry_forward_older_data(tmp_path):
@@ -423,7 +433,8 @@ def test_latest_stale_exact_pair_sample_does_not_carry_forward_older_data(tmp_pa
         clock=lambda: NOW,
     ).get_opportunities(OpportunitiesFilters(), now=NOW)
 
-    assert result["rows"] == []
+    assert result["rows"]
+    assert all(row["state"] == "stale" for row in result["rows"])
 
 
 def test_prior_only_basis_excludes_current_observation_and_uses_population_std(tmp_path):
@@ -449,6 +460,126 @@ def test_prior_only_basis_excludes_current_observation_and_uses_population_std(t
     assert row["round_trip_fee_bps"] == pytest.approx(6.0)
     assert row["theoretical_edge_bps"] == pytest.approx(294.0)
     assert row["basis_eligible"] is True
+
+
+def test_opportunity_payload_exposes_distinct_net_and_convergence_semantics(tmp_path):
+    config = pair_config()
+    write_prior_pair_history(tmp_path / "data", prior_times=full_window_times())
+
+    result = DashboardQueryService(
+        config,
+        data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3",
+        clock=lambda: NOW,
+    ).get_opportunities(OpportunitiesFilters(), now=NOW)
+
+    row = result["rows"][0]
+    assert row["current_raw_spread_bps"] == pytest.approx(500.0)
+    assert row["current_net_spread_bps"] == pytest.approx(497.0)
+    assert row["round_trip_fee_bps"] == pytest.approx(6.0)
+    assert row["convergence_edge_bps"] == pytest.approx(294.0)
+    assert row["theoretical_edge_bps"] == pytest.approx(294.0)
+    assert row["basis_state"] == "eligible"
+    assert row["basis_sample_count"] == MIN_HISTORY_OBSERVATIONS
+    assert row["basis_coverage"] == pytest.approx(0.8)
+    assert row["primary_depth_status"] == "available"
+    assert row["data_as_of"] == NOW.isoformat()
+    assert row["scanner_data_as_of"] == NOW.isoformat()
+
+
+def test_basis_state_is_pending_when_dataset_is_ahead_of_published_scanner(tmp_path):
+    venues = ("lighter", "hyperliquid", "backpack")
+    config = make_config(
+        *[
+            MarketConfig(venue=venue, venue_symbol="BTC", canonical_symbol="BTC")
+            for venue in venues
+        ],
+        fees_bps={venue: 1.0 for venue in venues},
+    )
+    prior = NOW - timedelta(seconds=10)
+    write_markets(
+        tmp_path / "data",
+        [
+            make_market(
+                sample_time=prior,
+                observed_at=prior,
+                venue=venue,
+                venue_symbol="BTC",
+            )
+            for venue in venues
+        ],
+    )
+    # One later feed is visible, but the configured three-feed sample is not
+    # publishable.  The existing scanner therefore remains on ``prior``.
+    write_markets(
+        tmp_path / "data",
+        [make_market(venue=venues[0], sample_time=NOW, observed_at=NOW)],
+    )
+    service = DashboardQueryService(
+        config,
+        data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3",
+        clock=lambda: NOW,
+        cache_ttl_seconds=0,
+    )
+
+    result = service.get_opportunities(OpportunitiesFilters(), now=NOW)
+
+    assert result["data_as_of"] == NOW.isoformat()
+    assert result["scanner_data_as_of"] == prior.isoformat()
+    assert result["rows"]
+    assert all(row["basis_state"] == "pending" for row in result["rows"])
+
+
+def test_opportunity_sort_prioritizes_actionable_convergence_edge():
+    key = DashboardQueryService._opportunity_sort_key
+    rows = [
+        {
+            "canonical_symbol": "BTC",
+            "long_venue": "a",
+            "long_venue_symbol": "BTC",
+            "short_venue": "b",
+            "short_venue_symbol": "BTC",
+            "basis_state": "eligible",
+            "primary_depth_status": "available",
+            "freshness_seconds": 1.0,
+            "observed_at_skew_seconds": 0.1,
+            "convergence_edge_bps": -10.0,
+            "rolling_std_bps": 1.0,
+        },
+        {
+            "canonical_symbol": "ETH",
+            "long_venue": "a",
+            "long_venue_symbol": "ETH",
+            "short_venue": "b",
+            "short_venue_symbol": "ETH",
+            "basis_state": "eligible",
+            "primary_depth_status": "available",
+            "freshness_seconds": 1.0,
+            "observed_at_skew_seconds": 0.1,
+            "convergence_edge_bps": 5.0,
+            "rolling_std_bps": 10.0,
+        },
+        {
+            "canonical_symbol": "SOL",
+            "long_venue": "a",
+            "long_venue_symbol": "SOL",
+            "short_venue": "b",
+            "short_venue_symbol": "SOL",
+            "basis_state": "unavailable",
+            "primary_depth_status": "available",
+            "freshness_seconds": 0.1,
+            "observed_at_skew_seconds": 0.0,
+            "convergence_edge_bps": 1_000.0,
+            "rolling_std_bps": 0.1,
+        },
+    ]
+
+    assert [row["canonical_symbol"] for row in sorted(rows, key=key)] == [
+        "ETH",
+        "BTC",
+        "SOL",
+    ]
 
 
 def test_basis_requires_full_window_and_eighty_percent_coverage(tmp_path):
@@ -1026,7 +1157,9 @@ def test_fee_arithmetic_overflow_fails_closed(tmp_path):
         data_root=tmp_path / "data", runtime_db=tmp_path / "runtime.sqlite3",
         clock=lambda: NOW,
     ).get_opportunities(OpportunitiesFilters())
-    assert result["rows"] == []
+    assert result["rows"]
+    assert all(row["current_net_spread_bps"] is None for row in result["rows"])
+    assert all(row["state"] == "unavailable" for row in result["rows"])
     json.dumps(result, allow_nan=False)
 
 

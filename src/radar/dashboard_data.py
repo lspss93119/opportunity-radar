@@ -31,7 +31,9 @@ HEARTBEAT_HEALTHY_SECONDS = 30.0
 HEARTBEAT_DEGRADED_SECONDS = 60.0
 FEED_HEALTHY_SECONDS = 90.0
 FEED_DEGRADED_SECONDS = 180.0
-MAX_OPPORTUNITY_LIMIT = 200
+# The production universe currently exposes 496 directional routes.  Keep a
+# bounded API limit while making the default large enough not to hide routes.
+MAX_OPPORTUNITY_LIMIT = 512
 MAX_DISPLAY_POINTS = 500
 SCANNER_REFRESH_SECONDS = 10.0
 SCANNER_OVERLAP_SECONDS = EXPECTED_INTERVAL_SECONDS * 2
@@ -137,6 +139,7 @@ class OpportunitiesFilters:
     short_venue: str | None = None
     max_std_bps: float | None = None
     min_deviation_bps: float | None = None
+    min_convergence_edge_bps: float | None = None
     min_duration_seconds: int | None = None
     active_only: bool = False
     limit: int = MAX_OPPORTUNITY_LIMIT
@@ -294,6 +297,7 @@ class _PairScannerState:
 class _ScannerModel:
     known_files: set[Path]
     latest_rows: dict[tuple[str, str, str], _MarketRow]
+    published_rows: dict[tuple[str, str, str], _MarketRow]
     pair_states: dict[SpreadPairKey, _PairScannerState]
     data_as_of: datetime | None = None
     scanner_data_as_of: datetime | None = None
@@ -305,6 +309,7 @@ class _ScannerSnapshot:
     files: tuple[Path, ...]
     latest_file_mtime: datetime | None
     latest_rows: Mapping[tuple[str, str, str], _MarketRow]
+    published_rows: Mapping[tuple[str, str, str], _MarketRow]
     pair_states: Mapping[SpreadPairKey, _PairScannerState]
     current_observations: Mapping[SpreadPairKey, _PairObservation]
     basis_by_key: Mapping[SpreadPairKey, dict[str, object]]
@@ -408,6 +413,7 @@ class DashboardQueryService:
                 model = _ScannerModel(
                     known_files=set(),
                     latest_rows={},
+                    published_rows={},
                     pair_states={},
                 )
                 query_start = current_time - timedelta(
@@ -546,6 +552,15 @@ class DashboardQueryService:
                 int(observation.sample_time.timestamp()) - ROLLING_WINDOW_SECONDS
             )
 
+        # Keep the raw rows for the currently published sample as well as the
+        # executable pair states.  This lets the read-only scanner show an
+        # explicit stale/depth-unavailable state without turning an invalid
+        # route into a synthetic opportunity.
+        model.published_rows = {
+            (row.venue, row.venue_symbol, row.canonical_symbol): row
+            for row in rows
+        }
+
     def _build_scanner_snapshot(
         self,
         model: _ScannerModel,
@@ -572,6 +587,9 @@ class DashboardQueryService:
             files=files,
             latest_file_mtime=self._latest_file_mtime(files),
             latest_rows=MappingProxyType(dict(model.latest_rows if not model.errors else {})),
+            published_rows=MappingProxyType(
+                dict(model.published_rows if not model.errors else {})
+            ),
             pair_states=MappingProxyType(pair_states),
             current_observations=MappingProxyType(current),
             basis_by_key=MappingProxyType(basis_by_key),
@@ -605,6 +623,7 @@ class DashboardQueryService:
             filters.short_venue,
             filters.max_std_bps,
             filters.min_deviation_bps,
+            filters.min_convergence_edge_bps,
             filters.min_duration_seconds,
             filters.active_only,
             filters.limit,
@@ -735,6 +754,7 @@ class DashboardQueryService:
         for value, name in (
             (filters.max_std_bps, "max_std_bps"),
             (filters.min_deviation_bps, "min_deviation_bps"),
+            (filters.min_convergence_edge_bps, "min_convergence_edge_bps"),
         ):
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, (int, float))
@@ -875,7 +895,7 @@ class DashboardQueryService:
                 observation,
                 freshness_seconds=(now - observation.observed_at).total_seconds(),
             )
-        output_rows: list[dict[str, object]] = []
+        output_by_key: dict[SpreadPairKey, dict[str, object]] = {}
         basis_unavailable = False
         for key, observation in current_by_key.items():
             if self.config.monitors.spread.anomaly_v2.enabled:
@@ -898,11 +918,55 @@ class DashboardQueryService:
                 now,
                 basis=snapshot.basis_by_key.get(key, self._unavailable_basis()),
                 lifecycle=lifecycle,
+                data_as_of=data_as_of,
+                scanner_data_as_of=scanner_data_as_of,
             )
-            if not self._matches_filters(row, filters):
-                continue
-            output_rows.append(row)
-            basis_unavailable = basis_unavailable or row["basis_eligible"] is not True
+            output_by_key[key] = row
+
+        # Keep configured routes visible when a current pair exists but is no
+        # longer executable.  The values remain null and the state is explicit;
+        # this is presentation-only and never makes an invalid route eligible.
+        published = tuple(snapshot.published_rows.values())
+        by_symbol: dict[str, list[_MarketRow]] = {}
+        for market_row in published:
+            by_symbol.setdefault(market_row.canonical_symbol, []).append(market_row)
+        for rows in by_symbol.values():
+            for long_row in rows:
+                for short_row in rows:
+                    if long_row is short_row or long_row.venue.lower() == short_row.venue.lower():
+                        continue
+                    key = SpreadPairKey(
+                        canonical_symbol=long_row.canonical_symbol,
+                        long_venue=long_row.venue,
+                        long_venue_symbol=long_row.venue_symbol,
+                        short_venue=short_row.venue,
+                        short_venue_symbol=short_row.venue_symbol,
+                    )
+                    if key in output_by_key:
+                        continue
+                    basis = snapshot.basis_by_key.get(key, self._unavailable_basis())
+                    lifecycle = (
+                        self._anomaly_lifecycle_for(key, v2_by_key, v2_events, now)
+                        if self.config.monitors.spread.anomaly_v2.enabled
+                        else self._lifecycle_for(key, runtime.episodes_by_key, now)
+                    )
+                    output_by_key[key] = self._status_opportunity_payload(
+                        long_row,
+                        short_row,
+                        key,
+                        basis=basis,
+                        lifecycle=lifecycle,
+                        now=now,
+                        data_as_of=data_as_of,
+                        scanner_data_as_of=scanner_data_as_of,
+                    )
+
+        output_rows = [
+            row for row in output_by_key.values() if self._matches_filters(row, filters)
+        ]
+        basis_unavailable = any(
+            row["basis_state"] != "eligible" for row in output_by_key.values()
+        )
 
         output_rows.sort(key=self._opportunity_sort_key)
         output_rows = output_rows[: filters.limit]
@@ -1515,6 +1579,8 @@ class DashboardQueryService:
         *,
         basis: dict[str, object] | None = None,
         lifecycle: dict[str, object] | None = None,
+        data_as_of: datetime | None = None,
+        scanner_data_as_of: datetime | None = None,
     ) -> dict[str, object]:
         basis = (
             self._basis_payload_for(all_observations, observation)
@@ -1529,31 +1595,203 @@ class DashboardQueryService:
             else None
         )
         round_trip_fee_bps = 2.0 * (observation.long_fee_bps + observation.short_fee_bps)
+        current_net_spread_bps = (
+            observation.raw_spread_bps
+            - observation.long_fee_bps
+            - observation.short_fee_bps
+        )
+        convergence_edge_bps = (
+            deviation - round_trip_fee_bps
+            if isinstance(deviation, (int, float))
+            else None
+        )
+        basis_state = self._basis_state(basis, data_as_of, scanner_data_as_of)
         return {
             **self._identity_payload(observation.key),
             "current_raw_spread_bps": observation.raw_spread_bps,
+            "current_net_spread_bps": current_net_spread_bps,
             "rolling_mean_bps": basis["mean_bps"],
             "rolling_std_bps": basis["std_bps"],
             "deviation_bps": deviation,
             "basis_eligible": basis["eligible"],
+            "basis_state": basis_state,
+            "basis_sample_count": basis["sample_count"],
+            "basis_coverage": basis["coverage"],
             "signal_duration_seconds": lifecycle.get("signal_duration_seconds"),
             "round_trip_fee_bps": round_trip_fee_bps,
-            "theoretical_edge_bps": (
-                deviation - round_trip_fee_bps
-                if isinstance(deviation, (int, float))
-                else None
-            ),
+            "convergence_edge_bps": convergence_edge_bps,
+            # Retained for existing API clients; the UI uses the explicit
+            # convergence_edge_bps name.
+            "theoretical_edge_bps": convergence_edge_bps,
             "observed_at_skew_seconds": observation.observed_at_skew_seconds,
             "sample_time": observation.sample_time.isoformat(),
             "freshness_seconds": observation.freshness_seconds,
+            "data_as_of": _iso(data_as_of),
+            "scanner_data_as_of": _iso(scanner_data_as_of),
             "long_buy_vwap": observation.long_buy_vwap,
             "short_sell_vwap": observation.short_sell_vwap,
             "long_fee_bps": observation.long_fee_bps,
             "short_fee_bps": observation.short_fee_bps,
+            "primary_depth_status": "available",
+            "state": self._display_state(
+                basis_state=basis_state,
+                primary_depth_status="available",
+                freshness_seconds=observation.freshness_seconds,
+                fees_available=True,
+            ),
             "active": lifecycle.get("active") is True,
             "alerted": lifecycle.get("alerted") is True,
             "candidate_confirmed": lifecycle.get("candidate_confirmed") is True,
         }
+
+    def _status_opportunity_payload(
+        self,
+        long_row: _MarketRow,
+        short_row: _MarketRow,
+        key: SpreadPairKey,
+        *,
+        basis: dict[str, object],
+        lifecycle: dict[str, object],
+        now: datetime,
+        data_as_of: datetime | None,
+        scanner_data_as_of: datetime | None,
+    ) -> dict[str, object]:
+        long_buy = _positive_float(long_row.buy_10k_vwap)
+        short_sell = _positive_float(short_row.sell_10k_vwap)
+        long_fee = self._fee_for(long_row.venue)
+        short_fee = self._fee_for(short_row.venue)
+        raw_spread: float | None = None
+        if long_buy is not None and short_sell is not None:
+            try:
+                raw_spread = calculate_raw_spread_bps(long_buy, short_sell)
+            except (OverflowError, ValueError):
+                raw_spread = None
+        primary_depth_status = (
+            "available" if long_buy is not None and short_sell is not None else "unavailable"
+        )
+        fees_available = long_fee is not None and short_fee is not None
+        round_trip_fee = (
+            2.0 * (long_fee + short_fee)
+            if long_fee is not None and short_fee is not None
+            else None
+        )
+        if round_trip_fee is not None and not math.isfinite(round_trip_fee):
+            round_trip_fee = None
+        fees_available = fees_available and (
+            round_trip_fee is not None and math.isfinite(round_trip_fee)
+        )
+        observed_at = max(long_row.observed_at, short_row.observed_at)
+        age_seconds = (now - observed_at).total_seconds()
+        freshness = age_seconds if age_seconds >= 0 else None
+        observed_skew = abs(
+            (long_row.observed_at - short_row.observed_at).total_seconds()
+        )
+        timestamp_current = self._is_current_row(long_row, now) and self._is_current_row(
+            short_row, now
+        )
+        current = (
+            timestamp_current
+            and long_buy is not None
+            and short_sell is not None
+            and fees_available
+            and raw_spread is not None
+        )
+        current_net = (
+            raw_spread - long_fee - short_fee
+            if current
+            and raw_spread is not None
+            and long_fee is not None
+            and short_fee is not None
+            else None
+        )
+        deviation = (
+            raw_spread - float(basis["mean_bps"])
+            if current and raw_spread is not None and isinstance(basis["mean_bps"], (int, float))
+            else None
+        )
+        convergence_edge = (
+            deviation - round_trip_fee
+            if deviation is not None and round_trip_fee is not None
+            else None
+        )
+        basis_state = self._basis_state(basis, data_as_of, scanner_data_as_of)
+        return {
+            **self._identity_payload(key),
+            "current_raw_spread_bps": raw_spread,
+            "current_net_spread_bps": current_net,
+            "rolling_mean_bps": basis["mean_bps"],
+            "rolling_std_bps": basis["std_bps"],
+            "deviation_bps": deviation,
+            "basis_eligible": basis["eligible"],
+            "basis_state": basis_state,
+            "basis_sample_count": basis["sample_count"],
+            "basis_coverage": basis["coverage"],
+            "signal_duration_seconds": lifecycle.get("signal_duration_seconds"),
+            "round_trip_fee_bps": round_trip_fee,
+            "convergence_edge_bps": convergence_edge,
+            "theoretical_edge_bps": convergence_edge,
+            "observed_at_skew_seconds": observed_skew,
+            "sample_time": long_row.sample_time.isoformat(),
+            "freshness_seconds": freshness,
+            "data_as_of": _iso(data_as_of),
+            "scanner_data_as_of": _iso(scanner_data_as_of),
+            "long_buy_vwap": long_buy,
+            "short_sell_vwap": short_sell,
+            "long_fee_bps": long_fee,
+            "short_fee_bps": short_fee,
+            "primary_depth_status": primary_depth_status,
+            "state": self._display_state(
+                basis_state=basis_state,
+                primary_depth_status=primary_depth_status,
+                freshness_seconds=freshness if timestamp_current else None,
+                fees_available=fees_available,
+                timestamp_current=timestamp_current,
+            ),
+            "active": lifecycle.get("active") is True,
+            "alerted": lifecycle.get("alerted") is True,
+            "candidate_confirmed": lifecycle.get("candidate_confirmed") is True,
+        }
+
+    @staticmethod
+    def _basis_state(
+        basis: Mapping[str, object],
+        data_as_of: datetime | None,
+        scanner_data_as_of: datetime | None,
+    ) -> str:
+        if basis.get("eligible") is True:
+            return "eligible"
+        sample_count = basis.get("sample_count")
+        min_observations = basis.get("min_observations")
+        scanner_is_behind = (
+            data_as_of is not None
+            and scanner_data_as_of is not None
+            and data_as_of > scanner_data_as_of
+        )
+        if (
+            scanner_is_behind
+            and isinstance(sample_count, int)
+            and isinstance(min_observations, int)
+            and sample_count < min_observations
+        ):
+            return "pending"
+        return "unavailable"
+
+    @staticmethod
+    def _display_state(
+        *,
+        basis_state: str,
+        primary_depth_status: str,
+        freshness_seconds: float | None,
+        fees_available: bool,
+        timestamp_current: bool = True,
+    ) -> str:
+        if not timestamp_current or freshness_seconds is None:
+            return "stale"
+        if primary_depth_status != "available":
+            return "depth_unavailable"
+        if not fees_available:
+            return "unavailable"
+        return basis_state
 
     def _current_payload(
         self,
@@ -1568,12 +1806,18 @@ class DashboardQueryService:
             else None
         )
         round_trip_fee = 2.0 * (observation.long_fee_bps + observation.short_fee_bps)
+        current_net = (
+            observation.raw_spread_bps
+            - observation.long_fee_bps
+            - observation.short_fee_bps
+        )
         theoretical_edge = (
             deviation - round_trip_fee if isinstance(deviation, (int, float)) else None
         )
         return {
             "sample_time": observation.sample_time.isoformat(),
             "raw_spread_bps": observation.raw_spread_bps,
+            "current_net_spread_bps": current_net,
             "rolling_mean_bps": mean,
             "rolling_std_bps": basis["std_bps"],
             "deviation_bps": deviation,
@@ -1582,6 +1826,7 @@ class DashboardQueryService:
             "long_fee_bps": observation.long_fee_bps,
             "short_fee_bps": observation.short_fee_bps,
             "round_trip_fee_bps": round_trip_fee,
+            "convergence_edge_bps": theoretical_edge,
             "theoretical_edge_bps": theoretical_edge,
             "observed_at_skew_seconds": observation.observed_at_skew_seconds,
             "freshness_seconds": observation.freshness_seconds,
@@ -2207,6 +2452,13 @@ class DashboardQueryService:
             value = row["deviation_bps"]
             if not isinstance(value, (int, float)) or value < filters.min_deviation_bps:
                 return False
+        if filters.min_convergence_edge_bps is not None:
+            value = row["convergence_edge_bps"]
+            if (
+                not isinstance(value, (int, float))
+                or value < filters.min_convergence_edge_bps
+            ):
+                return False
         if filters.min_duration_seconds is not None:
             value = row["signal_duration_seconds"]
             if not isinstance(value, int) or value < filters.min_duration_seconds:
@@ -2214,9 +2466,29 @@ class DashboardQueryService:
         return not filters.active_only or row["active"] is True
 
     @staticmethod
-    def _opportunity_sort_key(row: dict[str, object]) -> tuple[bool, float, tuple[str, ...]]:
-        deviation = row.get("deviation_bps")
-        numeric = float(deviation) if isinstance(deviation, (int, float)) else 0.0
+    def _opportunity_sort_key(
+        row: dict[str, object],
+    ) -> tuple[bool, float, float, float, float, tuple[str, ...]]:
+        actionable = (
+            row.get("basis_state") == "eligible"
+            and row.get("primary_depth_status") == "available"
+            and isinstance(row.get("freshness_seconds"), (int, float))
+            and isinstance(row.get("observed_at_skew_seconds"), (int, float))
+        )
+        edge = row.get("convergence_edge_bps")
+        edge_rank = -float(edge) if isinstance(edge, (int, float)) else math.inf
+        standard_deviation = row.get("rolling_std_bps")
+        std_rank = (
+            float(standard_deviation)
+            if isinstance(standard_deviation, (int, float))
+            else math.inf
+        )
+        freshness = row.get("freshness_seconds")
+        freshness_rank = (
+            float(freshness) if isinstance(freshness, (int, float)) else math.inf
+        )
+        skew = row.get("observed_at_skew_seconds")
+        skew_rank = float(skew) if isinstance(skew, (int, float)) else math.inf
         identity = tuple(
             str(row.get(field) or "")
             for field in (
@@ -2227,7 +2499,14 @@ class DashboardQueryService:
                 "short_venue_symbol",
             )
         )
-        return (deviation is None, -numeric, identity)
+        return (
+            not actionable,
+            edge_rank,
+            std_rank,
+            freshness_rank,
+            skew_rank,
+            identity,
+        )
 
     @staticmethod
     def _range_start(range_name: PairRange, now: datetime) -> datetime:

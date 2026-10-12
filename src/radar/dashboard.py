@@ -125,7 +125,7 @@ def parse_pair_query(query: str) -> dict[str, str]:
 def parse_opportunities_filters(query: str) -> OpportunitiesFilters:
     """Reject malformed/duplicate input before accessing persisted sources."""
     allowed = {"symbol", "long_venue", "short_venue", "max_std", "min_deviation",
-               "min_duration", "active_only", "limit"}
+               "min_edge", "min_convergence_edge", "min_duration", "active_only", "limit"}
     if re.search(r"%(?![0-9a-fA-F]{2})", query):
         raise ValueError("invalid percent encoding")
     values: dict[str, str] = {}
@@ -143,7 +143,7 @@ def parse_opportunities_filters(query: str) -> OpportunitiesFilters:
         values[name] = value
 
     numbers: dict[str, float] = {}
-    for name in ("max_std", "min_deviation"):
+    for name in ("max_std", "min_deviation", "min_edge", "min_convergence_edge"):
         if name in values:
             if not re.fullmatch(r"[+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", values[name], re.ASCII):
                 raise ValueError(f"{name} must be a finite non-negative number")
@@ -160,6 +160,8 @@ def parse_opportunities_filters(query: str) -> OpportunitiesFilters:
     limit = integers.get("limit", MAX_OPPORTUNITY_LIMIT)
     if not 1 <= limit <= MAX_OPPORTUNITY_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_OPPORTUNITY_LIMIT}")
+    if "min_edge" in values and "min_convergence_edge" in values:
+        raise ValueError("min_edge and min_convergence_edge are duplicates")
     active_only = values.get("active_only", "false")
     if active_only not in ("true", "false"):
         raise ValueError("active_only must be true or false")
@@ -169,6 +171,9 @@ def parse_opportunities_filters(query: str) -> OpportunitiesFilters:
         short_venue=values["short_venue"].lower() if "short_venue" in values else None,
         max_std_bps=numbers.get("max_std"),
         min_deviation_bps=numbers.get("min_deviation"),
+        min_convergence_edge_bps=numbers.get(
+            "min_edge", numbers.get("min_convergence_edge")
+        ),
         min_duration_seconds=integers.get("min_duration"),
         active_only=active_only == "true", limit=limit,
     )
@@ -251,7 +256,7 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 <body data-view="__VIEW__">
 <main>
 <header><h1>OPPORTUNITY RADAR</h1><span class="muted">Read-only · $10k executable VWAP</span></header>
-<nav aria-label="Dashboard"><a id="nav-anomalies" href="/anomalies">Anomalies</a><a id="nav-opportunities" href="/opportunities">All Pairs</a><a id="nav-status" href="/status">Status</a></nav>
+<nav aria-label="Dashboard"><a id="nav-opportunities" href="/opportunities">Opportunities</a><a id="nav-anomalies" href="/anomalies">Anomalies</a><a id="nav-status" href="/status">Status</a></nav>
 <div class="summary" aria-live="polite"><span id="overall">Loading…</span><span id="data-as-of" class="muted">Data as of: Unavailable</span><span id="refreshed" class="muted"></span></div>
 <div id="errors" role="alert"></div>
 <section id="anomalies-view">
@@ -272,14 +277,14 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 <label>Long venue<input id="long_venue" name="long_venue" placeholder="All venues"></label>
 <label>Short venue<input id="short_venue" name="short_venue" placeholder="All venues"></label>
 <label>Max 24h std (bps)<input id="max_std" name="max_std" type="number" min="0" step="any"></label>
-<label>Min deviation (bps)<input id="min_deviation" name="min_deviation" type="number" min="0" step="any"></label>
+<label>Min convergence edge (bps)<input id="min_edge" name="min_edge" type="number" min="0" step="any"></label>
 <label>Min duration (s)<input id="min_duration" name="min_duration" type="number" min="0" step="1"></label>
-<label>Limit<input id="limit" name="limit" type="number" min="1" max="200" step="1" placeholder="200"></label>
+<label>Limit<input id="limit" name="limit" type="number" min="1" max="512" step="1" placeholder="512"></label>
 <label class="check"><input id="active_only" name="active_only" type="checkbox">Active only</label>
 <button type="submit">Apply filters</button><button id="reset" type="button">Reset</button>
 </form>
-<p class="muted">Deviation descending · RT Fee and Theo Edge are display-only · Duration comes from persisted SQLite episodes.</p>
-<div class="table-wrap"><table aria-label="Opportunities"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>Spread</th><th>24h Mean</th><th>24h Std</th><th>Deviation</th><th>Duration</th><th>RT Fee</th><th>Theo Edge</th><th>Skew</th><th>Freshness</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="12" class="muted">Loading…</td></tr></tbody></table></div>
+<p class="muted">Actionable routes first · convergence edge after RT fee descending · RT fee and edge are display-only · Duration comes from persisted SQLite episodes.</p>
+<div class="table-wrap"><table aria-label="Opportunities"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>State</th><th>Raw spread</th><th>Current net spread</th><th>Baseline</th><th>Edge after RT fee</th><th>Std</th><th>RT Fee</th><th>Freshness / skew</th><th>Depth</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="12" class="muted">Loading…</td></tr></tbody></table></div>
 </section>
 <section id="status-view">
 <div class="metrics">
@@ -304,7 +309,7 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 <div class="chart-legend"><span class="raw-color">Raw executable spread</span><span class="mean-color">Rolling 24h mean (prior-only)</span><span class="current-color">Current point</span></div>
 <div id="pair-chart" class="card">History unavailable</div>
 <p id="pair-coverage" class="muted"></p>
-<p class="muted">Spreads in bps · Exact sample_time joins · Missing slots stay as gaps; no interpolation. Display points preserve first/latest and significant extrema. Statistics use complete history with full 24h / 80% coverage. RT Fee and Theo Edge are display-only; duration and lifecycle come from persisted SQLite.</p>
+<p class="muted">Spreads in bps · Exact sample_time joins · Missing slots stay as gaps; no interpolation. Display points preserve first/latest and significant extrema. Statistics use complete history with full 24h / 80% coverage. RT Fee and convergence edge after RT fee are display-only; duration and lifecycle come from persisted SQLite.</p>
 </section>
 </main>
 <script>
@@ -316,11 +321,11 @@ const statusClass = value => ['healthy','degraded','down'].includes(value) ? val
 const text = (id, value) => { byId(id).textContent = value ?? 'Unavailable'; };
 const emptyRow = (columns, message) => '<tr><td colspan="' + columns + '" class="muted">' + esc(message) + '</td></tr>';
 const cell = value => '<td>' + esc(value) + '</td>';
-const filterNames = ['symbol','long_venue','short_venue','max_std','min_deviation','min_duration','limit'];
+const filterNames = ['symbol','long_venue','short_venue','max_std','min_edge','min_duration','limit'];
 const anomalyFilterNames = ['symbol','long_venue','short_venue'];
 const isStatus = location.pathname === '/status';
 const isPair = location.pathname === '/pair';
-const isAnomalies = location.pathname === '/' || location.pathname === '/anomalies';
+const isAnomalies = location.pathname === '/anomalies';
 if (!isPair) byId(isAnomalies ? 'nav-anomalies' : isStatus ? 'nav-status' : 'nav-opportunities').setAttribute?.('aria-current', 'page');
 function restoreFilters() {
   const query = new URLSearchParams(location.search);
@@ -371,13 +376,20 @@ function pairCell(row, symbolField) {
   return link ? '<td><a href="' + esc(link) + '">' + symbol + '</a></td>' : '<td>' + symbol + '<small>Exact identity unavailable</small></td>';
 }
 function renderOpportunities(data) {
+  const stateLabel = state => ({eligible:'Eligible',pending:'Baseline pending',unavailable:'Baseline unavailable',stale:'Stale',depth_unavailable:'Depth unavailable'}[state] ?? 'Unavailable');
+  const stateClass = state => state === 'eligible' ? 'healthy' : state === 'stale' || state === 'depth_unavailable' ? 'down' : 'degraded';
+  const baseline = row => number(row.rolling_mean_bps) + '<small>' + (typeof row.basis_coverage === 'number' ? number(row.basis_coverage * 100) + '% coverage' : 'Coverage unavailable') + '</small>';
+  const freshness = row => age(row.freshness_seconds) + ' / ' + age(row.observed_at_skew_seconds);
   byId('opportunity-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
     pairCell(row, 'canonical_symbol') +
     '<td>' + esc(row.long_venue) + '<small>' + esc(row.long_venue_symbol) + '</small></td>' +
     '<td>' + esc(row.short_venue) + '<small>' + esc(row.short_venue_symbol) + '</small></td>' +
-    [row.current_raw_spread_bps,row.rolling_mean_bps,row.rolling_std_bps,row.deviation_bps].map(value => cell(number(value))).join('') +
-    cell(age(row.signal_duration_seconds)) + cell(number(row.round_trip_fee_bps)) + cell(number(row.theoretical_edge_bps)) +
-    cell(age(row.observed_at_skew_seconds)) + '<td title="' + esc(row.sample_time) + '">' + esc(age(row.freshness_seconds)) + '</td></tr>'
+    '<td class="' + stateClass(row.state) + '">' + esc(stateLabel(row.state)) + '</td>' +
+    cell(number(row.current_raw_spread_bps)) + cell(number(row.current_net_spread_bps)) +
+    '<td>' + baseline(row) + '</td>' + cell(number(row.convergence_edge_bps)) +
+    cell(number(row.rolling_std_bps)) + cell(number(row.round_trip_fee_bps)) +
+    '<td title="' + esc(row.sample_time) + '">' + esc(freshness(row)) + '</td>' +
+    '<td class="' + (row.primary_depth_status === 'available' ? 'healthy' : 'down') + '">' + esc(row.primary_depth_status ?? 'Unavailable') + '</td></tr>'
   ).join('') || emptyRow(12, data.status === 'healthy' ? 'No matching opportunities' : 'No matching rows — degraded or unavailable data');
 }
 function renderAnomalies(data) {
@@ -424,11 +436,11 @@ function renderPair(data) {
     (identity.long_venue ?? 'Unavailable') + ' / ' + (identity.long_venue_symbol ?? 'Unavailable') + ' → Short ' +
     (identity.short_venue ?? 'Unavailable') + ' / ' + (identity.short_venue_symbol ?? 'Unavailable'));
   const metrics = [
-    ['Raw spread (bps)',number(current.raw_spread_bps)], ['24h Mean (bps)',number(current.rolling_mean_bps)],
+    ['Raw spread (bps)',number(current.raw_spread_bps)], ['Current net spread (bps)',number(current.current_net_spread_bps)], ['24h Mean (bps)',number(current.rolling_mean_bps)],
     ['24h Std (bps)',number(current.rolling_std_bps)], ['Deviation (bps)',number(current.deviation_bps)],
     ['Signal duration (persisted)',age(current.signal_duration_seconds)],
     ['Long $10k buy VWAP',number(current.long_buy_vwap)], ['Short $10k sell VWAP',number(current.short_sell_vwap)],
-    ['RT Fee (bps, display-only)',number(current.round_trip_fee_bps)], ['Theo Edge (bps, display-only)',number(current.theoretical_edge_bps)],
+    ['RT Fee (bps, display-only)',number(current.round_trip_fee_bps)], ['Convergence edge after RT fee (bps, display-only)',number(current.theoretical_edge_bps)],
     ['Observed skew (s)',number(current.observed_at_skew_seconds)], ['Freshness (s)',number(current.freshness_seconds)],
     ['Sample time (UTC)',current.sample_time ?? 'Unavailable'],
     ['Lifecycle (persisted)',lifecycle.available ? 'Active · confirmed: ' + (lifecycle.candidate_confirmed ? 'yes' : 'no') + ' · alerted: ' + (lifecycle.alerted ? 'yes' : 'no') + ' · ' + (lifecycle.episode_id ?? 'Unavailable') : 'Inactive / unavailable']
@@ -523,7 +535,8 @@ async function refresh(query = new URLSearchParams(location.search)) {
     const status = isStatus ? data.overall?.status : data.status;
     text('overall', (status ?? 'degraded').toUpperCase());
     byId('overall').className = statusClass(status);
-    text('data-as-of', 'Data as of: ' + (data.data_as_of ?? 'Unavailable'));
+    const scannerAsOf = data.scanner_data_as_of === undefined ? '' : ' · Scanner: ' + (data.scanner_data_as_of ?? 'Unavailable');
+    text('data-as-of', 'Data as of: ' + (data.data_as_of ?? 'Unavailable') + scannerAsOf);
     text('refreshed', 'Fetched ' + new Date().toLocaleTimeString() + ' · Generated ' + (data.generated_at ?? 'Unavailable'));
     byId('errors').innerHTML = (data.errors || []).map(error => '<div class="error">' + esc(error) + '</div>').join('');
     if (isStatus) renderStatus(data); else if (isPair) renderPair(data); else if (isAnomalies) renderAnomalies(data); else renderOpportunities(data);
@@ -593,8 +606,8 @@ def _handler_for(
                 view = (
                     "pair" if path == "/pair" else
                     "status" if path == "/status" else
-                    "opportunities" if path == "/opportunities" else
-                    "anomalies"
+                    "anomalies" if path == "/anomalies" else
+                    "opportunities"
                 )
                 self._send(200, "text/html; charset=utf-8", HTML.replace("__VIEW__", view).encode("utf-8"))
                 return

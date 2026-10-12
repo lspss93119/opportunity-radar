@@ -103,6 +103,25 @@ def test_scanner_hydration_keeps_compact_prior_only_pair_state(tmp_path):
     assert stats.mean_bps == pytest.approx(100.0)
 
 
+def test_scanner_default_returns_more_than_two_hundred_configured_routes(tmp_path):
+    venues = tuple(f"venue-{index:02d}" for index in range(23))
+    write_markets(
+        tmp_path / "data",
+        multi_feed_markets(venues, sample_time=NOW),
+    )
+    service = DashboardQueryService(
+        make_multi_feed_config(*venues),
+        data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3",
+        clock=lambda: NOW,
+        cache_ttl_seconds=0,
+    )
+
+    result = service.get_opportunities(OpportunitiesFilters())
+
+    assert len(result["rows"]) == 23 * 22
+
+
 def test_scanner_incremental_refresh_updates_current_snapshot(tmp_path):
     write_markets(
         tmp_path / "data",
