@@ -496,34 +496,25 @@ def test_opportunities_http_exposes_v3_scanner_fields_and_root_is_opportunities(
         html = response.read().decode()
     assert 'href="/opportunities"' in html
     assert 'id="nav-opportunities"' in html
-    assert ">State<" in html
-    assert ">Current net spread<" in html
+    assert ">Route<" in html
+    assert ">Current<" in html
     assert ">Baseline<" in html
-    assert ">Edge after RT fee<" in html
-    assert ">Freshness / skew<" in html
-    assert ">Depth<" in html
+    assert ">Edge<" in html
+    assert ">Execution<" in html
 
 
-def test_opportunities_ui_orders_scan_columns_and_exposes_sticky_hooks(scanner_http):
+def test_opportunities_ui_orders_scan_columns_and_exposes_terminal_hooks(scanner_http):
     with urlopen(scanner_http + "/opportunities") as response:
         html = response.read().decode()
 
     headers = re.search(r'<table[^>]*aria-label="Opportunities"[^>]*>.*?<thead><tr>(.*?)</tr>', html, re.S)
     assert headers is not None
     assert re.findall(r"<th>(.*?)</th>", headers.group(1)) == [
-        "Symbol", "Long", "Short", "State", "Edge after RT fee",
-        "Current net spread", "Baseline", "Freshness / skew", "Depth",
-        "Raw spread", "Std", "RT Fee",
+        "Symbol", "Route", "Edge", "Current", "Baseline", "Execution",
     ]
     for hook in (
-        "--opportunity-symbol-width",
-        "--opportunity-long-width",
-        "--opportunity-short-width",
-        "--opportunity-state-width",
-        "opportunity-table",
-        "table-scroll-hint",
-        "state-badge",
-        "edge-value",
+        "opportunity-terminal-table", "route-cell", "edge-cell", "current-cell",
+        "baseline-cell", "execution-cell", "more-filters",
     ):
         assert hook in html
 
@@ -543,11 +534,118 @@ renderOpportunities({status:'healthy', rows:[{
 console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
 """, setup="location.pathname='/opportunities';\n")
     rendered = result
-    assert 'class="state-badge state-stale"' in rendered
+    assert 'class="state-note state-stale"' in rendered
     assert 'age 1m 9s · skew 0s' in rendered
-    assert '>0.00<' in rendered
-    assert '>—<' in rendered
+    assert 'raw 0.00 bps' in rendered
+    assert 'Net unavailable' in rendered
     assert 'Unavailable' not in rendered
+
+
+def test_terminal_opportunities_use_six_grouped_decision_columns(scanner_http):
+    with urlopen(scanner_http + "/opportunities") as response:
+        html = response.read().decode()
+
+    headers = re.search(
+        r'<table[^>]*aria-label="Opportunities"[^>]*>.*?<thead><tr>(.*?)</tr>',
+        html,
+        re.S,
+    )
+    assert headers is not None
+    assert re.findall(r"<th>(.*?)</th>", headers.group(1)) == [
+        "Symbol", "Route", "Edge", "Current", "Baseline", "Execution",
+    ]
+    for hook in (
+        "opportunity-terminal-table", "route-cell", "edge-cell", "current-cell",
+        "baseline-cell", "execution-cell", "filter-primary", "filter-secondary",
+        "more-filters", "data-scanner-status",
+    ):
+        assert hook in html
+    for forbidden in (">State<", ">Depth<", ">Std<", ">RT Fee<"):
+        assert forbidden not in html
+
+
+def test_terminal_opportunity_cells_keep_state_and_exact_pair_semantics(scanner_http):
+    with urlopen(scanner_http + "/opportunities") as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+renderOpportunities({status:'healthy', rows:[
+  {canonical_symbol:'QQQ', long_venue:'arcus', long_venue_symbol:'QQQ-USD',
+   short_venue:'lighter_robinhood', short_venue_symbol:'QQQ', state:'eligible', basis_state:'eligible',
+   current_raw_spread_bps:26.24, current_net_spread_bps:18.24,
+   rolling_mean_bps:8.00, rolling_std_bps:1.25, basis_coverage:0.997,
+   convergence_edge_bps:10.24, round_trip_fee_bps:8.00,
+   freshness_seconds:4, observed_at_skew_seconds:1.5, primary_depth_status:'available'},
+  {canonical_symbol:'SNDK', long_venue:'arcus', long_venue_symbol:'SNDK-USD',
+   short_venue:'lighter', short_venue_symbol:'SNDK', state:'pending',
+   current_raw_spread_bps:-2, current_net_spread_bps:-10,
+   rolling_mean_bps:null, rolling_std_bps:null, basis_coverage:null,
+   convergence_edge_bps:-10, round_trip_fee_bps:8,
+   freshness_seconds:75, observed_at_skew_seconds:null, primary_depth_status:'unavailable'},
+  {canonical_symbol:'NVDA', long_venue:'arcus', long_venue_symbol:'NVDA-USD',
+   short_venue:'lighter', short_venue_symbol:'NVDA', state:'stale',
+   current_raw_spread_bps:12, current_net_spread_bps:null,
+   rolling_mean_bps:7, rolling_std_bps:2, basis_coverage:1,
+   convergence_edge_bps:null, round_trip_fee_bps:8,
+   freshness_seconds:181, observed_at_skew_seconds:0, primary_depth_status:'unavailable'}
+]});
+console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
+""", setup="location.pathname='/opportunities';\n")
+    rendered = result
+    assert 'class="route-cell"' in rendered
+    assert "LONG" in rendered and "SHORT" in rendered
+    assert "+18.24" in rendered and "+26.24" in rendered
+    assert "8.00" in rendered and "cov" in rendered
+    assert "age 4s" in rendered and "skew 2s" in rendered
+    assert "Baseline pending" in rendered and "STALE" in rendered
+    assert "Depth unavailable" in rendered
+    assert "/pair?symbol=QQQ" in rendered
+
+
+def test_terminal_anomalies_use_six_grouped_columns(scanner_http):
+    with urlopen(scanner_http + "/anomalies") as response:
+        html = response.read().decode()
+    headers = re.search(
+        r'<table[^>]*aria-label="Active anomalies"[^>]*>.*?<thead><tr>(.*?)</tr>',
+        html,
+        re.S,
+    )
+    assert headers is not None
+    assert re.findall(r"<th>(.*?)</th>", headers.group(1)) == [
+        "Symbol", "Route", "Deviation", "Reference", "Episode", "Context",
+    ]
+    for hook in ("anomaly-terminal-table", "anomaly-route", "anomaly-context"):
+        assert hook in html
+
+
+def test_terminal_pair_places_chart_before_secondary_details(scanner_http):
+    with urlopen(scanner_http + "/pair") as response:
+        html = response.read().decode()
+    assert html.index('id="pair-summary"') < html.index('id="pair-chart"')
+    assert html.index('id="pair-chart"') < html.index('id="pair-details"')
+    for hook in ("pair-kpis", "pair-layout", "pair-main", "pair-right-rail",
+                 "pair-long-leg", "pair-short-leg", "pair-lifecycle-rail", "pair-secondary"):
+        assert hook in html
+
+
+def test_terminal_pair_summary_prioritizes_edge_current_baseline_and_execution(scanner_http):
+    with urlopen(scanner_http + "/pair") as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+renderPair({
+  identity:{canonical_symbol:'QQQ',long_venue:'arcus',long_venue_symbol:'QQQ-USD',short_venue:'lighter_robinhood',short_venue_symbol:'QQQ'},
+  current:{raw_spread_bps:26.24,current_net_spread_bps:18.24,rolling_mean_bps:8,rolling_std_bps:1.25,deviation_bps:18.24,theoretical_edge_bps:10.24,signal_duration_seconds:120,long_buy_vwap:100,short_sell_vwap:100.2624,round_trip_fee_bps:8,observed_at_skew_seconds:1.5,freshness_seconds:4,sample_time:'2026-09-23T12:00:00Z'},
+  basis:{eligible:true,sample_count:8500,coverage:.997},
+  history:[{sample_time:'2026-09-23T11:59:00Z',raw_spread_bps:8,segment:0},{sample_time:'2026-09-23T12:00:00Z',raw_spread_bps:26.24,segment:0}],
+  rolling_mean_series:[{sample_time:'2026-09-23T11:59:00Z',rolling_mean_bps:8,segment:0},{sample_time:'2026-09-23T12:00:00Z',rolling_mean_bps:8,segment:0}],
+  lifecycle:{available:true,reference_mean_bps:8,candidate_started_at:'2026-09-23T11:58:00Z',confirmed_at:'2026-09-23T11:59:00Z',candidate_confirmed:true,alerted:false}
+});
+console.log(JSON.stringify({summary:byId('pair-summary').innerHTML, secondary:byId('pair-secondary').innerHTML}));
+""", setup="location.pathname='/pair';\n")
+    labels = re.findall(r'class="metric-label">([^<]+)', result["summary"])
+    assert labels[:4] == ["Edge after RT fee", "Current", "Baseline", "Execution"]
+    assert "26.24" in result["secondary"] or "26.24" in result["summary"]
+    assert "Long $10k buy VWAP" in result["secondary"]
+    assert "Short $10k sell VWAP" in result["secondary"]
 
 
 def test_status_ui_distinguishes_latest_rows_from_configured_feeds(scanner_http):
@@ -557,10 +655,10 @@ def test_status_ui_distinguishes_latest_rows_from_configured_feeds(scanner_http)
     assert "Healthy feeds / primary VWAP ready" in html
 
 
-def test_anomalies_ui_reuses_scroll_and_identity_table_presentation(scanner_http):
+def test_anomalies_ui_uses_grouped_terminal_presentation(scanner_http):
     with urlopen(scanner_http + "/anomalies") as response:
         html = response.read().decode()
-    for hook in ("anomaly-table", "--anomaly-symbol-width", "table-scroll-hint"):
+    for hook in ("anomaly-terminal-table", "anomaly-route", "anomaly-context"):
         assert hook in html
 
 
@@ -691,7 +789,7 @@ def test_dashboard_html_navigation_and_view_anchors(scanner_http, path):
     elif path in ("/", "/opportunities"):
         for anchor in ("filters", "opportunity-rows", "data-as-of"):
             assert f'id="{anchor}"' in html
-        for column in ("Symbol", "Long", "Short", "State", "Raw spread", "Current net spread", "Baseline", "Edge after RT fee", "Std", "RT Fee", "Freshness / skew", "Depth"):
+        for column in ("Symbol", "Route", "Current", "Baseline", "Edge", "Execution"):
             assert f">{column}<" in html
     else:
         for anchor in ("anomaly-filters", "anomaly-symbol", "anomaly-long-venue", "anomaly-short-venue", "anomaly-eligible-only", "anomaly-rows", "data-as-of"):
@@ -998,14 +1096,16 @@ def test_pair_ui_summary_chart_and_range_state(scanner_http):
     result = run_ui_script(html, """
 renderPair(payload);
 const summary = byId('pair-summary').innerHTML;
+const secondary = byId('pair-secondary').innerHTML;
 const chart = byId('pair-chart').innerHTML;
 byId('pair-range').value = '7d';
 byId('pair-range').listeners.change();
-console.log(JSON.stringify({summary, chart, search:location.search, requests:requests.map(r=>r.url)}));
+console.log(JSON.stringify({summary, secondary, chart, search:location.search, requests:requests.map(r=>r.url)}));
 """, setup=POLLING_SETUP + "location.pathname='/pair'; location.search=" + json.dumps("?" + query) + "; const payload=" + json.dumps(payload) + ";\n")
-    for label in ("Raw spread", "24h Mean", "24h Std", "Deviation", "Signal duration", "Long $10k buy VWAP", "Short $10k sell VWAP", "RT Fee", "Convergence edge after RT fee", "Observed skew", "Freshness", "Sample time", "Lifecycle"):
-        assert label in result["summary"]
-    assert "500.00" in result["summary"] and "294.00" in result["summary"]
+    combined = result["summary"] + result["secondary"]
+    for label in ("Raw spread", "24h Mean", "24h Std", "Deviation", "Signal duration", "Long $10k buy VWAP", "Short $10k sell VWAP", "RT Fee", "Observed skew", "Freshness", "Sample time", "Lifecycle"):
+        assert label in combined
+    assert "500.00" in combined and "294.00" in combined
     assert "<svg" in result["chart"] and 'data-series="raw"' in result["chart"]
     assert 'data-series="mean"' in result["chart"] and 'data-series="current"' in result["chart"]
     assert parse_qs(result["search"][1:]) == {**{k: [v] for k, v in PAIR_QUERY.items()}, "range": ["7d"]}
@@ -1037,9 +1137,9 @@ console.log(JSON.stringify({summary:byId('pair-summary').innerHTML, chart:byId('
 """, setup="location.pathname='/pair';\n")
     labels = re.findall(r'class="metric-label">([^<]+)', result["summary"])
     assert labels[:3] == [
-        "Raw spread (bps)",
-        "Current net spread (bps)",
-        "Convergence edge after RT fee (bps, display-only)",
+        "Edge after RT fee",
+        "Current",
+        "Baseline",
     ]
     assert 'data-marker="current"' in result["chart"]
     assert 'data-marker="candidate"' in result["chart"]

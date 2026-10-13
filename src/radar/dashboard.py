@@ -215,115 +215,139 @@ HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Opportunity Radar</title>
 <style>
-:root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111827; color: #e5e7eb; }
+:root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #07111f; color: #dbe7f5; }
 * { box-sizing: border-box; }
-body { margin: 0; }
-main { max-width: 1440px; margin: auto; padding: 24px; }
-h1 { margin: 0; font-size: 1.2rem; letter-spacing: .06em; }
-h2 { margin: 0 0 12px; font-size: .95rem; }
-header, nav, .summary { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
-header { justify-content: space-between; }
-a { color: #93c5fd; text-underline-offset: 3px; }
-nav a { padding: 8px 12px; border-radius: 6px; }
-nav a[aria-current="page"] { background: #374151; color: #fff; }
-.muted, .metric-label { color: #94a3b8; font-size: .8rem; }
-.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 18px; }
-.card { background: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 14px; overflow-wrap: anywhere; }
-.metric-value { margin-top: 6px; font-size: 1rem; }
-#filters, #anomaly-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 9px 10px; align-items: end; margin-bottom: 12px; }
-label { display: grid; gap: 5px; font-size: .78rem; color: #cbd5e1; }
-input, button { font: inherit; color: #e5e7eb; background: #1f2937; border: 1px solid #4b5563; border-radius: 5px; padding: 8px; }
-input { width: 130px; }
+body { margin: 0; background: #07111f; }
+main { width: calc(100% - 36px); max-width: 1760px; margin: auto; padding: 16px 0 28px; }
+h1 { margin: 0; font-size: 1rem; letter-spacing: .12em; color: #f8fafc; }
+h2 { margin: 0 0 12px; font-size: .92rem; letter-spacing: .04em; }
+a { color: #8ec5ff; text-underline-offset: 3px; }
+.terminal-header { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 10px 0 12px; border-bottom: 1px solid #24364b; }
+.brand-line, .terminal-meta, nav { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.brand-mark { color: #38bdf8; font-weight: 700; }
+nav { margin: 12px 0 14px; gap: 4px; }
+nav a { padding: 6px 10px; border-radius: 4px; color: #8fa5bb; font-size: .78rem; }
+nav a[aria-current="page"] { background: #163149; color: #e0f2fe; }
+.read-only, .scanner-status { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #31516d; border-radius: 999px; padding: 4px 8px; color: #93c5fd; font: 700 .66rem/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; }
+.scanner-status { border-color: #28634f; color: #6ee7b7; }
+.muted, .metric-label { color: #7f95aa; font-size: .76rem; }
+.summary { display: flex; align-items: center; gap: 12px; min-height: 24px; margin-bottom: 12px; }
+.summary #overall { font: 700 .72rem/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 9px; margin-bottom: 14px; }
+.card { background: #0d1b2b; border: 1px solid #24364b; border-radius: 6px; padding: 11px 12px; overflow-wrap: anywhere; }
+.metric-value { margin-top: 5px; font: 600 .92rem/1.35 "SFMono-Regular", Consolas, monospace; }
+#filters, #anomaly-filters { margin-bottom: 10px; }
+#anomaly-filters { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; }
+.filter-primary, .filter-secondary { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; }
+.filter-primary { padding: 8px; background: #0b1929; border: 1px solid #1f344a; border-radius: 6px; }
+.filter-secondary { padding: 8px 0 2px; }
+.more-filters { margin-top: 7px; color: #8fa5bb; font-size: .74rem; }
+.more-filters summary { cursor: pointer; width: fit-content; }
+label { display: grid; gap: 4px; font-size: .7rem; color: #a9bbcc; }
+input, button, select { font: inherit; color: #dbe7f5; background: #0e1d2e; border: 1px solid #35516a; border-radius: 4px; padding: 7px 8px; }
+input, select { width: 132px; }
 input[type="checkbox"] { width: auto; }
-.check { display: flex; align-items: center; padding: 8px 0; }
-button { cursor: pointer; min-height: 36px; }
-.filter-actions { display: flex; gap: 8px; align-items: end; }
-a:focus-visible, input:focus-visible, button:focus-visible { outline: 2px solid #93c5fd; outline-offset: 3px; }
-.section { min-width: 0; margin-bottom: 20px; }
-.table-wrap { position: relative; overflow-x: auto; border: 1px solid #374151; border-radius: 8px; scrollbar-color: #64748b #1f2937; }
-table { width: 100%; border-collapse: collapse; background: #1f2937; font-size: .8rem; }
-th, td { padding: 10px; text-align: left; border-bottom: 1px solid #374151; white-space: nowrap; font-variant-numeric: tabular-nums; }
-th { color: #cbd5e1; font-size: .74rem; }
+.check { display: flex; align-items: center; padding: 7px 0; }
+button { cursor: pointer; min-height: 32px; }
+.filter-actions { display: flex; gap: 6px; align-items: end; }
+a:focus-visible, input:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid #7dd3fc; outline-offset: 2px; }
+.section { min-width: 0; margin-bottom: 18px; }
+.table-wrap { position: relative; overflow-x: auto; border: 1px solid #24364b; border-radius: 6px; scrollbar-color: #46627b #0d1b2b; }
+table { width: 100%; border-collapse: collapse; background: #0d1b2b; font-size: .76rem; }
+th, td { padding: 8px 9px; text-align: left; border-bottom: 1px solid #203246; font-variant-numeric: tabular-nums; vertical-align: middle; }
+th { color: #91a8bd; font-size: .66rem; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
 tr:last-child td { border-bottom: 0; }
-td small { display: block; color: #94a3b8; margin-top: 3px; }
-.table-scroll-hint { display: block; margin: 6px 2px 0; text-align: right; color: #64748b; font-size: .7rem; }
+td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; line-height: 1.25; }
+.table-scroll-hint { display: block; margin: 5px 2px 0; color: #607991; font-size: .68rem; }
+.table-help { margin: 0 0 8px; color: #7890a6; font-size: .7rem; }
 .healthy { color: #6ee7b7; }
 .degraded { color: #fcd34d; }
 .down, .error { color: #fca5a5; }
-.error { margin: 8px 0; overflow-wrap: anywhere; font-size: .82rem; }
-.state-badge { display: inline-flex; align-items: center; min-height: 23px; padding: 3px 7px; border: 1px solid currentColor; border-radius: 999px; font-size: .7rem; font-weight: 600; line-height: 1.1; }
-.state-eligible { color: #6ee7b7; background: #064e3b; }
-.state-pending, .state-unavailable { color: #fcd34d; background: #422006; }
-.state-stale { color: #fca5a5; background: #450a0a; }
-.state-depth-unavailable { color: #fdba74; background: #431407; }
-.state-cell { white-space: normal; }
-.direction-label { display: block; color: #94a3b8; font-size: .65rem; font-weight: 700; letter-spacing: .08em; }
-.route-cell { min-width: 150px; white-space: normal; }
+.error { margin: 8px 0; overflow-wrap: anywhere; font-size: .78rem; }
+.state-badge { display: inline-flex; align-items: center; min-height: 21px; padding: 3px 7px; border: 1px solid currentColor; border-radius: 999px; font-size: .66rem; font-weight: 700; line-height: 1.1; }
+.state-eligible { color: #6ee7b7; background: #073b32; }
+.state-pending, .state-unavailable { color: #fcd34d; background: #3d2d08; }
+.state-stale { color: #fca5a5; background: #3b1418; }
+.state-depth-unavailable { color: #fdba74; background: #3d1d0f; }
+.state-note { font: 700 .66rem/1.2 "SFMono-Regular", Consolas, monospace; letter-spacing: .03em; }
+.unavailable { color: #71869b; }
 .numeric { text-align: right; }
-.edge-value { font-weight: 700; }
+.opportunity-terminal-table { table-layout: fixed; min-width: 0; }
+.opportunity-terminal-table th:nth-child(1), .opportunity-terminal-table td:nth-child(1) { width: 13%; }
+.opportunity-terminal-table th:nth-child(2), .opportunity-terminal-table td:nth-child(2) { width: 29%; }
+.opportunity-terminal-table th:nth-child(3), .opportunity-terminal-table td:nth-child(3) { width: 14%; }
+.opportunity-terminal-table th:nth-child(4), .opportunity-terminal-table td:nth-child(4) { width: 17%; }
+.opportunity-terminal-table th:nth-child(5), .opportunity-terminal-table td:nth-child(5) { width: 14%; }
+.opportunity-terminal-table th:nth-child(6), .opportunity-terminal-table td:nth-child(6) { width: 13%; }
+.opportunity-terminal-table tbody tr:hover, .anomaly-terminal-table tbody tr:hover { background: #10263a; }
+.opportunity-terminal-table .symbol-cell { font-weight: 700; white-space: nowrap; }
+.route-cell { white-space: normal; }
+.route-link { display: block; color: inherit; text-decoration: none; }
+.route-side { display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 5px; align-items: baseline; line-height: 1.25; }
+.route-side + .route-side { margin-top: 4px; }
+.route-label { color: #728aa0; font: 700 .62rem/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; }
+.route-venue { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #dbe7f5; }
+.route-symbol { grid-column: 2; color: #7890a6; font: .66rem/1.15 "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
+.route-side.long .route-label { color: #6ee7b7; }
+.route-side.short .route-label { color: #fca5a5; }
+.edge-cell, .current-cell, .baseline-cell, .execution-cell { white-space: normal; }
+.edge-value { font: 700 .93rem/1.15 "SFMono-Regular", Consolas, monospace; }
 .edge-positive { color: #6ee7b7; }
 .edge-negative { color: #fca5a5; }
-.edge-zero { color: #e5e7eb; }
-.edge-unavailable { color: #94a3b8; }
-.unavailable { color: #94a3b8; }
-#opportunities-view { --opportunity-symbol-width: 82px; --opportunity-long-width: 160px; --opportunity-short-width: 160px; --opportunity-state-width: 140px; }
-.opportunity-table { min-width: 1320px; border-collapse: separate; border-spacing: 0; }
-.opportunity-table th, .opportunity-table td { position: relative; }
-.opportunity-table th:nth-child(1), .opportunity-table td:nth-child(1) { width: var(--opportunity-symbol-width); min-width: var(--opportunity-symbol-width); max-width: var(--opportunity-symbol-width); }
-.opportunity-table th:nth-child(2), .opportunity-table td:nth-child(2) { width: var(--opportunity-long-width); min-width: var(--opportunity-long-width); }
-.opportunity-table th:nth-child(3), .opportunity-table td:nth-child(3) { width: var(--opportunity-short-width); min-width: var(--opportunity-short-width); }
-.opportunity-table th:nth-child(4), .opportunity-table td:nth-child(4) { width: var(--opportunity-state-width); min-width: var(--opportunity-state-width); }
-.opportunity-table th:nth-child(5), .opportunity-table td:nth-child(5) { min-width: 105px; }
-.opportunity-table th:nth-child(6), .opportunity-table td:nth-child(6) { min-width: 105px; }
-.opportunity-table th:nth-child(7), .opportunity-table td:nth-child(7) { min-width: 140px; }
-.opportunity-table th:nth-child(8), .opportunity-table td:nth-child(8) { min-width: 125px; }
-.opportunity-table th:nth-child(9), .opportunity-table td:nth-child(9) { min-width: 90px; }
-.opportunity-table th:nth-child(10), .opportunity-table td:nth-child(10) { min-width: 95px; }
-.opportunity-table th:nth-child(11), .opportunity-table td:nth-child(11) { min-width: 80px; }
-.opportunity-table th:nth-child(12), .opportunity-table td:nth-child(12) { min-width: 80px; }
-.opportunity-table thead th { position: sticky; top: 0; z-index: 10; background: #243244; }
-.opportunity-table th:nth-child(-n+4), .opportunity-table td:nth-child(-n+4) { position: sticky; z-index: 4; background: #1f2937; }
-.opportunity-table thead th:nth-child(-n+4) { z-index: 20; background: #243244; }
-.opportunity-table th:nth-child(1), .opportunity-table td:nth-child(1) { left: 0; }
-.opportunity-table th:nth-child(2), .opportunity-table td:nth-child(2) { left: var(--opportunity-symbol-width); }
-.opportunity-table th:nth-child(3), .opportunity-table td:nth-child(3) { left: calc(var(--opportunity-symbol-width) + var(--opportunity-long-width)); }
-.opportunity-table th:nth-child(4), .opportunity-table td:nth-child(4) { left: calc(var(--opportunity-symbol-width) + var(--opportunity-long-width) + var(--opportunity-short-width)); box-shadow: 7px 0 12px -10px #020617; }
-.opportunity-table tbody tr:hover td:nth-child(-n+4) { background: #26364a; }
-.opportunity-table .symbol-cell { overflow: hidden; text-overflow: ellipsis; }
-.opportunity-table .edge-value { font-size: .84rem; }
-#anomalies-view { --anomaly-symbol-width: 82px; --anomaly-long-width: 180px; --anomaly-short-width: 180px; }
-.anomaly-table { min-width: 1080px; border-collapse: separate; border-spacing: 0; }
-.anomaly-table thead th { position: sticky; top: 0; z-index: 10; background: #243244; }
-.anomaly-table th:nth-child(-n+3), .anomaly-table td:nth-child(-n+3) { position: sticky; z-index: 4; background: #1f2937; }
-.anomaly-table thead th:nth-child(-n+3) { z-index: 20; background: #243244; }
-.anomaly-table th:nth-child(1), .anomaly-table td:nth-child(1) { width: var(--anomaly-symbol-width); min-width: var(--anomaly-symbol-width); left: 0; }
-.anomaly-table th:nth-child(2), .anomaly-table td:nth-child(2) { width: var(--anomaly-long-width); min-width: var(--anomaly-long-width); left: var(--anomaly-symbol-width); }
-.anomaly-table th:nth-child(3), .anomaly-table td:nth-child(3) { width: var(--anomaly-short-width); min-width: var(--anomaly-short-width); left: calc(var(--anomaly-symbol-width) + var(--anomaly-long-width)); box-shadow: 7px 0 12px -10px #020617; }
-#pair-summary .card:nth-child(-n+3) { border-color: #475569; }
-#pair-chart { overflow: hidden; }
+.edge-zero { color: #dbe7f5; }
+.edge-unavailable { color: #71869b; }
+.current-net { font: 700 .86rem/1.15 "SFMono-Regular", Consolas, monospace; }
+.current-raw { color: #8fa5bb; }
+.baseline-primary, .execution-primary { font: 600 .78rem/1.2 "SFMono-Regular", Consolas, monospace; }
+.execution-primary { color: #b8d8f0; }
+.anomaly-terminal-table { table-layout: fixed; min-width: 0; }
+.anomaly-terminal-table th:nth-child(1), .anomaly-terminal-table td:nth-child(1) { width: 12%; }
+.anomaly-terminal-table th:nth-child(2), .anomaly-terminal-table td:nth-child(2) { width: 29%; }
+.anomaly-terminal-table th:nth-child(3), .anomaly-terminal-table td:nth-child(3) { width: 13%; }
+.anomaly-terminal-table th:nth-child(4), .anomaly-terminal-table td:nth-child(4) { width: 13%; }
+.anomaly-terminal-table th:nth-child(5), .anomaly-terminal-table td:nth-child(5) { width: 17%; }
+.anomaly-terminal-table th:nth-child(6), .anomaly-terminal-table td:nth-child(6) { width: 16%; }
+.anomaly-route, .anomaly-context { white-space: normal; }
+.pair-identity { margin-bottom: 12px; }
+.pair-kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.pair-layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(230px, 1fr); gap: 12px; align-items: start; }
+.pair-main, .pair-right-rail { min-width: 0; }
+.pair-right-rail { display: grid; gap: 9px; }
+.pair-rail-card { background: #0d1b2b; border: 1px solid #24364b; border-radius: 6px; padding: 10px; }
+.pair-rail-card h3 { margin: 0 0 7px; color: #91a8bd; font: 700 .65rem/1.1 "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.pair-rail-line { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; font-size: .72rem; }
+.pair-rail-line span:last-child { color: #dbe7f5; text-align: right; overflow-wrap: anywhere; }
+.pair-chart-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.pair-chart-header label { display: flex; align-items: center; gap: 7px; }
+#pair-chart { min-height: 270px; overflow: hidden; }
+#pair-chart svg { display: block; width: 100%; height: auto; }
 #pair-chart svg text { font-variant-numeric: tabular-nums; }
-#pair-chart .axis-tick { stroke: #334155; }
+#pair-chart .axis-tick { stroke: #334d66; }
+.chart-legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 8px 0; font-size: .72rem; }
+.raw-color { color: #93c5fd; } .mean-color { color: #fcd34d; } .current-color { color: #6ee7b7; }
+.pair-details { margin-top: 12px; border-top: 1px solid #24364b; padding-top: 10px; }
+.pair-details summary { cursor: pointer; color: #91a8bd; font-size: .76rem; }
+.pair-secondary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }
+.pair-secondary .detail { padding: 8px; background: #0b1929; border: 1px solid #1f344a; border-radius: 4px; }
+.pair-secondary .detail-label { color: #71869b; font-size: .66rem; }
+.pair-secondary .detail-value { display: block; margin-top: 3px; font: .73rem/1.3 "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
 [data-view="opportunities"] #status-view, [data-view="opportunities"] #pair-view, [data-view="opportunities"] #anomalies-view,
 [data-view="status"] #opportunities-view, [data-view="status"] #pair-view, [data-view="status"] #anomalies-view,
 [data-view="pair"] #opportunities-view, [data-view="pair"] #status-view, [data-view="pair"] #anomalies-view,
 [data-view="anomalies"] #opportunities-view, [data-view="anomalies"] #status-view, [data-view="anomalies"] #pair-view { display: none; }
-select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; border: 1px solid #4b5563; border-radius: 5px; }
-#pair-chart svg { display: block; width: 100%; height: auto; }
-.chart-legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0; font-size: .8rem; }
-.raw-color { color: #93c5fd; } .mean-color { color: #fcd34d; } .current-color { color: #6ee7b7; }
-@media(max-width: 760px) { main { padding: 14px; } #filters label:not(.check), #anomaly-filters label:not(.check) { flex: 1 1 130px; } input { width: 100%; } }
-@media(max-width: 760px) { #opportunities-view { --opportunity-symbol-width: 72px; --opportunity-long-width: 128px; --opportunity-short-width: 128px; --opportunity-state-width: 120px; } th, td { padding: 8px; } .table-scroll-hint { text-align: left; } }
+@media(max-width: 960px) { main { width: calc(100% - 24px); } .pair-layout { grid-template-columns: minmax(0, 1fr); } .pair-right-rail { grid-template-columns: repeat(3, minmax(0, 1fr)); } .pair-secondary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media(max-width: 760px) { main { width: calc(100% - 20px); padding-top: 10px; } .terminal-header { align-items: flex-start; flex-direction: column; gap: 9px; } th, td { padding: 7px; } .pair-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } .pair-right-rail { grid-template-columns: 1fr; } .pair-secondary { grid-template-columns: 1fr; } input, select { width: 100%; } .filter-primary, .filter-secondary { align-items: stretch; } .filter-primary label, .filter-secondary label { flex: 1 1 130px; } .filter-actions { width: 100%; } }
 </style>
 </head>
 <body data-view="__VIEW__">
 <main>
-<header><h1>OPPORTUNITY RADAR</h1><span class="muted">Read-only · $10k executable VWAP</span></header>
+<header class="terminal-header"><div class="brand-line"><span class="brand-mark">◆</span><h1>OPPORTUNITY RADAR</h1></div><div class="terminal-meta"><span class="read-only">READ ONLY</span><span class="muted">$10k executable VWAP</span><span id="scanner-status" class="scanner-status" data-scanner-status>SCANNER · —</span></div></header>
 <nav aria-label="Dashboard"><a id="nav-opportunities" href="/opportunities">Opportunities</a><a id="nav-anomalies" href="/anomalies">Anomalies</a><a id="nav-status" href="/status">Status</a></nav>
 <div class="summary" aria-live="polite"><span id="overall">Loading…</span><span id="data-as-of" class="muted">Data as of: Unavailable</span><span id="refreshed" class="muted"></span></div>
 <div id="errors" role="alert"></div>
 <section id="anomalies-view">
 <h2>Active Anomalies</h2>
-<p class="muted">Confirmed v2 episodes only · lifecycle and Telegram state come from read-only SQLite.</p>
+<p class="table-help">Confirmed v2 episodes · lifecycle and Telegram state from read-only SQLite.</p>
 <form id="anomaly-filters">
 <label>Symbol<input id="anomaly-symbol" name="symbol" placeholder="All symbols"></label>
 <label>Long venue<input id="anomaly-long-venue" name="long_venue" placeholder="All venues"></label>
@@ -331,25 +355,27 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 <label class="check"><input id="anomaly-eligible-only" name="eligible_only" type="checkbox">TG eligible only</label>
 <span class="filter-actions"><button type="submit">Apply filters</button><button id="anomaly-reset" type="button">Reset</button></span>
 </form>
-<div class="table-wrap"><table class="anomaly-table" aria-label="Active anomalies"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>Current</th><th>Reference</th><th>Deviation</th><th>Age</th><th>Peak</th><th>12h / 24h / 48h</th><th>Alignment</th><th>Telegram</th></tr></thead><tbody id="anomaly-rows"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody></table></div>
-<span class="table-scroll-hint">Scroll horizontally for lifecycle detail →</span>
+<div class="table-wrap"><table class="anomaly-terminal-table" aria-label="Active anomalies"><thead><tr><th>Symbol</th><th>Route</th><th>Deviation</th><th>Reference</th><th>Episode</th><th>Context</th></tr></thead><tbody id="anomaly-rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table></div>
 </section>
 <section id="opportunities-view">
-<form id="filters">
+<form id="filters" class="filter-toolbar">
+<div class="filter-primary">
 <label>Symbol<input id="symbol" name="symbol" placeholder="All symbols"></label>
 <label>Long venue<input id="long_venue" name="long_venue" placeholder="All venues"></label>
 <label>Short venue<input id="short_venue" name="short_venue" placeholder="All venues"></label>
-<label>Max 24h std (bps)<input id="max_std" name="max_std" type="number" min="0" step="any"></label>
 <label>Min convergence edge (bps)<input id="min_edge" name="min_edge" type="number" min="0" step="any"></label>
-<label>Min duration (s)<input id="min_duration" name="min_duration" type="number" min="0" step="1"></label>
 <label>Basis state<select id="basis_state" name="basis_state"><option value="">All states</option><option value="eligible">Eligible</option><option value="pending">Baseline pending</option><option value="unavailable">Baseline unavailable</option></select></label>
+<span class="filter-actions"><button type="submit">Apply filters</button><button id="reset" type="button">Reset</button></span>
+</div>
+<details id="more-filters" class="more-filters"><summary>More filters</summary><div class="filter-secondary">
+<label>Max 24h std (bps)<input id="max_std" name="max_std" type="number" min="0" step="any"></label>
+<label>Min duration (s)<input id="min_duration" name="min_duration" type="number" min="0" step="1"></label>
 <label>Limit<input id="limit" name="limit" type="number" min="1" max="512" step="1" placeholder="512"></label>
 <label class="check"><input id="active_only" name="active_only" type="checkbox">Active only</label>
-<span class="filter-actions"><button type="submit">Apply filters</button><button id="reset" type="button">Reset</button></span>
+</div></details>
 </form>
-<p class="muted">Actionable routes first · convergence edge after RT fee descending · RT fee and edge are display-only · Duration comes from persisted SQLite episodes.</p>
-<div class="table-wrap"><table aria-label="Opportunities" class="opportunity-table"><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>State</th><th>Edge after RT fee</th><th>Current net spread</th><th>Baseline</th><th>Freshness / skew</th><th>Depth</th><th>Raw spread</th><th>Std</th><th>RT Fee</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="12" class="muted">Loading…</td></tr></tbody></table></div>
-<span class="table-scroll-hint">Scroll horizontally for lower-priority spread detail →</span>
+<p class="table-help">Sorted by deviation · values are display-only · duration comes from persisted SQLite.</p>
+<div class="table-wrap"><table aria-label="Opportunities" class="opportunity-terminal-table"><thead><tr><th>Symbol</th><th>Route</th><th>Edge</th><th>Current</th><th>Baseline</th><th>Execution</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table></div>
 </section>
 <section id="status-view">
 <div class="metrics">
@@ -369,12 +395,15 @@ select { font: inherit; color: #e5e7eb; background: #1f2937; padding: 8px; borde
 </section>
 <section id="pair-view">
 <h2 id="pair-identity">Pair Detail — exact identity unavailable</h2>
-<div id="pair-summary" class="metrics"></div>
-<label>History range<select id="pair-range" aria-label="History range"><option value="1h">1h</option><option value="6h">6h</option><option value="24h" selected>24h</option><option value="3d">3d</option><option value="7d">7d</option><option value="all">All available (90 days)</option></select></label>
-<div class="chart-legend"><span class="raw-color">Raw executable spread</span><span class="mean-color">Rolling 24h mean (prior-only)</span><span class="current-color">Current point</span></div>
+<div id="pair-summary" class="pair-kpis metrics"></div>
+<div class="pair-layout"><div class="pair-main">
+<div class="pair-chart-header"><strong>Directional executable spread</strong><label>Range<select id="pair-range" aria-label="History range"><option value="1h">1h</option><option value="6h">6h</option><option value="24h" selected>24h</option><option value="3d">3d</option><option value="7d">7d</option><option value="all">All available (90 days)</option></select></label></div>
+<div class="chart-legend"><span class="raw-color">Raw spread</span><span class="mean-color">Rolling 24h mean</span><span class="current-color">Current</span></div>
 <div id="pair-chart" class="card">History unavailable</div>
 <p id="pair-coverage" class="muted"></p>
-<p class="muted">Spreads in bps · Exact sample_time joins · Missing slots stay as gaps; no interpolation. Display points preserve first/latest and significant extrema. Statistics use complete history with full 24h / 80% coverage. RT Fee and convergence edge after RT fee are display-only; duration and lifecycle come from persisted SQLite.</p>
+</div><aside class="pair-right-rail"><div id="pair-long-leg" class="pair-rail-card"></div><div id="pair-short-leg" class="pair-rail-card"></div><div id="pair-lifecycle-rail" class="pair-rail-card"></div></aside></div>
+<details id="pair-details" class="pair-details"><summary>Secondary operational details</summary><div id="pair-secondary" class="pair-secondary"></div></details>
+<p class="muted">UTC exact sample_time joins · missing slots remain gaps · history is read-only and prior-only. Statistics and lifecycle values are not recomputed in the browser.</p>
 </section>
 </main>
 <script>
@@ -446,45 +475,45 @@ function pairLink(row) {
 function pairCell(row, symbolField) {
   const link = pairLink(row);
   const symbol = esc(row[symbolField]);
-  return link ? '<td class="symbol-cell"><a href="' + esc(link) + '">' + symbol + '</a></td>' : '<td class="symbol-cell">' + symbol + '<small>Exact identity unavailable</small></td>';
+  const state = row.state ? '<small>' + esc(({eligible:'Eligible',pending:'Baseline pending',unavailable:'Baseline unavailable',stale:'Stale',depth_unavailable:'Depth unavailable'}[row.state] ?? row.state)) + '</small>' : '';
+  return link ? '<td class="symbol-cell"><a href="' + esc(link) + '">' + symbol + '</a>' + state + '</td>' : '<td class="symbol-cell">' + symbol + '<small>Exact identity unavailable</small>' + state + '</td>';
 }
 function directionCell(row, venueField, symbolField, direction) {
   return '<td class="route-cell"><span class="direction-label">' + direction + '</span>' + esc(row[venueField]) + '<small>' + esc(row[symbolField]) + '</small></td>';
 }
+function routeCell(row, extraClass = '') {
+  const link = pairLink(row);
+  const side = (direction, venueField, symbolField, className) => '<div class="route-side ' + className + '"><span class="route-label">' + direction + '</span><span class="route-venue">' + esc(row[venueField]) + '</span><span class="route-symbol">' + esc(row[symbolField]) + '</span></div>';
+  const body = side('LONG', 'long_venue', 'long_venue_symbol', 'long') + side('SHORT', 'short_venue', 'short_venue_symbol', 'short');
+  return '<td class="route-cell' + (extraClass ? ' ' + extraClass : '') + '">' + (link ? '<a class="route-link" href="' + esc(link) + '">' + body + '</a>' : body + '<small>Exact identity unavailable</small>') + '</td>';
+}
+function signedNumber(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+  return (value > 0 ? '+' : '') + value.toFixed(2);
+}
 function renderOpportunities(data) {
-  const stateLabel = state => ({eligible:'Eligible',pending:'Baseline pending',unavailable:'Baseline unavailable',stale:'Stale',depth_unavailable:'Depth unavailable'}[state] ?? 'Unavailable');
-  const stateClass = state => 'state-badge state-' + ({eligible:'eligible',pending:'pending',unavailable:'unavailable',stale:'stale',depth_unavailable:'depth-unavailable'}[state] ?? 'unavailable');
-  const baseline = row => row.basis_state === 'eligible' && typeof row.rolling_mean_bps === 'number'
-    ? number(row.rolling_mean_bps) + '<small>' + (typeof row.basis_coverage === 'number' ? number(row.basis_coverage * 100) + '% cov' : '—') + '</small>'
-    : '<span class="unavailable">—</span>';
-  const freshness = row => 'age ' + age(row.freshness_seconds) + ' · skew ' + age(row.observed_at_skew_seconds);
+  const stateClass = state => ({eligible:'eligible',pending:'pending',unavailable:'unavailable',stale:'stale',depth_unavailable:'depth-unavailable'}[state] ?? 'unavailable');
   const edgeClass = value => typeof value !== 'number' || !Number.isFinite(value) ? 'edge-unavailable' : value > 0 ? 'edge-positive' : value < 0 ? 'edge-negative' : 'edge-zero';
   const sampleTitle = row => typeof row.sample_time === 'string' ? esc(row.sample_time) : '';
   byId('opportunity-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
     pairCell(row, 'canonical_symbol') +
-    directionCell(row, 'long_venue', 'long_venue_symbol', 'LONG') +
-    directionCell(row, 'short_venue', 'short_venue_symbol', 'SHORT') +
-    '<td class="state-cell"><span class="' + stateClass(row.state) + '">' + esc(stateLabel(row.state)) + '</span></td>' +
-    cell(number(row.convergence_edge_bps), 'numeric edge-value ' + edgeClass(row.convergence_edge_bps)) +
-    cell(number(row.current_net_spread_bps), 'numeric') +
-    '<td>' + baseline(row) + '</td>' +
-    '<td title="' + sampleTitle(row) + '">' + esc(freshness(row)) + '</td>' +
-    cell(row.primary_depth_status === 'available' ? 'available' : '—', row.primary_depth_status === 'available' ? 'healthy' : 'unavailable') +
-    cell(number(row.current_raw_spread_bps), 'numeric') +
-    cell(number(row.rolling_std_bps), 'numeric') +
-    cell(number(row.round_trip_fee_bps), 'numeric') + '</tr>'
-  ).join('') || emptyRow(12, data.status === 'healthy' ? 'No matching opportunities' : 'No matching rows — degraded or unavailable data');
+    routeCell(row) +
+    '<td class="edge-cell"><strong class="edge-value ' + edgeClass(row.convergence_edge_bps) + '">' + signedNumber(row.convergence_edge_bps) + ' bps</strong><small>after ' + number(row.round_trip_fee_bps) + ' RT fee</small></td>' +
+    '<td class="current-cell">' + (typeof row.current_net_spread_bps === 'number' && Number.isFinite(row.current_net_spread_bps) ? '<strong class="current-net ' + edgeClass(row.current_net_spread_bps) + '">' + signedNumber(row.current_net_spread_bps) + ' net</strong>' : '<span class="unavailable">Net unavailable</span>') + '<small class="current-raw">raw ' + signedNumber(row.current_raw_spread_bps) + ' bps</small></td>' +
+    '<td class="baseline-cell">' + (row.basis_state === 'eligible' && typeof row.rolling_mean_bps === 'number'
+      ? '<strong class="baseline-primary">' + number(row.rolling_mean_bps) + ' bps mean</strong><small>σ ' + number(row.rolling_std_bps) + ' · ' + (typeof row.basis_coverage === 'number' ? number(row.basis_coverage * 100) + '% cov' : '—') + '</small>'
+      : '<span class="state-note state-' + stateClass(row.basis_state) + '">' + esc(row.basis_state === 'pending' ? 'Baseline pending' : row.basis_state === 'unavailable' ? 'Baseline unavailable' : 'Baseline unavailable') + '</span>') + '</td>' +
+    '<td class="execution-cell" title="' + sampleTitle(row) + '">' + (row.state === 'stale' ? '<span class="state-note state-stale">STALE</span>' : row.primary_depth_status !== 'available' ? '<span class="state-note state-depth-unavailable">Depth unavailable</span>' : '<span class="execution-primary">Depth available</span>') + '<small>age ' + age(row.freshness_seconds) + ' · skew ' + age(row.observed_at_skew_seconds) + '</small></td></tr>'
+  ).join('') || emptyRow(6, data.status === 'healthy' ? 'No matching opportunities' : 'No matching rows — degraded or unavailable data');
 }
 function renderAnomalies(data) {
   byId('anomaly-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
     pairCell({...row, canonical_symbol: row.symbol}, 'symbol') +
-    directionCell(row, 'long_venue', 'long_venue_symbol', 'LONG') +
-    directionCell(row, 'short_venue', 'short_venue_symbol', 'SHORT') +
-    cell(number(row.current_spread_bps)) + cell(number(row.reference_mean_bps)) +
-    cell(number(row.current_deviation_bps)) + cell(age(row.episode_age_seconds)) +
-    cell(number(row.post_confirmation_peak_deviation_bps)) +
-    cell((row.mean_12h_bps ?? '—') + ' / ' + (row.mean_24h_bps ?? '—') + ' / ' + (row.mean_48h_bps ?? '—')) +
-    cell(number(row.mean_alignment_bps)) + cell(row.tg_status ?? 'Pending') + '</tr>').join('') || emptyRow(11, 'No active confirmed anomalies');
+    routeCell({...row, canonical_symbol: row.symbol}, 'anomaly-route') +
+    '<td class="numeric"><strong class="edge-value ' + (row.current_deviation_bps >= 0 ? 'edge-positive' : 'edge-negative') + '">' + signedNumber(row.current_deviation_bps) + ' bps</strong><small>current ' + signedNumber(row.current_spread_bps) + '</small></td>' +
+    '<td class="numeric"><strong>' + number(row.reference_mean_bps) + ' bps</strong><small>alignment ' + number(row.mean_alignment_bps) + '</small></td>' +
+    '<td><strong>' + age(row.episode_age_seconds) + '</strong><small>peak ' + signedNumber(row.post_confirmation_peak_deviation_bps) + ' · TG ' + esc(row.tg_status ?? 'Pending') + '</small></td>' +
+    '<td class="anomaly-context"><strong>' + (row.mean_12h_bps ?? '—') + ' / ' + (row.mean_24h_bps ?? '—') + ' / ' + (row.mean_48h_bps ?? '—') + '</strong><small>12h / 24h / 48h</small></td></tr>').join('') || emptyRow(6, 'No active confirmed anomalies');
 }
 function renderStatus(data) {
   const overall = data.overall || {}, heartbeat = data.heartbeat || {};
@@ -522,14 +551,24 @@ function renderPair(data) {
     : (identity.canonical_symbol ?? 'Unavailable') + ' · Long ' +
       (identity.long_venue ?? 'Unavailable') + ' / ' + (identity.long_venue_symbol ?? 'Unavailable') + ' → Short ' +
       (identity.short_venue ?? 'Unavailable') + ' / ' + (identity.short_venue_symbol ?? 'Unavailable'));
+  const finite = value => typeof value === 'number' && Number.isFinite(value);
+  const baselineValue = finite(lifecycle.reference_mean_bps) ? lifecycle.reference_mean_bps : current.rolling_mean_bps;
+  const baselineLabel = finite(baselineValue) ? number(baselineValue) + ' bps' : '—';
+  const kpis = [
+    ['Edge after RT fee', finite(current.theoretical_edge_bps) ? signedNumber(current.theoretical_edge_bps) + ' bps' : '—', 'display-only'],
+    ['Current', finite(current.current_net_spread_bps) ? signedNumber(current.current_net_spread_bps) + ' net' : '—', 'raw ' + signedNumber(current.raw_spread_bps) + ' bps'],
+    ['Baseline', baselineLabel, finite(current.rolling_std_bps) ? 'σ ' + number(current.rolling_std_bps) + ' · ' + (typeof basis.coverage === 'number' ? number(basis.coverage * 100) + '% cov' : '—') : 'prior-only 24h mean'],
+    ['Execution', current.primary_depth_status === 'available' ? 'Depth available' : 'Depth unavailable', 'age ' + age(current.freshness_seconds) + ' · skew ' + age(current.observed_at_skew_seconds)],
+  ];
+  byId('pair-summary').innerHTML = kpis.map(([label,value,detail]) => '<div class="card"><div class="metric-label">' + esc(label) + '</div><div class="metric-value">' + esc(value) + '</div><small>' + esc(detail) + '</small></div>').join('');
+  const railLine = (label, value) => '<div class="pair-rail-line"><span>' + esc(label) + '</span><span>' + esc(value) + '</span></div>';
+  byId('pair-long-leg').innerHTML = '<h3>Long leg</h3>' + railLine('Venue', identity.long_venue ?? 'Unavailable') + railLine('Symbol', identity.long_venue_symbol ?? 'Unavailable') + railLine('$10k buy VWAP', number(current.long_buy_vwap));
+  byId('pair-short-leg').innerHTML = '<h3>Short leg</h3>' + railLine('Venue', identity.short_venue ?? 'Unavailable') + railLine('Symbol', identity.short_venue_symbol ?? 'Unavailable') + railLine('$10k sell VWAP', number(current.short_sell_vwap));
+  byId('pair-lifecycle-rail').innerHTML = '<h3>Lifecycle</h3>' + railLine('Duration', age(current.signal_duration_seconds)) + railLine('Candidate', lifecycle.candidate_started_at ?? 'Unavailable') + railLine('Confirmed', lifecycle.confirmed_at ?? 'Unavailable') + railLine('Status', lifecycle.available ? ((lifecycle.candidate_confirmed ? 'confirmed' : 'candidate') + ' · ' + (lifecycle.alerted ? 'alerted' : 'not alerted')) : 'Unavailable');
   const metrics = [
-    ['Raw spread (bps)',number(current.raw_spread_bps)], ['Current net spread (bps)',number(current.current_net_spread_bps)], ['Convergence edge after RT fee (bps, display-only)',number(current.theoretical_edge_bps)],
-    ['24h Mean (bps)',number(current.rolling_mean_bps)], ['24h Std (bps)',number(current.rolling_std_bps)], ['Deviation (bps)',number(current.deviation_bps)],
-    ['Observed skew (s)',number(current.observed_at_skew_seconds)], ['Freshness (s)',number(current.freshness_seconds)],
-    ['Signal duration (persisted)',age(current.signal_duration_seconds)],
-    ['Long $10k buy VWAP',number(current.long_buy_vwap)], ['Short $10k sell VWAP',number(current.short_sell_vwap)],
-    ['RT Fee (bps, display-only)',number(current.round_trip_fee_bps)],
-    ['Sample time (UTC)',current.sample_time ?? 'Unavailable'],
+    ['Raw spread (bps)', signedNumber(current.raw_spread_bps)], ['Current net spread (bps)',signedNumber(current.current_net_spread_bps)], ['24h Mean (bps)',number(current.rolling_mean_bps)], ['24h Std (bps)',number(current.rolling_std_bps)], ['Deviation (bps)',signedNumber(current.deviation_bps)],
+    ['Observed skew (s)',number(current.observed_at_skew_seconds)], ['Freshness (s)',number(current.freshness_seconds)], ['Signal duration (persisted)',age(current.signal_duration_seconds)],
+    ['Long $10k buy VWAP',number(current.long_buy_vwap)], ['Short $10k sell VWAP',number(current.short_sell_vwap)], ['RT Fee (bps, display-only)',number(current.round_trip_fee_bps)], ['Sample time (UTC)',current.sample_time ?? 'Unavailable'],
     ['Lifecycle (persisted)',lifecycle.available ? 'Active · confirmed: ' + (lifecycle.candidate_confirmed ? 'yes' : 'no') + ' · alerted: ' + (lifecycle.alerted ? 'yes' : 'no') + ' · ' + (lifecycle.episode_id ?? 'Unavailable') : 'Inactive / unavailable']
   ];
   if (lifecycle.reference_mean_bps !== undefined) {
@@ -540,7 +579,7 @@ function renderPair(data) {
       ['V2 Telegram', lifecycle.tg_status ?? 'Pending']
     );
   }
-  byId('pair-summary').innerHTML = metrics.map(([label,value]) => '<div class="card"><div class="metric-label">' + esc(label) + '</div><div class="metric-value">' + esc(value) + '</div></div>').join('');
+  byId('pair-secondary').innerHTML = metrics.map(([label,value]) => '<div class="detail"><span class="detail-label">' + esc(label) + '</span><span class="detail-value">' + esc(value) + '</span></div>').join('');
   text('pair-coverage', (basis.eligible ? '24h basis available' : '24h basis unavailable') + ' · prior samples: ' +
     (basis.sample_count ?? 'Unavailable') + ' · coverage: ' + (typeof basis.coverage === 'number' ? number(basis.coverage * 100) + '%' : 'Unavailable'));
   renderPairChart(data);
@@ -623,7 +662,8 @@ function renderPairChart(data) {
       const markerX = x(timestamp), markerY = y(value);
       const anchor = markerX < 130 ? 'start' : markerX > 850 ? 'end' : 'middle';
       const labelX = markerX + (anchor === 'start' ? 7 : anchor === 'end' ? -7 : 0);
-      const labelY = Math.max(18, Math.min(markerY - 7, 282));
+      const labelOffset = label === 'confirmation' ? 22 : label === 'peak' ? 30 : 10;
+      const labelY = Math.max(18, Math.min(markerY - labelOffset, 282));
       svg += '<circle data-marker="' + label + '" cx="' + markerX.toFixed(2) + '" cy="' + markerY.toFixed(2) + '" r="4" fill="' + color + '"><title>' + esc(label) + ' · ' + esc(timestamp) + ' · ' + number(value) + ' bps</title></circle>';
       svg += '<text data-marker-label="' + label + '" x="' + labelX.toFixed(2) + '" y="' + labelY.toFixed(2) + '" text-anchor="' + anchor + '" fill="' + color + '" font-size="10">' + label + '</text>';
     }
@@ -644,6 +684,8 @@ async function refresh(query = new URLSearchParams(location.search)) {
     const statusLabel = isOpportunities && status === 'degraded' ? 'SCANNER DATA DEGRADED' : (status ?? 'degraded').toUpperCase();
     text('overall', statusLabel);
     byId('overall').className = statusClass(status);
+    text('scanner-status', 'SCANNER · ' + ((status ?? 'degraded').toUpperCase()));
+    byId('scanner-status').className = 'scanner-status ' + statusClass(status);
     const scannerAsOf = data.scanner_data_as_of === undefined ? '' : ' · Scanner: ' + (data.scanner_data_as_of ?? 'Unavailable');
     text('data-as-of', 'Data as of: ' + (data.data_as_of ?? 'Unavailable') + scannerAsOf);
     text('refreshed', 'Fetched ' + new Date().toLocaleTimeString() + ' · Generated ' + (data.generated_at ?? 'Unavailable'));
@@ -653,10 +695,12 @@ async function refresh(query = new URLSearchParams(location.search)) {
     if (sequence !== requestSequence) return;
     text('overall', 'DEGRADED — dashboard request failed');
     byId('overall').className = 'degraded';
+    text('scanner-status', 'SCANNER · DEGRADED');
+    byId('scanner-status').className = 'scanner-status degraded';
     text('data-as-of', 'Data as of: Unavailable');
     text('refreshed', 'Request failed at ' + new Date().toLocaleTimeString());
     byId('errors').innerHTML = '<div class="error">' + esc(error) + '</div>';
-    if (isStatus) renderStatus({}); else if (isPair) renderPair({}); else if (isAnomalies) byId('anomaly-rows').innerHTML = emptyRow(11, 'Data unavailable'); else byId('opportunity-rows').innerHTML = emptyRow(12, 'Data unavailable');
+    if (isStatus) renderStatus({}); else if (isPair) renderPair({}); else if (isAnomalies) byId('anomaly-rows').innerHTML = emptyRow(6, 'Data unavailable'); else byId('opportunity-rows').innerHTML = emptyRow(6, 'Data unavailable');
   } finally {
     if (sequence === requestSequence) requestInFlight = false;
   }
