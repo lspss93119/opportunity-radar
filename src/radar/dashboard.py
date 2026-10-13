@@ -588,10 +588,13 @@ function renderPair(data) {
   const peakOffset = typeof trajectory.distance_from_recent_peak_bps === 'number' && Number.isFinite(trajectory.distance_from_recent_peak_bps)
     ? number(trajectory.distance_from_recent_peak_bps) + ' bps'
     : '—';
-  byId('pair-trajectory-rail').innerHTML = '<h3>Trajectory vs baseline</h3>' +
-    trajectoryLine('1m') + trajectoryLine('5m') + trajectoryLine('15m') +
-    railLine('Off 15m peak', peakOffset) +
-    '<small class="trajectory-note">Δ = change in absolute distance from ' + esc(referenceKind) + ' reference · display-only</small>';
+  byId('pair-trajectory-rail').innerHTML = trajectory.available === true
+    ? '<h3>Trajectory vs baseline</h3>' +
+      trajectoryLine('1m') + trajectoryLine('5m') + trajectoryLine('15m') +
+      railLine('Off 15m peak', peakOffset) +
+      '<small class="trajectory-note">Δ = change in absolute distance from ' + esc(referenceKind) + ' reference · display-only</small>'
+    : '<h3>Trajectory vs baseline</h3><span class="trajectory-state trajectory-unavailable">Unavailable</span>' +
+      '<small class="trajectory-note">Needs a current observation and usable baseline reference · display-only</small>';
   byId('pair-lifecycle-rail').innerHTML = '<h3>Lifecycle</h3>' + railLine('Duration', age(current.signal_duration_seconds)) + railLine('Candidate', lifecycle.candidate_started_at ?? 'Unavailable') + railLine('Confirmed', lifecycle.confirmed_at ?? 'Unavailable') + railLine('Status', lifecycle.available ? ((lifecycle.candidate_confirmed ? 'confirmed' : 'candidate') + ' · ' + (lifecycle.alerted ? 'alerted' : 'not alerted')) : 'Unavailable');
   const metrics = [
     ['Raw spread (bps)', signedNumber(current.raw_spread_bps)], ['Current net spread (bps)',signedNumber(current.current_net_spread_bps)], ['24h Mean (bps)',number(current.rolling_mean_bps)], ['24h Std (bps)',number(current.rolling_std_bps)], ['Deviation (bps)',signedNumber(current.deviation_bps)],
