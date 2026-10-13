@@ -253,6 +253,8 @@ button { cursor: pointer; min-height: 32px; }
 a:focus-visible, input:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid #7dd3fc; outline-offset: 2px; }
 .section { min-width: 0; margin-bottom: 18px; }
 .table-wrap { position: relative; overflow-x: auto; border: 1px solid #24364b; border-radius: 6px; scrollbar-color: #46627b #0d1b2b; }
+.terminal-table-wrap { max-height: min(68vh, 720px); overflow: auto; }
+.terminal-table-wrap thead th { position: sticky; top: 0; z-index: 4; background: #102237; box-shadow: 0 1px 0 #46627b; }
 table { width: 100%; border-collapse: collapse; background: #0d1b2b; font-size: .76rem; }
 th, td { padding: 8px 9px; text-align: left; border-bottom: 1px solid #203246; font-variant-numeric: tabular-nums; vertical-align: middle; }
 th { color: #91a8bd; font-size: .66rem; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
@@ -296,6 +298,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 .edge-negative { color: #fca5a5; }
 .edge-zero { color: #dbe7f5; }
 .edge-unavailable { color: #71869b; }
+.anomaly-deviation { color: #c4b5fd; }
 .current-net { font: 700 .86rem/1.15 "SFMono-Regular", Consolas, monospace; }
 .current-raw { color: #8fa5bb; }
 .baseline-primary, .execution-primary { font: 600 .78rem/1.2 "SFMono-Regular", Consolas, monospace; }
@@ -343,7 +346,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 <main>
 <header class="terminal-header"><div class="brand-line"><span class="brand-mark">◆</span><h1>OPPORTUNITY RADAR</h1></div><div class="terminal-meta"><span class="read-only">READ ONLY</span><span class="muted">$10k executable VWAP</span><span id="scanner-status" class="scanner-status" data-scanner-status>SCANNER · —</span></div></header>
 <nav aria-label="Dashboard"><a id="nav-opportunities" href="/opportunities">Opportunities</a><a id="nav-anomalies" href="/anomalies">Anomalies</a><a id="nav-status" href="/status">Status</a></nav>
-<div class="summary" aria-live="polite"><span id="overall">Loading…</span><span id="data-as-of" class="muted">Data as of: Unavailable</span><span id="refreshed" class="muted"></span></div>
+<div class="summary" aria-live="polite"><span id="overall">Loading…</span><span id="data-as-of" class="muted">Data age —</span><span id="refreshed" class="muted"></span></div>
 <div id="errors" role="alert"></div>
 <section id="anomalies-view">
 <h2>Active Anomalies</h2>
@@ -355,7 +358,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 <label class="check"><input id="anomaly-eligible-only" name="eligible_only" type="checkbox">TG eligible only</label>
 <span class="filter-actions"><button type="submit">Apply filters</button><button id="anomaly-reset" type="button">Reset</button></span>
 </form>
-<div class="table-wrap"><table class="anomaly-terminal-table" aria-label="Active anomalies"><thead><tr><th>Symbol</th><th>Route</th><th>Deviation</th><th>Reference</th><th>Episode</th><th>Context</th></tr></thead><tbody id="anomaly-rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table></div>
+<div class="table-wrap terminal-table-wrap"><table class="anomaly-terminal-table" aria-label="Active anomalies"><thead><tr><th>Symbol</th><th>Route</th><th>Deviation</th><th>Reference</th><th>Episode</th><th>Context</th></tr></thead><tbody id="anomaly-rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table></div>
 </section>
 <section id="opportunities-view">
 <form id="filters" class="filter-toolbar">
@@ -374,8 +377,8 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 <label class="check"><input id="active_only" name="active_only" type="checkbox">Active only</label>
 </div></details>
 </form>
-<p class="table-help">Sorted by deviation · values are display-only · duration comes from persisted SQLite.</p>
-<div class="table-wrap"><table aria-label="Opportunities" class="opportunity-terminal-table"><thead><tr><th>Symbol</th><th>Route</th><th>Edge</th><th>Current</th><th>Baseline</th><th>Execution</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table></div>
+<p class="table-help">Actionable first · edge after RT fee descending · values are display-only · duration comes from persisted SQLite.</p>
+<div class="table-wrap terminal-table-wrap"><table aria-label="Opportunities" class="opportunity-terminal-table"><thead><tr><th>Symbol</th><th>Route</th><th>Edge</th><th>Current</th><th>Baseline</th><th>Execution</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table></div>
 </section>
 <section id="status-view">
 <div class="metrics">
@@ -472,10 +475,10 @@ function pairLink(row) {
   for (const name of fields) query.set(name === 'canonical_symbol' ? 'symbol' : name, row[name]);
   return '/pair?' + query.toString();
 }
-function pairCell(row, symbolField) {
+function pairCell(row, symbolField, includeState = true) {
   const link = pairLink(row);
   const symbol = esc(row[symbolField]);
-  const state = row.state ? '<small>' + esc(({eligible:'Eligible',pending:'Baseline pending',unavailable:'Baseline unavailable',stale:'Stale',depth_unavailable:'Depth unavailable'}[row.state] ?? row.state)) + '</small>' : '';
+  const state = includeState && row.state ? '<small>' + esc(({eligible:'Eligible',pending:'Baseline pending',unavailable:'Baseline unavailable',stale:'Stale',depth_unavailable:'Depth unavailable'}[row.state] ?? row.state)) + '</small>' : '';
   return link ? '<td class="symbol-cell"><a href="' + esc(link) + '">' + symbol + '</a>' + state + '</td>' : '<td class="symbol-cell">' + symbol + '<small>Exact identity unavailable</small>' + state + '</td>';
 }
 function directionCell(row, venueField, symbolField, direction) {
@@ -496,7 +499,7 @@ function renderOpportunities(data) {
   const edgeClass = value => typeof value !== 'number' || !Number.isFinite(value) ? 'edge-unavailable' : value > 0 ? 'edge-positive' : value < 0 ? 'edge-negative' : 'edge-zero';
   const sampleTitle = row => typeof row.sample_time === 'string' ? esc(row.sample_time) : '';
   byId('opportunity-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
-    pairCell(row, 'canonical_symbol') +
+    pairCell(row, 'canonical_symbol', false) +
     routeCell(row) +
     '<td class="edge-cell"><strong class="edge-value ' + edgeClass(row.convergence_edge_bps) + '">' + signedNumber(row.convergence_edge_bps) + ' bps</strong><small>after ' + number(row.round_trip_fee_bps) + ' RT fee</small></td>' +
     '<td class="current-cell">' + (typeof row.current_net_spread_bps === 'number' && Number.isFinite(row.current_net_spread_bps) ? '<strong class="current-net ' + edgeClass(row.current_net_spread_bps) + '">' + signedNumber(row.current_net_spread_bps) + ' net</strong>' : '<span class="unavailable">Net unavailable</span>') + '<small class="current-raw">raw ' + signedNumber(row.current_raw_spread_bps) + ' bps</small></td>' +
@@ -510,7 +513,7 @@ function renderAnomalies(data) {
   byId('anomaly-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
     pairCell({...row, canonical_symbol: row.symbol}, 'symbol') +
     routeCell({...row, canonical_symbol: row.symbol}, 'anomaly-route') +
-    '<td class="numeric"><strong class="edge-value ' + (row.current_deviation_bps >= 0 ? 'edge-positive' : 'edge-negative') + '">' + signedNumber(row.current_deviation_bps) + ' bps</strong><small>current ' + signedNumber(row.current_spread_bps) + '</small></td>' +
+    '<td class="numeric"><strong class="edge-value anomaly-deviation">' + signedNumber(row.current_deviation_bps) + ' bps</strong><small>current ' + signedNumber(row.current_spread_bps) + '</small></td>' +
     '<td class="numeric"><strong>' + number(row.reference_mean_bps) + ' bps</strong><small>alignment ' + number(row.mean_alignment_bps) + '</small></td>' +
     '<td><strong>' + age(row.episode_age_seconds) + '</strong><small>peak ' + signedNumber(row.post_confirmation_peak_deviation_bps) + ' · TG ' + esc(row.tg_status ?? 'Pending') + '</small></td>' +
     '<td class="anomaly-context"><strong>' + (row.mean_12h_bps ?? '—') + ' / ' + (row.mean_24h_bps ?? '—') + ' / ' + (row.mean_48h_bps ?? '—') + '</strong><small>12h / 24h / 48h</small></td></tr>').join('') || emptyRow(6, 'No active confirmed anomalies');
@@ -633,16 +636,35 @@ function renderPairChart(data) {
   }
   svg += '</g>';
   svg += series(points, 'raw_spread_bps', 'raw', '#93c5fd') + series(means, 'rolling_mean_bps', 'mean', '#fcd34d');
+  const labelPositions = [];
+  const clampLabelY = value => Math.max(18, Math.min(value, 282));
+  const placeLabel = (xValue, preferredY) => {
+    const candidates = [preferredY, preferredY - 18, preferredY - 36, preferredY + 18, preferredY + 36,
+      18, 36, 54, 72, 90, 108, 126, 144, 162, 180, 198, 216, 234, 252, 270];
+    for (const candidate of candidates) {
+      const yValue = clampLabelY(candidate);
+      if (!labelPositions.some(position => Math.abs(position.x - xValue) < 120 && Math.abs(position.y - yValue) < 14)) {
+        labelPositions.push({x:xValue, y:yValue});
+        return yValue;
+      }
+    }
+    const yValue = clampLabelY(preferredY);
+    labelPositions.push({x:xValue, y:yValue});
+    return yValue;
+  };
   if (v2Reference !== null) {
     const py = y(v2Reference).toFixed(2);
     svg += '<line data-marker="reference" x1="70" x2="910" y1="' + py + '" y2="' + py + '" stroke="#c084fc" stroke-dasharray="5 4"/>';
-    svg += '<text x="905" y="' + (Number(py) - 4) + '" text-anchor="end" fill="#c084fc" font-size="11">Reference</text>';
+    const referenceY = placeLabel(78, Number(py) - 4);
+    svg += '<text data-marker-label="reference" data-label-lane="reference" x="78" y="' + referenceY.toFixed(2) + '" text-anchor="start" fill="#c084fc" font-size="11">Reference</text>';
   }
   if (current && finite(current.raw_spread_bps) && Date.parse(current.sample_time) >= start && Date.parse(current.sample_time) <= end) {
     const currentX = x(current.sample_time), currentY = y(current.raw_spread_bps);
     const currentAnchor = currentX > 840 ? 'end' : 'start';
+    const currentLabelX = currentX + (currentAnchor === 'end' ? -8 : 8);
+    const currentLabelY = placeLabel(currentLabelX, currentY - 10);
     svg += '<circle data-series="current" data-marker="current" cx="' + currentX.toFixed(2) + '" cy="' + currentY.toFixed(2) + '" r="5" fill="#6ee7b7"><title>Current · ' + esc(current.sample_time) + ' · ' + number(current.raw_spread_bps) + ' bps</title></circle>';
-    svg += '<text data-marker-label="current" x="' + (currentX + (currentAnchor === 'end' ? -8 : 8)).toFixed(2) + '" y="' + Math.max(18, currentY - 10).toFixed(2) + '" text-anchor="' + currentAnchor + '" fill="#6ee7b7" font-size="10">current</text>';
+    svg += '<text data-marker-label="current" data-label-lane="current" x="' + currentLabelX.toFixed(2) + '" y="' + currentLabelY.toFixed(2) + '" text-anchor="' + currentAnchor + '" fill="#6ee7b7" font-size="10">current</text>';
   }
   if (v2Reference !== null || lifecycle.available) {
     const rawAt = timestamp => {
@@ -662,14 +684,25 @@ function renderPairChart(data) {
       const markerX = x(timestamp), markerY = y(value);
       const anchor = markerX < 130 ? 'start' : markerX > 850 ? 'end' : 'middle';
       const labelX = markerX + (anchor === 'start' ? 7 : anchor === 'end' ? -7 : 0);
-      const labelOffset = label === 'confirmation' ? 22 : label === 'peak' ? 30 : 10;
-      const labelY = Math.max(18, Math.min(markerY - labelOffset, 282));
+      const lane = {candidate:0, confirmation:1, peak:2, return:3}[label] ?? 0;
+      const labelY = placeLabel(labelX, markerY - 14 - lane * 18);
       svg += '<circle data-marker="' + label + '" cx="' + markerX.toFixed(2) + '" cy="' + markerY.toFixed(2) + '" r="4" fill="' + color + '"><title>' + esc(label) + ' · ' + esc(timestamp) + ' · ' + number(value) + ' bps</title></circle>';
-      svg += '<text data-marker-label="' + label + '" x="' + labelX.toFixed(2) + '" y="' + labelY.toFixed(2) + '" text-anchor="' + anchor + '" fill="' + color + '" font-size="10">' + label + '</text>';
+      svg += '<text data-marker-label="' + label + '" data-label-lane="' + label + '" x="' + labelX.toFixed(2) + '" y="' + labelY.toFixed(2) + '" text-anchor="' + anchor + '" fill="' + color + '" font-size="10">' + label + '</text>';
     }
   }
   svg += '</svg>';
   byId('pair-chart').innerHTML = svg;
+}
+function compactDataStatus(data) {
+  const ageSeconds = typeof data.scanner_sample_age_seconds === 'number'
+    ? data.scanner_sample_age_seconds
+    : data.sample_age_seconds;
+  const exactTimes = [data.data_as_of, data.scanner_data_as_of, data.generated_at]
+    .filter(value => typeof value === 'string' && value);
+  byId('data-as-of').title = exactTimes.join(' · ');
+  byId('refreshed').title = typeof data.generated_at === 'string' ? data.generated_at : '';
+  text('data-as-of', 'data age ' + age(ageSeconds));
+  text('refreshed', 'read-only source');
 }
 let requestSequence = 0;
 let requestInFlight = false;
@@ -686,9 +719,7 @@ async function refresh(query = new URLSearchParams(location.search)) {
     byId('overall').className = statusClass(status);
     text('scanner-status', 'SCANNER · ' + ((status ?? 'degraded').toUpperCase()));
     byId('scanner-status').className = 'scanner-status ' + statusClass(status);
-    const scannerAsOf = data.scanner_data_as_of === undefined ? '' : ' · Scanner: ' + (data.scanner_data_as_of ?? 'Unavailable');
-    text('data-as-of', 'Data as of: ' + (data.data_as_of ?? 'Unavailable') + scannerAsOf);
-    text('refreshed', 'Fetched ' + new Date().toLocaleTimeString() + ' · Generated ' + (data.generated_at ?? 'Unavailable'));
+    compactDataStatus(data);
     byId('errors').innerHTML = (data.errors || []).map(error => '<div class="error">' + esc(error) + '</div>').join('');
     if (isStatus) renderStatus(data); else if (isPair) renderPair(data); else if (isAnomalies) renderAnomalies(data); else renderOpportunities(data);
   } catch (error) {
@@ -697,8 +728,8 @@ async function refresh(query = new URLSearchParams(location.search)) {
     byId('overall').className = 'degraded';
     text('scanner-status', 'SCANNER · DEGRADED');
     byId('scanner-status').className = 'scanner-status degraded';
-    text('data-as-of', 'Data as of: Unavailable');
-    text('refreshed', 'Request failed at ' + new Date().toLocaleTimeString());
+    compactDataStatus({});
+    text('refreshed', 'request failed');
     byId('errors').innerHTML = '<div class="error">' + esc(error) + '</div>';
     if (isStatus) renderStatus({}); else if (isPair) renderPair({}); else if (isAnomalies) byId('anomaly-rows').innerHTML = emptyRow(6, 'Data unavailable'); else byId('opportunity-rows').innerHTML = emptyRow(6, 'Data unavailable');
   } finally {

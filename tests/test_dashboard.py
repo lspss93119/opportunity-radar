@@ -541,6 +541,107 @@ console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
     assert 'Unavailable' not in rendered
 
 
+def test_opportunities_ui_describes_the_actual_backend_sort(scanner_http):
+    with urlopen(scanner_http + "/opportunities") as response:
+        html = response.read().decode()
+    assert "Actionable first · edge after RT fee descending" in html
+    assert "Sorted by deviation" not in html
+
+
+def test_opportunity_symbol_does_not_show_generic_eligibility(scanner_http):
+    with urlopen(scanner_http + "/opportunities") as response:
+        html = response.read().decode()
+    rendered = run_ui_script(html, """
+renderOpportunities({status:'healthy', rows:[{
+  canonical_symbol:'QQQ', long_venue:'arcus', long_venue_symbol:'QQQ-USD',
+  short_venue:'lighter_robinhood', short_venue_symbol:'QQQ', state:'eligible', basis_state:'eligible',
+  current_raw_spread_bps:26.24, current_net_spread_bps:18.24,
+  rolling_mean_bps:8, rolling_std_bps:1.25, basis_coverage:.997,
+  convergence_edge_bps:10.24, round_trip_fee_bps:8,
+  freshness_seconds:4, observed_at_skew_seconds:1.5, primary_depth_status:'available'
+}]});
+console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
+""", setup="location.pathname='/opportunities';\n")
+    symbol_cell = re.search(r'<td class="symbol-cell">.*?</td>', rendered)
+    assert symbol_cell is not None
+    assert "Eligible" not in symbol_cell.group(0)
+    assert rendered.count("Eligible") == 0
+    assert "8.00 bps mean" in rendered
+
+
+def test_terminal_tables_use_a_shared_sticky_header_only(scanner_http):
+    with urlopen(scanner_http + "/opportunities") as response:
+        opportunities = response.read().decode()
+    with urlopen(scanner_http + "/anomalies") as response:
+        anomalies = response.read().decode()
+    for html in (opportunities, anomalies):
+        assert 'class="table-wrap terminal-table-wrap"' in html
+        assert ".terminal-table-wrap thead th" in html
+        assert "position: sticky" in html
+    assert not re.search(r"\.opportunity-terminal-table[^{}]*td[^{}]*position:\s*sticky", opportunities)
+    assert not re.search(r"\.anomaly-terminal-table[^{}]*td[^{}]*position:\s*sticky", anomalies)
+
+
+def test_dashboard_top_status_uses_compact_age_without_locale_timestamp(scanner_http):
+    with urlopen(scanner_http + "/opportunities") as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+const request = requests[0];
+succeed(request, '2026-10-12T15:21:50+00:00');
+await settle();
+console.log(JSON.stringify({status:byId('overall').textContent, data:byId('data-as-of').textContent,
+  refreshed:byId('refreshed').textContent}));
+""", setup=POLLING_SETUP + "location.pathname='/opportunities';\n")
+    assert result["status"] == "HEALTHY"
+    assert result["data"] == "data age 4s"
+    assert "2026-10-12T15:21:50" not in result["data"]
+    assert "上午" not in result["refreshed"]
+    assert "toLocaleTimeString" not in html
+
+
+def test_pair_marker_labels_use_deterministic_non_overlapping_lanes(scanner_http):
+    with urlopen(scanner_http + "/pair") as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+renderPair({
+  identity:{canonical_symbol:'QQQ',long_venue:'arcus',long_venue_symbol:'QQQ-USD',short_venue:'lighter_robinhood',short_venue_symbol:'QQQ'},
+  current:{raw_spread_bps:25,current_net_spread_bps:17,rolling_mean_bps:8,rolling_std_bps:1,deviation_bps:17,signal_duration_seconds:120,long_buy_vwap:100,short_sell_vwap:100.25,round_trip_fee_bps:8,observed_at_skew_seconds:1,freshness_seconds:4,sample_time:'2026-09-23T12:00:00Z'},
+  basis:{eligible:true,sample_count:8500,coverage:.997},
+  history:[
+    {sample_time:'2026-09-23T11:58:00Z',raw_spread_bps:8,segment:0},
+    {sample_time:'2026-09-23T11:59:00Z',raw_spread_bps:20,segment:0},
+    {sample_time:'2026-09-23T11:59:30Z',raw_spread_bps:22,segment:0},
+    {sample_time:'2026-09-23T12:00:00Z',raw_spread_bps:25,segment:0}
+  ],
+  rolling_mean_series:[{sample_time:'2026-09-23T11:58:00Z',rolling_mean_bps:8,segment:0},{sample_time:'2026-09-23T12:00:00Z',rolling_mean_bps:8,segment:0}],
+  lifecycle:{available:true,reference_mean_bps:8,candidate_started_at:'2026-09-23T11:59:00Z',confirmed_at:'2026-09-23T11:59:30Z',candidate_confirmed:true,alerted:false}
+});
+console.log(JSON.stringify(byId('pair-chart').innerHTML));
+""", setup="location.pathname='/pair';\n")
+    labels = {label: float(y) for label, y in re.findall(
+        r'<text data-marker-label="([^"]+)"[^>]* y="([0-9.]+)"', result
+    )}
+    assert {"candidate", "confirmation", "reference"} <= labels.keys()
+    assert abs(labels["candidate"] - labels["confirmation"]) >= 12
+    assert 'data-label-lane="candidate"' in result
+    assert 'data-label-lane="confirmation"' in result
+
+
+def test_anomaly_deviation_uses_neutral_visual_treatment(scanner_http):
+    with urlopen(scanner_http + "/anomalies") as response:
+        html = response.read().decode()
+    rendered = run_ui_script(html, """
+renderAnomalies({rows:[{symbol:'QQQ', long_venue:'arcus', long_venue_symbol:'QQQ-USD',
+  short_venue:'lighter_robinhood', short_venue_symbol:'QQQ', current_deviation_bps:18,
+  current_spread_bps:26, reference_mean_bps:8, mean_alignment_bps:0,
+  episode_age_seconds:120, post_confirmation_peak_deviation_bps:22,
+  mean_12h_bps:8, mean_24h_bps:8, mean_48h_bps:8, tg_status:'Pending'}]});
+console.log(JSON.stringify(byId('anomaly-rows').innerHTML));
+""", setup="location.pathname='/anomalies';\n")
+    assert 'class="edge-value anomaly-deviation"' in rendered
+    assert 'edge-positive' not in rendered
+
+
 def test_terminal_opportunities_use_six_grouped_decision_columns(scanner_http):
     with urlopen(scanner_http + "/opportunities") as response:
         html = response.read().decode()
@@ -576,7 +677,7 @@ renderOpportunities({status:'healthy', rows:[
    convergence_edge_bps:10.24, round_trip_fee_bps:8.00,
    freshness_seconds:4, observed_at_skew_seconds:1.5, primary_depth_status:'available'},
   {canonical_symbol:'SNDK', long_venue:'arcus', long_venue_symbol:'SNDK-USD',
-   short_venue:'lighter', short_venue_symbol:'SNDK', state:'pending',
+   short_venue:'lighter', short_venue_symbol:'SNDK', state:'pending', basis_state:'pending',
    current_raw_spread_bps:-2, current_net_spread_bps:-10,
    rolling_mean_bps:null, rolling_std_bps:null, basis_coverage:null,
    convergence_edge_bps:-10, round_trip_fee_bps:8,
@@ -824,6 +925,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 function succeed(request, marker) {
   request.resolve({json: async () => ({
     status:'healthy', overall:{status:'healthy'}, data_as_of:marker,
+    sample_age_seconds:4, scanner_sample_age_seconds:4,
     heartbeat:{status:'healthy', updated_at:marker, age_seconds:0},
     rows:[{canonical_symbol:marker}], errors:[]
   })});
@@ -852,7 +954,7 @@ def test_dashboard_polling_renders_delayed_successes_without_overlap(scanner_htt
 """, setup=POLLING_SETUP + f"location.pathname = {json.dumps(path)};\n")
     assert [view["overall"] for view in result["rendered"]] == ["HEALTHY"] * 3
     for cycle, view in enumerate(result["rendered"]):
-        assert view["sample"] == f"Data as of: sample-{cycle}"
+        assert view["sample"] == "data age 4s"
         assert f"sample-{cycle}" in view["view"]
     assert result["requests"] == 3
     assert result["interval"] == 10_000
@@ -888,7 +990,7 @@ def test_dashboard_filter_refresh_invalidates_pending_response(scanner_http, act
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """, setup=POLLING_SETUP + f"location.pathname = '/opportunities'; const action = {json.dumps(action)}, oldFirst = {json.dumps(old_first)};\n")
     assert result["rendered"]["overall"] == "HEALTHY"
-    assert result["rendered"]["sample"] == "Data as of: current"
+    assert result["rendered"]["sample"] == "data age 4s"
     assert "current" in result["rendered"]["rows"]
     assert "obsolete" not in result["rendered"]["rows"]
     expected_query = {"submit": {"symbol": ["BTC"], "active_only": ["true"]},
@@ -915,7 +1017,7 @@ def test_dashboard_polling_resumes_after_request_failure(scanner_http, path):
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """, setup=POLLING_SETUP + f"location.pathname = {json.dumps(path)};\n")
     assert result == {"failed": "DEGRADED — dashboard request failed", "overall": "HEALTHY",
-                      "sample": "Data as of: recovered", "requests": 2}
+                      "sample": "data age 4s", "requests": 2}
 
 
 def test_scanner_exact_pair_links_and_missing_identity_never_guessed(scanner_http):
