@@ -1837,7 +1837,7 @@ class DashboardQueryService:
                 "seconds": seconds,
                 "prior_sample_time": None,
                 "spread_change_bps": None,
-                "distance_change_bps": None,
+                "edge_change_bps": None,
                 "state": "unavailable",
             }
             for label, seconds in PAIR_TRAJECTORY_WINDOWS
@@ -1846,9 +1846,10 @@ class DashboardQueryService:
             "available": False,
             "reference_bps": reference_bps,
             "reference_kind": reference_kind,
-            "current_distance_bps": None,
-            "recent_peak_distance_bps": None,
-            "distance_from_recent_peak_bps": None,
+            "current_edge_bps": None,
+            "current_state": "unavailable",
+            "recent_peak_edge_bps": None,
+            "edge_from_recent_peak_bps": None,
             "recent_peak_at": None,
             "windows": windows,
         }
@@ -1867,7 +1868,13 @@ class DashboardQueryService:
                 reference_kind=reference_kind,
             )
 
-        current_distance = abs(current.raw_spread_bps - reference_bps)
+        def convergence_edge(observation: _PairObservation) -> float:
+            round_trip_fee = 2.0 * (
+                observation.long_fee_bps + observation.short_fee_bps
+            )
+            return observation.raw_spread_bps - reference_bps - round_trip_fee
+
+        current_edge = convergence_edge(current)
         earliest_needed = current.sample_time - timedelta(
             seconds=PAIR_TRAJECTORY_WINDOWS[-1][1]
             + PAIR_TRAJECTORY_TOLERANCE_SECONDS
@@ -1901,16 +1908,17 @@ class DashboardQueryService:
                     "seconds": seconds,
                     "prior_sample_time": None,
                     "spread_change_bps": None,
-                    "distance_change_bps": None,
+                    "edge_change_bps": None,
                     "state": "unavailable",
                 }
                 continue
 
-            previous_distance = abs(previous.raw_spread_bps - reference_bps)
-            distance_change = current_distance - previous_distance
-            if distance_change > PAIR_TRAJECTORY_FLAT_EPSILON_BPS:
+            edge_change = current_edge - convergence_edge(previous)
+            if current_edge <= 0:
+                state = "gone"
+            elif edge_change > PAIR_TRAJECTORY_FLAT_EPSILON_BPS:
                 state = "widening"
-            elif distance_change < -PAIR_TRAJECTORY_FLAT_EPSILON_BPS:
+            elif edge_change < -PAIR_TRAJECTORY_FLAT_EPSILON_BPS:
                 state = "reverting"
             else:
                 state = "flat"
@@ -1919,9 +1927,9 @@ class DashboardQueryService:
                 "seconds": seconds,
                 "prior_sample_time": previous.sample_time.isoformat(),
                 "spread_change_bps": current.raw_spread_bps - previous.raw_spread_bps,
-                # Positive means farther from the displayed reference; negative
-                # means closer. This is display context only.
-                "distance_change_bps": distance_change,
+                # Positive means the executable convergence edge improved;
+                # negative means it reverted toward or through break-even.
+                "edge_change_bps": edge_change,
                 "state": state,
             }
 
@@ -1934,19 +1942,17 @@ class DashboardQueryService:
             if observation.sample_time >= peak_start
         ]
         peak_candidates.append(current)
-        peak = max(
-            peak_candidates,
-            key=lambda observation: abs(observation.raw_spread_bps - reference_bps),
-        )
-        peak_distance = abs(peak.raw_spread_bps - reference_bps)
+        peak = max(peak_candidates, key=convergence_edge)
+        peak_edge = convergence_edge(peak)
 
         return {
             "available": True,
             "reference_bps": reference_bps,
             "reference_kind": reference_kind,
-            "current_distance_bps": current_distance,
-            "recent_peak_distance_bps": peak_distance,
-            "distance_from_recent_peak_bps": max(0.0, peak_distance - current_distance),
+            "current_edge_bps": current_edge,
+            "current_state": "gone" if current_edge <= 0 else "active",
+            "recent_peak_edge_bps": peak_edge,
+            "edge_from_recent_peak_bps": max(0.0, peak_edge - current_edge),
             "recent_peak_at": peak.sample_time.isoformat(),
             "windows": windows,
         }
