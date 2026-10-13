@@ -324,6 +324,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 .trajectory-widening { color: #fbbf24; }
 .trajectory-reverting { color: #7dd3fc; }
 .trajectory-flat { color: #a9bbcc; }
+.trajectory-gone { color: #fca5a5; }
 .trajectory-unavailable { color: #71869b; }
 .trajectory-note { display: block; margin-top: 6px; color: #71869b; font-size: .65rem; line-height: 1.3; }
 .pair-chart-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
