@@ -507,10 +507,10 @@ def test_opportunities_ui_orders_scan_columns_and_exposes_terminal_hooks(scanner
     with urlopen(scanner_http + "/opportunities") as response:
         html = response.read().decode()
 
-    headers = re.search(r'<table[^>]*aria-label="Opportunities"[^>]*>.*?<thead><tr>(.*?)</tr>', html, re.S)
+    headers = re.search(r'<table[^>]*aria-label="套利機會"[^>]*>.*?<thead><tr>(.*?)</tr>', html, re.S)
     assert headers is not None
     assert re.findall(r"<th>(.*?)</th>", headers.group(1)) == [
-        "Symbol", "Route", "Edge", "Current", "Baseline", "Execution",
+        "交易標的", "交易方向", "收斂優勢", "目前價差", "歷史基準", "可成交性",
     ]
     for hook in (
         "opportunity-terminal-table", "route-cell", "edge-cell", "current-cell",
@@ -566,7 +566,7 @@ console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
     assert symbol_cell is not None
     assert "Eligible" not in symbol_cell.group(0)
     assert rendered.count("Eligible") == 0
-    assert "8.00 bps mean" in rendered
+    assert "8.00 bps 均值" in rendered
 
 
 def test_terminal_tables_use_a_shared_sticky_header_only(scanner_http):
@@ -592,8 +592,8 @@ await settle();
 console.log(JSON.stringify({status:byId('overall').textContent, data:byId('data-as-of').textContent,
   refreshed:byId('refreshed').textContent}));
 """, setup=POLLING_SETUP + "location.pathname='/opportunities';\n")
-    assert result["status"] == "HEALTHY"
-    assert result["data"] == "data age 4s"
+    assert result["status"] == "正常"
+    assert result["data"] == "資料延遲 4s"
     assert "2026-10-12T15:21:50" not in result["data"]
     assert "上午" not in result["refreshed"]
     assert "toLocaleTimeString" not in html
@@ -606,7 +606,7 @@ def test_pair_top_status_omits_unavailable_data_age(scanner_http):
 compactDataStatus({data_as_of:'2026-10-12T15:21:50+00:00', generated_at:'2026-10-12T15:21:51+00:00'}, 'HEALTHY');
 console.log(JSON.stringify({data:byId('data-as-of').textContent, refreshed:byId('refreshed').textContent}));
 """, setup="location.pathname='/pair';\n")
-    assert result == {"data": "", "refreshed": "read-only source"}
+    assert result == {"data": "", "refreshed": "唯讀資料源"}
     assert "data age" not in result["data"]
 
 
@@ -658,13 +658,13 @@ def test_terminal_opportunities_use_six_grouped_decision_columns(scanner_http):
         html = response.read().decode()
 
     headers = re.search(
-        r'<table[^>]*aria-label="Opportunities"[^>]*>.*?<thead><tr>(.*?)</tr>',
+        r'<table[^>]*aria-label="套利機會"[^>]*>.*?<thead><tr>(.*?)</tr>',
         html,
         re.S,
     )
     assert headers is not None
     assert re.findall(r"<th>(.*?)</th>", headers.group(1)) == [
-        "Symbol", "Route", "Edge", "Current", "Baseline", "Execution",
+        "交易標的", "交易方向", "收斂優勢", "目前價差", "歷史基準", "可成交性",
     ]
     for hook in (
         "opportunity-terminal-table", "route-cell", "edge-cell", "current-cell",
@@ -704,12 +704,12 @@ console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
 """, setup="location.pathname='/opportunities';\n")
     rendered = result
     assert 'class="route-cell"' in rendered
-    assert "LONG" in rendered and "SHORT" in rendered
+    assert "做多" in rendered and "做空" in rendered
     assert "+18.24" in rendered and "+26.24" in rendered
-    assert "8.00" in rendered and "cov" in rendered
-    assert "age 4s" in rendered and "skew 2s" in rendered
-    assert "Baseline pending" in rendered and "STALE" in rendered
-    assert "Depth unavailable" in rendered
+    assert "8.00" in rendered and "覆蓋率" in rendered
+    assert "延遲 4s" in rendered and "時間差 2s" in rendered
+    assert "等待基準建立" in rendered and "資料過期" in rendered
+    assert "深度不可用" in rendered
     assert "/pair?symbol=QQQ" in rendered
 
 
@@ -739,13 +739,13 @@ def test_terminal_anomalies_use_six_grouped_columns(scanner_http):
     with urlopen(scanner_http + "/anomalies") as response:
         html = response.read().decode()
     headers = re.search(
-        r'<table[^>]*aria-label="Active anomalies"[^>]*>.*?<thead><tr>(.*?)</tr>',
+        r'<table[^>]*aria-label="有效異常訊號"[^>]*>.*?<thead><tr>(.*?)</tr>',
         html,
         re.S,
     )
     assert headers is not None
     assert re.findall(r"<th>(.*?)</th>", headers.group(1)) == [
-        "Symbol", "Route", "Deviation", "Reference", "Episode", "Context",
+        "交易標的", "交易方向", "偏離幅度", "參考基準", "訊號週期", "歷史比較",
     ]
     for hook in ("anomaly-terminal-table", "anomaly-route", "anomaly-context"):
         assert hook in html
@@ -777,17 +777,17 @@ renderPair({
 console.log(JSON.stringify({summary:byId('pair-summary').innerHTML, secondary:byId('pair-secondary').innerHTML}));
 """, setup="location.pathname='/pair';\n")
     labels = re.findall(r'class="metric-label">([^<]+)', result["summary"])
-    assert labels[:4] == ["Edge after RT fee", "Current", "Baseline", "Execution"]
+    assert labels[:4] == ["扣費後預估收斂優勢", "目前價差", "歷史基準", "可成交性"]
     assert "26.24" in result["secondary"] or "26.24" in result["summary"]
-    assert "Long $10k buy VWAP" in result["secondary"]
-    assert "Short $10k sell VWAP" in result["secondary"]
+    assert "做多端 1 萬美元買入 VWAP" in result["secondary"]
+    assert "做空端 1 萬美元賣出 VWAP" in result["secondary"]
 
 
 def test_status_ui_distinguishes_latest_rows_from_configured_feeds(scanner_http):
     with urlopen(scanner_http + "/status") as response:
         html = response.read().decode()
-    assert "Rows at latest sample / configured feeds" in html
-    assert "Healthy feeds / primary VWAP ready" in html
+    assert "最新採樣筆數／已設定資料源" in html
+    assert "正常資料源／VWAP 就緒" in html
 
 
 def test_anomalies_ui_uses_grouped_terminal_presentation(scanner_http):
@@ -810,7 +810,7 @@ def test_opportunities_http_filters_by_basis_state_and_exposes_the_filter(scanne
     with urlopen(scanner_http + "/") as response:
         html = response.read().decode()
     assert 'id="basis_state"' in html
-    assert "Basis state" in html
+    assert "基準狀態" in html
 
 
 @pytest.mark.parametrize(("query", "count", "first_symbol"), [
@@ -924,7 +924,7 @@ def test_dashboard_html_navigation_and_view_anchors(scanner_http, path):
     elif path in ("/", "/opportunities"):
         for anchor in ("filters", "opportunity-rows", "data-as-of"):
             assert f'id="{anchor}"' in html
-        for column in ("Symbol", "Route", "Current", "Baseline", "Edge", "Execution"):
+        for column in ("交易標的", "交易方向", "目前價差", "歷史基準", "收斂優勢", "可成交性"):
             assert f">{column}<" in html
     else:
         for anchor in ("anomaly-filters", "anomaly-symbol", "anomaly-long-venue", "anomaly-short-venue", "anomaly-eligible-only", "anomaly-rows", "data-as-of"):
@@ -1239,7 +1239,7 @@ byId('pair-range').listeners.change();
 console.log(JSON.stringify({summary, secondary, chart, search:location.search, requests:requests.map(r=>r.url)}));
 """, setup=POLLING_SETUP + "location.pathname='/pair'; location.search=" + json.dumps("?" + query) + "; const payload=" + json.dumps(payload) + ";\n")
     combined = result["summary"] + result["secondary"]
-    for label in ("Raw spread", "24h Mean", "24h Std", "Deviation", "Signal duration", "Long $10k buy VWAP", "Short $10k sell VWAP", "RT Fee", "Observed skew", "Freshness", "Sample time", "Lifecycle"):
+    for label in ("原始價差", "24 小時均值", "24 小時標準差", "偏離幅度", "訊號持續時間", "做多端 1 萬美元買入 VWAP", "做空端 1 萬美元賣出 VWAP", "來回手續費", "觀測時間差", "資料延遲", "採樣時間", "訊號生命週期"):
         assert label in combined
     assert "500.00" in combined and "294.00" in combined
     assert "<svg" in result["chart"] and 'data-series="raw"' in result["chart"]
@@ -1273,9 +1273,9 @@ console.log(JSON.stringify({summary:byId('pair-summary').innerHTML, chart:byId('
 """, setup="location.pathname='/pair';\n")
     labels = re.findall(r'class="metric-label">([^<]+)', result["summary"])
     assert labels[:3] == [
-        "Edge after RT fee",
-        "Current",
-        "Baseline",
+        "扣費後預估收斂優勢",
+        "目前價差",
+        "歷史基準",
     ]
     assert 'data-marker="current"' in result["chart"]
     assert 'data-marker="candidate"' in result["chart"]
@@ -1292,7 +1292,7 @@ renderPair({identity:{canonical_symbol:'USO',long_venue:'lighter_robinhood',long
   errors:['pair identity is not an enabled configured mapping'], current:null, history:[], rolling_mean_series:[]});
 console.log(JSON.stringify(byId('pair-identity').textContent + '|' + byId('pair-chart').textContent));
 """, setup="location.pathname='/pair';\n")
-    assert "no longer an enabled mapping" in result
+    assert "已不在目前的監控清單中" in result
 
 
 def test_pair_ui_gaps_unavailable_mean_and_current_are_not_synthesized(scanner_http):
@@ -1451,16 +1451,16 @@ console.log(JSON.stringify(byId('pair-trajectory-rail').innerHTML));
         setup="location.pathname='/pair';\n",
     )
 
-    assert "Edge trajectory" in rendered
-    assert "+2.00 bps · widening" in rendered
-    assert "-1.50 bps · reverting" in rendered
-    assert "0.00 bps · flat" in rendered
-    assert "Off peak" in rendered
+    assert "價差優勢走勢" in rendered
+    assert "+2.00 bps · 持續擴大" in rendered
+    assert "-1.50 bps · 正在收斂" in rendered
+    assert "0.00 bps · 大致持平" in rendered
+    assert "距高點回落" in rendered
     assert "3.00 bps" in rendered
-    assert "rolling 24h reference" in rendered
-    assert "Current edge" in rendered
+    assert "滾動 24 小時 基準" in rendered
+    assert "目前收斂優勢" in rendered
     assert "+10.00 bps" in rendered
-    assert "15m peak" in rendered
+    assert "15 分鐘高點" in rendered
     assert "+13.00 bps" in rendered
-    assert "display-only" in rendered
+    assert "僅供觀察" in rendered
     assert "entry" not in rendered.lower()
