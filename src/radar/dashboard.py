@@ -416,7 +416,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 <h2 id="pair-identity">配對詳情｜無法辨識完整配對</h2>
 <div id="pair-summary" class="pair-kpis metrics"></div>
 <div class="pair-layout"><div class="pair-main">
-<div class="pair-chart-header"><strong>方向性可成交價差</strong><div class="pair-chart-controls"><button type="button" id="pair-chart-reset">重設視圖</button><button type="button" id="pair-chart-latest">跳至最新</button><label>歷史範圍<select id="pair-range" aria-label="歷史資料範圍"><option value="1h">1h</option><option value="6h">6h</option><option value="24h" selected>24h</option><option value="3d">3d</option><option value="7d">7d</option><option value="all">全部資料（最多 90 天）</option></select></label></div></div>
+<div class="pair-chart-header"><strong>方向性可成交價差</strong><div class="pair-chart-controls"><button type="button" id="pair-chart-reset">重設視圖</button><button type="button" id="pair-chart-latest">跳至最新</button><label>歷史範圍<select id="pair-range" aria-label="歷史資料範圍"><option value="1h">1 小時</option><option value="6h">6 小時</option><option value="24h" selected>24 小時</option><option value="3d">3 天</option><option value="7d">7 天</option><option value="all">全部資料（最多 90 天）</option></select></label></div></div>
 <div class="chart-legend"><span class="raw-color">原始價差</span><span class="mean-color">滾動 24 小時均值</span><span class="current-color">目前價差</span></div>
 <div id="pair-chart" class="card">無歷史資料</div>
 <p id="pair-coverage" class="muted"></p>
@@ -497,7 +497,7 @@ function pairCell(row, symbolField, includeState = true) {
   const link = pairLink(row);
   const symbol = esc(row[symbolField]);
   const state = includeState && row.state ? '<small>' + esc(({eligible:'符合條件',pending:'等待基準建立',unavailable:'基準不可用',stale:'資料過期',depth_unavailable:'深度不可用'}[row.state] ?? row.state)) + '</small>' : '';
-  return link ? '<td class="symbol-cell"><a href="' + esc(link) + '">' + symbol + '</a>' + state + '</td>' : '<td class="symbol-cell">' + symbol + '<small>Exact identity unavailable</small>' + state + '</td>';
+  return link ? '<td class="symbol-cell"><a href="' + esc(link) + '">' + symbol + '</a>' + state + '</td>' : '<td class="symbol-cell">' + symbol + '<small>完整配對資訊不可用</small>' + state + '</td>';
 }
 function directionCell(row, venueField, symbolField, direction) {
   return '<td class="route-cell"><span class="direction-label">' + direction + '</span>' + esc(row[venueField]) + '<small>' + esc(row[symbolField]) + '</small></td>';
@@ -506,7 +506,7 @@ function routeCell(row, extraClass = '') {
   const link = pairLink(row);
   const side = (direction, venueField, symbolField, className) => '<div class="route-side ' + className + '"><span class="route-label">' + direction + '</span><span class="route-venue">' + esc(row[venueField]) + '</span><span class="route-symbol">' + esc(row[symbolField]) + '</span></div>';
   const body = side('做多', 'long_venue', 'long_venue_symbol', 'long') + side('做空', 'short_venue', 'short_venue_symbol', 'short');
-  return '<td class="route-cell' + (extraClass ? ' ' + extraClass : '') + '">' + (link ? '<a class="route-link" href="' + esc(link) + '">' + body + '</a>' : body + '<small>Exact identity unavailable</small>') + '</td>';
+  return '<td class="route-cell' + (extraClass ? ' ' + extraClass : '') + '">' + (link ? '<a class="route-link" href="' + esc(link) + '">' + body + '</a>' : body + '<small>完整配對資訊不可用</small>') + '</td>';
 }
 function signedNumber(value) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
@@ -519,28 +519,28 @@ function renderOpportunities(data) {
   byId('opportunity-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
     pairCell(row, 'canonical_symbol', false) +
     routeCell(row) +
-    '<td class="edge-cell"><strong class="edge-value ' + edgeClass(row.convergence_edge_bps) + '">' + signedNumber(row.convergence_edge_bps) + ' bps</strong><small>after ' + number(row.round_trip_fee_bps) + ' RT fee</small></td>' +
-    '<td class="current-cell">' + (typeof row.current_net_spread_bps === 'number' && Number.isFinite(row.current_net_spread_bps) ? '<strong class="current-net">' + signedNumber(row.current_net_spread_bps) + ' net</strong>' : '<span class="unavailable">Net unavailable</span>') + '<small class="current-raw">raw ' + signedNumber(row.current_raw_spread_bps) + ' bps</small></td>' +
+    '<td class="edge-cell"><strong class="edge-value ' + edgeClass(row.convergence_edge_bps) + '">' + signedNumber(row.convergence_edge_bps) + ' bps</strong><small>扣除 ' + number(row.round_trip_fee_bps) + ' bps 來回手續費</small></td>' +
+    '<td class="current-cell">' + (typeof row.current_net_spread_bps === 'number' && Number.isFinite(row.current_net_spread_bps) ? '<strong class="current-net">' + signedNumber(row.current_net_spread_bps) + ' 淨價差</strong>' : '<span class="unavailable">淨價差不可用</span>') + '<small class="current-raw">原始 ' + signedNumber(row.current_raw_spread_bps) + ' bps</small></td>' +
     '<td class="baseline-cell">' + (row.basis_state === 'eligible' && typeof row.rolling_mean_bps === 'number'
-      ? '<strong class="baseline-primary">' + number(row.rolling_mean_bps) + ' bps mean</strong><small>σ ' + number(row.rolling_std_bps) + ' · ' + (typeof row.basis_coverage === 'number' ? number(row.basis_coverage * 100) + '% 覆蓋率' : '—') + '</small>'
+      ? '<strong class="baseline-primary">' + number(row.rolling_mean_bps) + ' bps 均值</strong><small>σ ' + number(row.rolling_std_bps) + ' · ' + (typeof row.basis_coverage === 'number' ? number(row.basis_coverage * 100) + '% 覆蓋率' : '—') + '</small>'
       : '<span class="state-note state-' + stateClass(row.basis_state) + '">' + esc(row.basis_state === 'pending' ? '等待基準建立' : row.basis_state === 'unavailable' ? '基準不可用' : '基準不可用') + '</span>') + '</td>' +
-    '<td class="execution-cell" title="' + sampleTitle(row) + '">' + (row.state === 'stale' ? '<span class="state-note state-stale">STALE</span>' : row.primary_depth_status !== 'available' ? '<span class="state-note state-depth-unavailable">Depth unavailable</span>' : '<span class="execution-primary">Depth available</span>') + '<small>age ' + age(row.freshness_seconds) + ' · 時間差 ' + age(row.observed_at_skew_seconds) + '</small></td></tr>'
+    '<td class="execution-cell" title="' + sampleTitle(row) + '">' + (row.state === 'stale' ? '<span class="state-note state-stale">資料過期</span>' : row.primary_depth_status !== 'available' ? '<span class="state-note state-depth-unavailable">深度不可用</span>' : '<span class="execution-primary">深度可用</span>') + '<small>延遲 ' + age(row.freshness_seconds) + ' · 時間差 ' + age(row.observed_at_skew_seconds) + '</small></td></tr>'
   ).join('') || emptyRow(6, data.status === 'healthy' ? '沒有符合條件的套利機會' : '目前沒有符合的資料；部分來源可能異常');
 }
 function renderAnomalies(data) {
   byId('anomaly-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
     pairCell({...row, canonical_symbol: row.symbol}, 'symbol') +
     routeCell({...row, canonical_symbol: row.symbol}, 'anomaly-route') +
-    '<td class="numeric"><strong class="edge-value anomaly-deviation">' + signedNumber(row.current_deviation_bps) + ' bps</strong><small>current ' + signedNumber(row.current_spread_bps) + '</small></td>' +
-    '<td class="numeric"><strong>' + number(row.reference_mean_bps) + ' bps</strong><small>alignment ' + number(row.mean_alignment_bps) + '</small></td>' +
-    '<td><strong>' + age(row.episode_age_seconds) + '</strong><small>peak ' + signedNumber(row.post_confirmation_peak_deviation_bps) + ' · TG ' + esc(row.tg_status ?? '等待中') + '</small></td>' +
+    '<td class="numeric"><strong class="edge-value anomaly-deviation">' + signedNumber(row.current_deviation_bps) + ' bps</strong><small>目前 ' + signedNumber(row.current_spread_bps) + '</small></td>' +
+    '<td class="numeric"><strong>' + number(row.reference_mean_bps) + ' bps</strong><small>基準差距 ' + number(row.mean_alignment_bps) + '</small></td>' +
+    '<td><strong>' + age(row.episode_age_seconds) + '</strong><small>高峰 ' + signedNumber(row.post_confirmation_peak_deviation_bps) + ' · TG ' + esc(row.tg_status ?? '等待中') + '</small></td>' +
     '<td class="anomaly-context"><strong>' + (row.mean_12h_bps ?? '—') + ' / ' + (row.mean_24h_bps ?? '—') + ' / ' + (row.mean_48h_bps ?? '—') + '</strong><small>12h / 24h / 48h</small></td></tr>').join('') || emptyRow(6, '目前沒有有效且已確認的異常訊號');
 }
 function renderStatus(data) {
   const overall = data.overall || {}, heartbeat = data.heartbeat || {};
   const metric = (id, value, title) => { const element = byId(id); element.textContent = value ?? '—'; if (title) element.title = title; };
-  metric('heartbeat', statusZh(heartbeat.status) + ' · age ' + age(heartbeat.age_seconds) + ' · ' + compactUtc(heartbeat.updated_at), heartbeat.updated_at);
-  metric('sample', compactUtc(data.data_as_of) + ' · age ' + age(data.sample_age_seconds), data.data_as_of);
+  metric('heartbeat', statusZh(heartbeat.status) + ' · 延遲 ' + age(heartbeat.age_seconds) + ' · ' + compactUtc(heartbeat.updated_at), heartbeat.updated_at);
+  metric('sample', compactUtc(data.data_as_of) + ' · 延遲 ' + age(data.sample_age_seconds), data.data_as_of);
   metric('feeds', (overall.latest_feeds ?? '—') + ' / ' + (overall.configured_feeds ?? '—'));
   metric('primary', (overall.healthy_feeds ?? '—') + ' / ' + (overall.primary_vwap_ready ?? '—'));
   const parquet = data.parquet || {};
@@ -586,7 +586,7 @@ function renderPair(data) {
   byId('pair-long-leg').innerHTML = '<h3>做多端</h3>' + railLine('交易所', identity.long_venue ?? '無資料') + railLine('標的', identity.long_venue_symbol ?? '無資料') + railLine('1 萬美元買入 VWAP', number(current.long_buy_vwap));
   byId('pair-short-leg').innerHTML = '<h3>做空端</h3>' + railLine('交易所', identity.short_venue ?? '無資料') + railLine('標的', identity.short_venue_symbol ?? '無資料') + railLine('1 萬美元賣出 VWAP', number(current.short_sell_vwap));
   const trajectoryWindows = trajectory.windows || {};
-  const trajectoryClass = state => ['持續擴大','正在收斂','大致持平','優勢消失'].includes(state) ? 'trajectory-' + state : 'trajectory-unavailable';
+  const trajectoryClass = state => ['widening','reverting','flat','gone'].includes(state) ? 'trajectory-' + state : 'trajectory-unavailable';
   const trajectoryValue = entry => {
     if (!entry || entry.available !== true || typeof entry.edge_change_bps !== 'number' || !Number.isFinite(entry.edge_change_bps)) return '—';
     return signedNumber(entry.edge_change_bps) + ' bps · ' + statusTrajectoryZh(entry.state);
@@ -595,9 +595,9 @@ function renderPair(data) {
   const trajectoryLine = label => {
     const entry = trajectoryWindows[label];
     const state = entry?.state ?? 'unavailable';
-    return '<div class="pair-rail-line"><span>' + esc(label) + '</span><span class="trajectory-state ' + trajectoryClass(state) + '">' + esc(trajectoryValue(entry)) + '</span></div>';
+    return '<div class="pair-rail-line"><span>' + esc(({ '1m':'1 分鐘', '5m':'5 分鐘', '15m':'15 分鐘' }[label] ?? label)) + '</span><span class="trajectory-state ' + trajectoryClass(state) + '">' + esc(trajectoryValue(entry)) + '</span></div>';
   };
-  const referenceKind = trajectory.reference_kind === 'anomaly_frozen' ? '異常訊號固定基準' : trajectory.reference_kind === 'rolling_24h' ? '滾動 24 小時' : 'unavailable';
+  const referenceKind = trajectory.reference_kind === 'anomaly_frozen' ? '異常訊號固定基準' : trajectory.reference_kind === 'rolling_24h' ? '滾動 24 小時' : '不可用';
   const currentEdge = typeof trajectory.current_edge_bps === 'number' && Number.isFinite(trajectory.current_edge_bps)
     ? signedNumber(trajectory.current_edge_bps) + ' bps'
     : '—';
@@ -609,13 +609,13 @@ function renderPair(data) {
     : '—';
   byId('pair-trajectory-rail').innerHTML = trajectory.available === true
     ? '<h3>價差優勢走勢</h3>' +
-      railLine('目前收斂優勢', currentEdge + (trajectory.current_state === '優勢消失' ? ' · 優勢消失' : '')) +
+      railLine('目前收斂優勢', currentEdge + (trajectory.current_state === 'gone' ? ' · 優勢消失' : '')) +
       trajectoryLine('1m') + trajectoryLine('5m') + trajectoryLine('15m') +
       railLine('15 分鐘高點', peakEdge) +
       railLine('距高點回落', peakOffset) +
-      '<small class="trajectory-note">Δ = change in directional convergence edge after RT fee vs ' + esc(referenceKind) + ' 基準｜僅供觀察</small>'
-    : '<h3>Edge trajectory</h3><span class="trajectory-state trajectory-unavailable">Unavailable</span>' +
-      '<small class="trajectory-note">Needs a current observation and usable baseline reference · display-only</small>';
+      '<small class="trajectory-note">Δ = 扣除來回手續費後的收斂優勢變化；對比 ' + esc(referenceKind) + ' 基準｜僅供觀察</small>'
+    : '<h3>價差優勢走勢</h3><span class="trajectory-state trajectory-unavailable">不可用</span>' +
+      '<small class="trajectory-note">需要有效的最新觀測與歷史基準｜僅供觀察</small>';
   byId('pair-lifecycle-rail').innerHTML = '<h3>訊號生命週期</h3>' + railLine('持續時間', age(current.signal_duration_seconds)) + railLine('候選開始', lifecycle.candidate_started_at ?? '無資料') + railLine('確認時間', lifecycle.confirmed_at ?? '無資料') + railLine('狀態', lifecycle.available ? ((lifecycle.candidate_confirmed ? '已確認' : '候選') + ' · ' + (lifecycle.alerted ? '已通知' : '未通知')) : '無資料');
   const metrics = [
     ['原始價差（bps）', signedNumber(current.raw_spread_bps)], ['目前淨價差（bps）',signedNumber(current.current_net_spread_bps)], ['24 小時均值（bps）',number(current.rolling_mean_bps)], ['24 小時標準差（bps）',number(current.rolling_std_bps)], ['偏離幅度（bps）',signedNumber(current.deviation_bps)],
@@ -660,8 +660,9 @@ function renderInteractivePairChart(data, points, means) {
     let previous = null;
     for (const row of sorted) {
       if (previous && row.time <= previous.time) continue;
-      if (previous && previous.segment !== row.segment && row.time - previous.time > 0) {
-        output.push({time:(previous.time + row.time) / 2});
+      if (previous && previous.segment !== row.segment) {
+        const gapTime = previous.time + Math.floor((row.time - previous.time) / 2);
+        if (gapTime > previous.time && gapTime < row.time) output.push({time:gapTime});
       }
       output.push(finite(row[field]) ? {time:row.time, value:row[field]} : {time:row.time});
       previous = row;
@@ -773,9 +774,10 @@ function renderPairChart(data) {
   const points = (data.history || []).filter(p => finite(p.raw_spread_bps) && Number.isFinite(Date.parse(p.sample_time)));
   const means = data.rolling_mean_series || [];
   if (renderInteractivePairChart(data, points, means)) return;
+  if (interactivePairChart) { interactivePairChart.chart.remove(); interactivePairChart = null; interactivePairChartMarkers = null; interactivePairReference = null; }
   const current = data.current;
   const lifecycle = data.lifecycle || {};
-  if (!points.length) { text('pair-chart', '歷史資料不可用'); return; }
+  if (!points.length) { if (interactivePairChart) { interactivePairChart.chart.remove(); interactivePairChart = null; interactivePairChartMarkers = null; interactivePairReference = null; } text('pair-chart', '歷史資料不可用'); return; }
   const values = points.map(p => p.raw_spread_bps).concat(means.filter(p => finite(p.rolling_mean_bps)).map(p => p.rolling_mean_bps));
   if (current && finite(current.raw_spread_bps)) values.push(current.raw_spread_bps);
   const v2Reference = finite(lifecycle.reference_mean_bps) ? lifecycle.reference_mean_bps : null;
@@ -795,7 +797,7 @@ function renderPairChart(data) {
     }
     return path ? '<g><path data-series="' + name + '" d="' + path + '" fill="none" stroke="' + color + '" stroke-width="1.6"/></g>' : '';
   }
-  let svg = '<svg viewBox="0 0 960 350" role="img" aria-label="Executable spread and prior-only rolling 24h mean in basis points"><title>Exact sampled executable spread history</title>';
+  let svg = '<svg viewBox="0 0 960 350" role="img" aria-label="可成交價差與僅使用歷史資料的 24 小時均值（bps）"><title>精確採樣的可成交價差歷史</title>';
   for (let i = 0; i <= 4; i++) {
     const value = low + (high - low) * i / 4, py = y(value).toFixed(2);
     svg += '<line x1="70" x2="910" y1="' + py + '" y2="' + py + '" stroke="#374151"/><text x="60" y="' + py + '" text-anchor="end" fill="#94a3b8" font-size="11">' + number(value) + '</text>';
@@ -838,15 +840,15 @@ function renderPairChart(data) {
     const py = y(v2Reference).toFixed(2);
     svg += '<line data-marker="reference" x1="70" x2="910" y1="' + py + '" y2="' + py + '" stroke="#c084fc" stroke-dasharray="5 4"/>';
     const referenceY = placeLabel(78, Number(py) - 4);
-    svg += '<text data-marker-label="reference" data-label-lane="reference" x="78" y="' + referenceY.toFixed(2) + '" text-anchor="start" fill="#c084fc" font-size="11">Reference</text>';
+    svg += '<text data-marker-label="reference" data-label-lane="reference" x="78" y="' + referenceY.toFixed(2) + '" text-anchor="start" fill="#c084fc" font-size="11" >參考基準</text>';
   }
   if (current && finite(current.raw_spread_bps) && Date.parse(current.sample_time) >= start && Date.parse(current.sample_time) <= end) {
     const currentX = x(current.sample_time), currentY = y(current.raw_spread_bps);
     const currentAnchor = currentX > 840 ? 'end' : 'start';
     const currentLabelX = currentX + (currentAnchor === 'end' ? -8 : 8);
     const currentLabelY = placeLabel(currentLabelX, currentY - 10);
-    svg += '<circle data-series="current" data-marker="current" cx="' + currentX.toFixed(2) + '" cy="' + currentY.toFixed(2) + '" r="5" fill="#6ee7b7"><title>Current · ' + esc(current.sample_time) + ' · ' + number(current.raw_spread_bps) + ' bps</title></circle>';
-    svg += '<text data-marker-label="current" data-label-lane="current" x="' + currentLabelX.toFixed(2) + '" y="' + currentLabelY.toFixed(2) + '" text-anchor="' + currentAnchor + '" fill="#6ee7b7" font-size="10">current</text>';
+    svg += '<circle data-series="current" data-marker="current" cx="' + currentX.toFixed(2) + '" cy="' + currentY.toFixed(2) + '" r="5" fill="#6ee7b7"><title>目前 · ' + esc(current.sample_time) + ' · ' + number(current.raw_spread_bps) + ' bps</title></circle>';
+    svg += '<text data-marker-label="current" data-label-lane="current" x="' + currentLabelX.toFixed(2) + '" y="' + currentLabelY.toFixed(2) + '" text-anchor="' + currentAnchor + '" fill="#6ee7b7" font-size="10">目前</text>';
   }
   if (v2Reference !== null || lifecycle.available) {
     const rawAt = timestamp => {
@@ -854,7 +856,7 @@ function renderPairChart(data) {
       return point && finite(point.raw_spread_bps) ? point.raw_spread_bps : null;
     };
     const markers = [
-      ['候選', lifecycle.candidate_started_at, rawAt(lifecycle.candidate_started_at), '#fbbf24'],
+      ['candidate', lifecycle.candidate_started_at, rawAt(lifecycle.candidate_started_at), '#fbbf24'],
       ['confirmation', lifecycle.confirmed_at, rawAt(lifecycle.confirmed_at), '#fb923c'],
       ['peak', lifecycle.post_confirmation_peak_at, rawAt(lifecycle.post_confirmation_peak_at), '#f87171'],
       ['return', lifecycle.active === false ? lifecycle.ended_at : null, lifecycle.active === false ? lifecycle.current_spread_bps : null, '#4ade80'],
@@ -908,7 +910,7 @@ async function refresh(query = new URLSearchParams(location.search)) {
     if (sequence !== requestSequence) return;
     text('overall', '儀表板讀取失敗');
     byId('overall').className = 'degraded';
-    text('scanner-status', 'SCANNER · DEGRADED');
+    text('scanner-status', '掃描器 · 部分異常');
     byId('scanner-status').className = 'scanner-status degraded';
     compactDataStatus({});
     text('refreshed', '請求失敗');
