@@ -1464,3 +1464,105 @@ console.log(JSON.stringify(byId('pair-trajectory-rail').innerHTML));
     assert "+13.00 bps" in rendered
     assert "僅供觀察" in rendered
     assert "entry" not in rendered.lower()
+
+
+def test_pair_tradingview_chart_keeps_exact_gaps_markers_and_user_zoom(scanner_http):
+    with urlopen(scanner_http + "/pair") as response:
+        html = response.read().decode()
+    assert 'lang="zh-Hant"' in html
+    assert "lightweight-charts@5.2.1" in html
+    assert "id=\"pair-chart-reset\"" in html
+    assert "id=\"pair-chart-latest\"" in html
+    result = run_ui_script(
+        html,
+        """
+const pair = {
+  range:'24h',
+  identity:{canonical_symbol:'BTC',long_venue:'arcus',long_venue_symbol:'BTC',
+    short_venue:'lighter_robinhood',short_venue_symbol:'BTC'},
+  current:{raw_spread_bps:20,current_net_spread_bps:17,sample_time:'2026-10-13T12:00:00Z'},
+  basis:{eligible:false},
+  lifecycle:{available:true,reference_mean_bps:5,candidate_started_at:'2026-10-13T11:58:00Z',
+    confirmed_at:'2026-10-13T12:00:00Z'},
+  history:[
+    {sample_time:'2026-10-13T11:58:00Z',raw_spread_bps:10,segment:0},
+    {sample_time:'2026-10-13T12:00:00Z',raw_spread_bps:20,segment:1}
+  ],
+  rolling_mean_series:[
+    {sample_time:'2026-10-13T11:58:00Z',rolling_mean_bps:5,segment:0},
+    {sample_time:'2026-10-13T12:00:00Z',rolling_mean_bps:null,segment:1}
+  ]
+};
+renderPair(pair);
+const first = {raw:observed.datasets[0],mean:observed.datasets[1],markers:observed.markers[0],
+  ref:observed.lines[0],fit:observed.fit,
+  chart:byId('pair-chart').innerHTML,
+  guidance:byId('chart-library-status').textContent};
+renderPair(pair);
+byId('pair-chart-reset').listeners.click();
+byId('pair-chart-latest').listeners.click();
+console.log(JSON.stringify({first,visible:observed.visible,fit:observed.fit,latest:observed.latest,
+  markersUpdated:observed.markers.length}));
+""",
+        setup="""
+location.pathname='/pair';
+document.createElement = () => ({});
+const observed = {datasets:[], markers:[], lines:[], visible:[],fit:0,latest:0};
+const makeSeries = () => ({
+  setData(rows){ observed.datasets.push(rows); },
+  createPriceLine(options){ observed.lines.push(options); return options; },
+  removePriceLine() {}
+});
+window.LightweightCharts = {
+  LineSeries:{},
+  CrosshairMode:{Normal:0},
+  LineStyle:{Dashed:2},
+  createSeriesMarkers(series,rows){
+    observed.markers.push(rows);
+    return {setMarkers(next){observed.markers.push(next)}};
+  },
+  createChart(surface,options){
+    return {
+      addSeries(type,opts){return makeSeries()},
+      subscribeCrosshairMove(callback){},
+      timeScale(){return {
+        getVisibleLogicalRange(){return {from:1,to:4}},
+        setVisibleLogicalRange(range){observed.visible.push(range)},
+        fitContent(){observed.fit++},
+        scrollToRealTime(){observed.latest++}
+      }},
+      remove(){}
+    };
+  }
+};
+""",
+    )
+    raw = result["first"]["raw"]
+    assert len(raw) == 3  # segment boundary creates a whitespace data point
+    assert raw[0]["value"] == 10 and "value" not in raw[1] and raw[2]["value"] == 20
+    assert "value" not in result["first"]["mean"][-1]  # missing 24h mean is not filled
+    assert result["first"]["ref"]["price"] == 5
+    assert {marker["text"] for marker in result["first"]["markers"]} == {"候選", "確認", "目前"}
+    assert "pair-chart-surface" in result["first"]["chart"]  # interactive path, not SVG fallback
+    assert "滾輪縮放" in result["first"]["guidance"]
+    assert result["first"]["fit"] == 1
+    assert result["visible"] == [{"from": 1, "to": 4}]  # refresh preserves zoom
+    assert result["fit"] == 2 and result["latest"] == 1  # toolbar buttons work
+    assert result["markersUpdated"] == 2
+
+
+def test_pair_chart_svg_fallback_is_visible_and_explained_in_chinese(scanner_http):
+    with urlopen(scanner_http + "/pair") as response:
+        html = response.read().decode()
+    result = run_ui_script(
+        html,
+        """
+renderPair({history:[{sample_time:'2026-10-13T12:00:00Z',raw_spread_bps:20,segment:0}],
+  rolling_mean_series:[], current:null, lifecycle:{available:false},basis:{eligible:false}});
+console.log(JSON.stringify({chart:byId('pair-chart').innerHTML,
+  note:byId('chart-library-status').textContent}));
+""",
+        setup="location.pathname='/pair';\n",
+    )
+    assert result["chart"].startswith("<svg")
+    assert "互動圖表暫時無法載入" in result["note"]
