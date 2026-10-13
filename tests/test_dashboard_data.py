@@ -1263,7 +1263,7 @@ def test_pair_read_is_identity_bounded_and_does_not_read_unneeded_partitions(tmp
 
 
 
-def test_pair_trajectory_classifies_distance_to_displayed_reference():
+def test_pair_trajectory_classifies_directional_edge_to_displayed_reference():
     key = SpreadPairKey(
         canonical_symbol="BTC",
         long_venue=LONG_VENUE,
@@ -1304,19 +1304,58 @@ def test_pair_trajectory_classifies_distance_to_displayed_reference():
     assert trajectory["available"] is True
     assert trajectory["reference_bps"] == pytest.approx(100.0)
     assert trajectory["reference_kind"] == "rolling_24h"
-    assert trajectory["current_distance_bps"] == pytest.approx(20.0)
-    assert trajectory["recent_peak_distance_bps"] == pytest.approx(30.0)
-    assert trajectory["distance_from_recent_peak_bps"] == pytest.approx(10.0)
+    assert trajectory["current_edge_bps"] == pytest.approx(14.0)
+    assert trajectory["recent_peak_edge_bps"] == pytest.approx(24.0)
+    assert trajectory["edge_from_recent_peak_bps"] == pytest.approx(10.0)
     assert trajectory["recent_peak_at"] == (NOW - timedelta(seconds=300)).isoformat()
 
     windows = trajectory["windows"]
-    assert windows["1m"]["distance_change_bps"] == pytest.approx(10.0)
+    assert windows["1m"]["edge_change_bps"] == pytest.approx(10.0)
     assert windows["1m"]["spread_change_bps"] == pytest.approx(10.0)
     assert windows["1m"]["state"] == "widening"
-    assert windows["5m"]["distance_change_bps"] == pytest.approx(-10.0)
+    assert windows["5m"]["edge_change_bps"] == pytest.approx(-10.0)
     assert windows["5m"]["state"] == "reverting"
-    assert windows["15m"]["distance_change_bps"] == pytest.approx(0.0)
+    assert windows["15m"]["edge_change_bps"] == pytest.approx(0.0)
     assert windows["15m"]["state"] == "flat"
+
+
+def test_pair_trajectory_marks_directional_edge_gone_after_crossing_reference():
+    key = SpreadPairKey(
+        canonical_symbol="BTC",
+        long_venue=LONG_VENUE,
+        long_venue_symbol="BTC",
+        short_venue=SHORT_VENUE,
+        short_venue_symbol="BTC",
+    )
+
+    def observation(seconds_ago: int, raw_spread_bps: float) -> _PairObservation:
+        sample_time = NOW - timedelta(seconds=seconds_ago)
+        return _PairObservation(
+            key=key,
+            sample_time=sample_time,
+            observed_at=sample_time,
+            long_buy_vwap=100.0,
+            short_sell_vwap=101.0,
+            long_fee_bps=1.0,
+            short_fee_bps=2.0,
+            raw_spread_bps=raw_spread_bps,
+            observed_at_skew_seconds=0.0,
+            freshness_seconds=None,
+            valid_for_history=True,
+        )
+
+    current = observation(0, 80.0)
+    trajectory = DashboardQueryService._pair_trajectory(
+        [observation(60, 110.0), current],
+        current,
+        reference_bps=100.0,
+        reference_kind="rolling_24h",
+    )
+
+    assert trajectory["current_edge_bps"] == pytest.approx(-26.0)
+    assert trajectory["current_state"] == "gone"
+    assert trajectory["windows"]["1m"]["edge_change_bps"] == pytest.approx(-30.0)
+    assert trajectory["windows"]["1m"]["state"] == "gone"
 
 
 def test_pair_trajectory_fails_closed_when_window_sample_is_too_far_away():
