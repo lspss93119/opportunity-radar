@@ -329,7 +329,16 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 .trajectory-note { display: block; margin-top: 6px; color: #71869b; font-size: .65rem; line-height: 1.3; }
 .pair-chart-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
 .pair-chart-header label { display: flex; align-items: center; gap: 7px; }
-#pair-chart { min-height: 270px; overflow: hidden; }
+#pair-chart { min-height: 270px; overflow: hidden; position: relative; padding: 7px; }
+
+.pair-chart-surface { width: 100%; height: min(62vh, 560px); min-height: 360px; }
+.pair-chart-tooltip { position: absolute; z-index: 2; top: 13px; left: 15px; max-width: calc(100% - 30px); padding: 6px 10px;
+  background: rgba(7,17,31,.85); border: 1px solid #35516a; border-radius: 4px; color: #cbd5e1; font-size: .75rem;
+  font-variant-numeric: tabular-nums; pointer-events: none; }
+.pair-chart-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.pair-chart-controls button { padding: 5px 9px; font-size: .72rem; min-height: 29px; }
+@media(max-width:760px) { .pair-chart-surface { height: 380px; min-height: 300px; } }
+
 #pair-chart svg { display: block; width: 100%; height: auto; }
 #pair-chart svg text { font-variant-numeric: tabular-nums; }
 #pair-chart .axis-tick { stroke: #334d66; }
@@ -407,7 +416,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 <h2 id="pair-identity">Pair Detail — exact identity unavailable</h2>
 <div id="pair-summary" class="pair-kpis metrics"></div>
 <div class="pair-layout"><div class="pair-main">
-<div class="pair-chart-header"><strong>Directional executable spread</strong><label>Range<select id="pair-range" aria-label="History range"><option value="1h">1h</option><option value="6h">6h</option><option value="24h" selected>24h</option><option value="3d">3d</option><option value="7d">7d</option><option value="all">All available (90 days)</option></select></label></div>
+<div class="pair-chart-header"><strong>Directional executable spread</strong><div class="pair-chart-controls"><button type="button" id="pair-chart-reset">重設視圖</button><button type="button" id="pair-chart-latest">跳至最新</button><label>Range<select id="pair-range" aria-label="History range"><option value="1h">1h</option><option value="6h">6h</option><option value="24h" selected>24h</option><option value="3d">3d</option><option value="7d">7d</option><option value="all">All available (90 days)</option></select></label></div></div>
 <div class="chart-legend"><span class="raw-color">Raw spread</span><span class="mean-color">Rolling 24h mean</span><span class="current-color">Current</span></div>
 <div id="pair-chart" class="card">History unavailable</div>
 <p id="pair-coverage" class="muted"></p>
@@ -416,6 +425,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 <p class="muted">UTC exact sample_time joins · missing slots remain gaps · history is read-only and prior-only. Statistics and lifecycle values are not recomputed in the browser.</p>
 </section>
 </main>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.min.js"></script>
 <script>
 const byId = id => document.getElementById(id);
 const esc = value => String(value ?? 'Unavailable').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
@@ -624,10 +634,143 @@ function renderPair(data) {
     (basis.sample_count ?? 'Unavailable') + ' · coverage: ' + (typeof basis.coverage === 'number' ? number(basis.coverage * 100) + '%' : 'Unavailable'));
   renderPairChart(data);
 }
+
+let interactivePairChart = null;
+let interactivePairRange = null;
+let interactivePairChartMarkers = null;
+let interactivePairReference = null;
+
+// TradingView Lightweight Charts is presentation-only. Exact timestamps and gaps come from the API.
+// The existing SVG below remains an offline fallback when the chart library is unavailable.
+function renderInteractivePairChart(data, points, means) {
+  const lib = window.LightweightCharts;
+  if (!lib || !lib.createChart || !lib.LineSeries || !document.createElement) return false;
+  const finite = value => typeof value === 'number' && Number.isFinite(value);
+  const epoch = value => {
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms / 1000 : null;
+  };
+  // Break on a missing sample or a new server-provided segment; never bridge gaps.
+  const toLine = (rows, field) => {
+    const sorted = rows.map(row => ({...row, time:epoch(row.sample_time)}))
+      .filter(row => row.time !== null).sort((a,b) => a.time - b.time);
+    const output = [];
+    let previous = null;
+    for (const row of sorted) {
+      if (previous && row.time <= previous.time) continue;
+      if (previous && previous.segment !== row.segment && row.time - previous.time > 0) {
+        output.push({time:(previous.time + row.time) / 2});
+      }
+      output.push(finite(row[field]) ? {time:row.time, value:row[field]} : {time:row.time});
+      previous = row;
+    }
+    return output;
+  };
+  const rawData = toLine(points, 'raw_spread_bps');
+  if (!rawData.some(row => finite(row.value))) return false;
+  try {
+    if (!interactivePairChart) {
+      const container = byId('pair-chart');
+      container.innerHTML = '<div id="pair-chart-surface" class="pair-chart-surface"></div>' +
+        '<div id="pair-chart-tooltip" class="pair-chart-tooltip" aria-live="off">移動游標可查看歷史價差</div>';
+      const surface = byId('pair-chart-surface');
+      const chart = lib.createChart(surface, {
+        autoSize:true,
+        layout:{background:{type:'solid',color:'#0d1b2b'},textColor:'#93a8bc',fontFamily:'-apple-system, BlinkMacSystemFont, sans-serif',attributionLogo:true},
+        grid:{vertLines:{color:'#183044'},horzLines:{color:'#21364a'}},
+        rightPriceScale:{borderColor:'#35516a',autoScale:true},
+        timeScale:{
+          borderColor:'#35516a',timeVisible:true,secondsVisible:false,
+          barSpacing:7,minBarSpacing:0.05,rightOffset:3,
+          tickMarkFormatter:t => {
+            if(typeof t!=='number') return String(t);
+            const date = new Date(t*1000), pad=v=>String(v).padStart(2,'0');
+            return pad(date.getUTCMonth()+1)+'/'+pad(date.getUTCDate())+' '+pad(date.getUTCHours())+':'+pad(date.getUTCMinutes());
+          }
+        },
+        localization:{
+          locale:'zh-TW',
+          timeFormatter:t => typeof t==='number' ? new Date(t*1000).toISOString().replace('T',' ').slice(0,19)+' UTC' : String(t)
+        },
+        crosshair:{mode:lib.CrosshairMode.Normal,vertLine:{color:'#64748b',labelBackgroundColor:'#334155'},horzLine:{color:'#64748b',labelBackgroundColor:'#334155'}},
+        handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:true},
+        handleScale:{axisPressedMouseMove:true,mouseWheel:true,pinch:true}
+      });
+      const raw = chart.addSeries(lib.LineSeries, {
+        color:'#93c5fd',lineWidth:2,crosshairMarkerVisible:true,
+        priceFormat:{type:'custom',minMove:0.01,formatter:v=>v.toFixed(2)+' bps'},
+        priceLineVisible:false,lastValueVisible:true
+      });
+      const mean = chart.addSeries(lib.LineSeries, {
+        color:'#fcd34d',lineWidth:2,priceLineVisible:false,lastValueVisible:true,
+        crosshairMarkerVisible:false
+      });
+      const tooltip = byId('pair-chart-tooltip');
+      chart.subscribeCrosshairMove(param => {
+        if (!param || !param.time || !param.seriesData) {
+          tooltip.textContent = '移動游標可查看歷史價差';
+          return;
+        }
+        const at = param.seriesData.get(raw);
+        const avg = param.seriesData.get(mean);
+        const date = typeof param.time==='number' ? new Date(param.time*1000).toISOString().replace('T',' ').slice(0,19)+' UTC' : String(param.time);
+        tooltip.textContent = date+'　價差 '+(at && finite(at.value) ? at.value.toFixed(2)+' bps' : '無資料')+
+          '　24 小時均值 '+(avg && finite(avg.value) ? avg.value.toFixed(2)+' bps' : '無資料');
+      });
+      interactivePairChart = {chart,raw,mean};
+    }
+    const instance = interactivePairChart;
+    const previousView = interactivePairRange === data.range ? instance.chart.timeScale().getVisibleLogicalRange() : null;
+    instance.raw.setData(rawData);
+    instance.mean.setData(toLine(means, 'rolling_mean_bps'));
+    if (interactivePairReference) {
+      instance.raw.removePriceLine(interactivePairReference);
+      interactivePairReference = null;
+    }
+    const lifecycle = data.lifecycle || {};
+    if (finite(lifecycle.reference_mean_bps)) {
+      interactivePairReference = instance.raw.createPriceLine({
+        price:lifecycle.reference_mean_bps,color:'#c084fc',lineWidth:1,
+        lineStyle:lib.LineStyle.Dashed,axisLabelVisible:true,title:'參考均值'
+      });
+    }
+    const availableTimes = new Set(rawData.filter(row => finite(row.value)).map(row => row.time));
+    const markers = [];
+    const addMarker = (time, color, label, position='aboveBar') => {
+      const timestamp = epoch(time);
+      if (timestamp === null || !availableTimes.has(timestamp)) return;
+      markers.push({time:timestamp,position,color,shape:'circle',text:label,size:1});
+    };
+    addMarker(lifecycle.candidate_started_at, '#fbbf24', '候選');
+    addMarker(lifecycle.confirmed_at, '#fb923c', '確認');
+    addMarker(lifecycle.post_confirmation_peak_at, '#f87171', '高峰');
+    if (lifecycle.active === false) addMarker(lifecycle.ended_at, '#4ade80', '回歸', 'belowBar');
+    const current = data.current || {};
+    if (finite(current.raw_spread_bps)) addMarker(current.sample_time, '#6ee7b7', '目前', 'belowBar');
+    markers.sort((a,b) => a.time - b.time);
+    if (lib.createSeriesMarkers) {
+      if (!interactivePairChartMarkers) interactivePairChartMarkers = lib.createSeriesMarkers(instance.raw, markers);
+      else interactivePairChartMarkers.setMarkers(markers);
+    }
+    if (previousView) instance.chart.timeScale().setVisibleLogicalRange(previousView);
+    else instance.chart.timeScale().fitContent();
+    interactivePairRange = data.range;
+    return true;
+  } catch (error) {
+    console.warn('互動圖表無法載入，已切換備援圖表', error);
+    if (interactivePairChart) interactivePairChart.chart.remove();
+    interactivePairChart = null;
+    interactivePairChartMarkers = null;
+    interactivePairReference = null;
+    return false;
+  }
+}
+
 function renderPairChart(data) {
   const finite = value => typeof value === 'number' && Number.isFinite(value);
   const points = (data.history || []).filter(p => finite(p.raw_spread_bps) && Number.isFinite(Date.parse(p.sample_time)));
   const means = data.rolling_mean_series || [];
+  if (renderInteractivePairChart(data, points, means)) return;
   const current = data.current;
   const lifecycle = data.lifecycle || {};
   if (!points.length) { text('pair-chart', 'History unavailable'); return; }
@@ -775,6 +918,8 @@ async function refresh(query = new URLSearchParams(location.search)) {
 }
 restoreFilters();
 restorePairRange();
+byId('pair-chart-reset').addEventListener('click', () => { if (interactivePairChart) interactivePairChart.chart.timeScale().fitContent(); });
+byId('pair-chart-latest').addEventListener('click', () => { if (interactivePairChart) interactivePairChart.chart.timeScale().scrollToRealTime(); });
 byId('pair-range').addEventListener('change', () => {
   const query = new URLSearchParams(location.search);
   query.set('range', byId('pair-range').value);
