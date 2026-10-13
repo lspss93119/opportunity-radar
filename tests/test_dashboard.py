@@ -1526,8 +1526,8 @@ window.LightweightCharts = {
       addSeries(type,opts){return makeSeries()},
       subscribeCrosshairMove(callback){},
       timeScale(){return {
-        getVisibleLogicalRange(){return {from:1,to:4}},
-        setVisibleLogicalRange(range){observed.visible.push(range)},
+        getVisibleRange(){return {from:1,to:4}},
+        setVisibleRange(range){observed.visible.push(range)},
         fitContent(){observed.fit++},
         scrollToRealTime(){observed.latest++}
       }},
