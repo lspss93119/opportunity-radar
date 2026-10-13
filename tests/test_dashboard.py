@@ -599,6 +599,17 @@ console.log(JSON.stringify({status:byId('overall').textContent, data:byId('data-
     assert "toLocaleTimeString" not in html
 
 
+def test_pair_top_status_omits_unavailable_data_age(scanner_http):
+    with urlopen(scanner_http + "/pair") as response:
+        html = response.read().decode()
+    result = run_ui_script(html, """
+compactDataStatus({data_as_of:'2026-10-12T15:21:50+00:00', generated_at:'2026-10-12T15:21:51+00:00'}, 'HEALTHY');
+console.log(JSON.stringify({data:byId('data-as-of').textContent, refreshed:byId('refreshed').textContent}));
+""", setup="location.pathname='/pair';\n")
+    assert result == {"data": "", "refreshed": "read-only source"}
+    assert "data age" not in result["data"]
+
+
 def test_pair_marker_labels_use_deterministic_non_overlapping_lanes(scanner_http):
     with urlopen(scanner_http + "/pair") as response:
         html = response.read().decode()

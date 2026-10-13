@@ -701,7 +701,7 @@ function compactDataStatus(data) {
     .filter(value => typeof value === 'string' && value);
   byId('data-as-of').title = exactTimes.join(' · ');
   byId('refreshed').title = typeof data.generated_at === 'string' ? data.generated_at : '';
-  text('data-as-of', 'data age ' + age(ageSeconds));
+  text('data-as-of', typeof ageSeconds === 'number' && Number.isFinite(ageSeconds) ? 'data age ' + age(ageSeconds) : '');
   text('refreshed', 'read-only source');
 }
 let requestSequence = 0;
