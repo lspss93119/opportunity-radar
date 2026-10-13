@@ -757,7 +757,8 @@ def test_terminal_pair_places_chart_before_secondary_details(scanner_http):
     assert html.index('id="pair-summary"') < html.index('id="pair-chart"')
     assert html.index('id="pair-chart"') < html.index('id="pair-details"')
     for hook in ("pair-kpis", "pair-layout", "pair-main", "pair-right-rail",
-                 "pair-long-leg", "pair-short-leg", "pair-lifecycle-rail", "pair-secondary"):
+                 "pair-long-leg", "pair-short-leg", "pair-trajectory-rail",
+                 "pair-lifecycle-rail", "pair-secondary"):
         assert hook in html
 
 
