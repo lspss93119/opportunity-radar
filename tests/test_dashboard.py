@@ -1400,13 +1400,13 @@ def test_pair_api_exposes_display_only_trajectory_context(scanner_http):
             "seconds",
             "prior_sample_time",
             "spread_change_bps",
-            "distance_change_bps",
+            "edge_change_bps",
             "state",
         }
         <= entry.keys()
         for entry in trajectory["windows"].values()
     )
-    assert trajectory["distance_from_recent_peak_bps"] >= 0
+    assert trajectory["edge_from_recent_peak_bps"] >= 0
 
 
 def test_pair_ui_renders_compact_trajectory_without_creating_entry_rule(scanner_http):
@@ -1433,14 +1433,15 @@ renderPair({
     available:true,
     reference_bps:8,
     reference_kind:'rolling_24h',
-    current_distance_bps:18,
-    recent_peak_distance_bps:21,
-    distance_from_recent_peak_bps:3,
+    current_edge_bps:10,
+    current_state:'active',
+    recent_peak_edge_bps:13,
+    edge_from_recent_peak_bps:3,
     recent_peak_at:'2026-09-23T11:58:00Z',
     windows:{
-      '1m':{available:true,distance_change_bps:2,state:'widening'},
-      '5m':{available:true,distance_change_bps:-1.5,state:'reverting'},
-      '15m':{available:true,distance_change_bps:0,state:'flat'}
+      '1m':{available:true,edge_change_bps:2,state:'widening'},
+      '5m':{available:true,edge_change_bps:-1.5,state:'reverting'},
+      '15m':{available:true,edge_change_bps:0,state:'flat'}
     }
   },
   anomaly_markers:[]
@@ -1450,12 +1451,16 @@ console.log(JSON.stringify(byId('pair-trajectory-rail').innerHTML));
         setup="location.pathname='/pair';\n",
     )
 
-    assert "Trajectory vs baseline" in rendered
+    assert "Edge trajectory" in rendered
     assert "+2.00 bps · widening" in rendered
     assert "-1.50 bps · reverting" in rendered
     assert "0.00 bps · flat" in rendered
-    assert "Off 15m peak" in rendered
+    assert "Off peak" in rendered
     assert "3.00 bps" in rendered
     assert "rolling 24h reference" in rendered
+    assert "Current edge" in rendered
+    assert "+10.00 bps" in rendered
+    assert "15m peak" in rendered
+    assert "+13.00 bps" in rendered
     assert "display-only" in rendered
     assert "entry" not in rendered.lower()
