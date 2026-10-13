@@ -1132,7 +1132,17 @@ def test_current_point_remains_visible_when_observed_after_sample(tmp_path):
         runtime_db=tmp_path / "runtime.sqlite3", clock=lambda: NOW,
     ))
     assert result["current"]["sample_time"] == sample.isoformat()
+    assert result["current"]["primary_depth_status"] == "available"
     assert result["history"][-1]["sample_time"] == sample.isoformat()
+
+
+def test_pair_without_current_observation_remains_fail_closed(tmp_path):
+    write_markets(tmp_path / "data", pair_markets(long_buy=None, long_sell=None))
+    result = query_pair(DashboardQueryService(
+        pair_config(), data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3", clock=lambda: NOW,
+    ))
+    assert result["current"] is None
 
 
 def test_latest_cycle_missing_feed_is_visible_in_venue_counts(tmp_path):
@@ -1148,6 +1158,30 @@ def test_latest_cycle_missing_feed_is_visible_in_venue_counts(tmp_path):
     assert status["venues"][SHORT_VENUE]["latest"] == 0
     assert status["venues"][SHORT_VENUE]["missing"] == 1
     assert status["overall"]["latest_feeds"] == 1
+
+
+def test_latest_feeds_sums_rows_across_venues(tmp_path):
+    config = make_config(
+        MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),
+        MarketConfig(venue="lighter", venue_symbol="ETH", canonical_symbol="ETH"),
+        MarketConfig(venue="entropy", venue_symbol="SOL", canonical_symbol="SOL"),
+        fees_bps={"lighter": 1.0, "entropy": 1.0},
+    )
+    write_markets(tmp_path / "data", [
+        make_market(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),
+        make_market(venue="lighter", venue_symbol="ETH", canonical_symbol="ETH"),
+        make_market(venue="entropy", venue_symbol="SOL", canonical_symbol="SOL"),
+    ])
+    write_episodes(tmp_path / "runtime.sqlite3", {})
+
+    status = DashboardQueryService(
+        config, data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3", clock=lambda: NOW,
+    ).get_status()
+
+    assert status["venues"]["lighter"]["latest"] == 2
+    assert status["venues"]["entropy"]["latest"] == 1
+    assert status["overall"]["latest_feeds"] == 3
 
 
 def test_fee_arithmetic_overflow_fails_closed(tmp_path):

@@ -828,6 +828,11 @@ class DashboardQueryService:
             parquet_status = "degraded"
         latest_file_mtime = self._latest_file_mtime(files)
         per_venue = self._venue_health(feeds, data_as_of)
+        latest_feeds = 0
+        for entry in per_venue.values():
+            latest = entry.get("latest")
+            if isinstance(latest, int):
+                latest_feeds += latest
         return {
             "generated_at": now.isoformat(),
             "data_as_of": _iso(data_as_of),
@@ -847,9 +852,7 @@ class DashboardQueryService:
                 "status": overall_status,
                 "heartbeat_age_seconds": heartbeat_age,
                 "configured_feeds": len(feeds),
-                "latest_feeds": sum(
-                    1 for entry in per_venue.values() if entry.get("latest") == 1
-                ),
+                "latest_feeds": latest_feeds,
                 "healthy_feeds": healthy_feeds,
                 "primary_vwap_ready": primary_vwap_ready,
                 "active_episodes": len(runtime.episodes),
@@ -1833,6 +1836,7 @@ class DashboardQueryService:
             "short_sell_vwap": observation.short_sell_vwap,
             "long_fee_bps": observation.long_fee_bps,
             "short_fee_bps": observation.short_fee_bps,
+            "primary_depth_status": "available",
             "round_trip_fee_bps": round_trip_fee,
             "convergence_edge_bps": theoretical_edge,
             "theoretical_edge_bps": theoretical_edge,

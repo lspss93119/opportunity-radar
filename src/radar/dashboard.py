@@ -299,7 +299,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 .edge-zero { color: #dbe7f5; }
 .edge-unavailable { color: #71869b; }
 .anomaly-deviation { color: #c4b5fd; }
-.current-net { font: 700 .86rem/1.15 "SFMono-Regular", Consolas, monospace; }
+.current-net { color: #dbe7f5; font: 700 .86rem/1.15 "SFMono-Regular", Consolas, monospace; }
 .current-raw { color: #8fa5bb; }
 .baseline-primary, .execution-primary { font: 600 .78rem/1.2 "SFMono-Regular", Consolas, monospace; }
 .execution-primary { color: #b8d8f0; }
@@ -502,7 +502,7 @@ function renderOpportunities(data) {
     pairCell(row, 'canonical_symbol', false) +
     routeCell(row) +
     '<td class="edge-cell"><strong class="edge-value ' + edgeClass(row.convergence_edge_bps) + '">' + signedNumber(row.convergence_edge_bps) + ' bps</strong><small>after ' + number(row.round_trip_fee_bps) + ' RT fee</small></td>' +
-    '<td class="current-cell">' + (typeof row.current_net_spread_bps === 'number' && Number.isFinite(row.current_net_spread_bps) ? '<strong class="current-net ' + edgeClass(row.current_net_spread_bps) + '">' + signedNumber(row.current_net_spread_bps) + ' net</strong>' : '<span class="unavailable">Net unavailable</span>') + '<small class="current-raw">raw ' + signedNumber(row.current_raw_spread_bps) + ' bps</small></td>' +
+    '<td class="current-cell">' + (typeof row.current_net_spread_bps === 'number' && Number.isFinite(row.current_net_spread_bps) ? '<strong class="current-net">' + signedNumber(row.current_net_spread_bps) + ' net</strong>' : '<span class="unavailable">Net unavailable</span>') + '<small class="current-raw">raw ' + signedNumber(row.current_raw_spread_bps) + ' bps</small></td>' +
     '<td class="baseline-cell">' + (row.basis_state === 'eligible' && typeof row.rolling_mean_bps === 'number'
       ? '<strong class="baseline-primary">' + number(row.rolling_mean_bps) + ' bps mean</strong><small>σ ' + number(row.rolling_std_bps) + ' · ' + (typeof row.basis_coverage === 'number' ? number(row.basis_coverage * 100) + '% cov' : '—') + '</small>'
       : '<span class="state-note state-' + stateClass(row.basis_state) + '">' + esc(row.basis_state === 'pending' ? 'Baseline pending' : row.basis_state === 'unavailable' ? 'Baseline unavailable' : 'Baseline unavailable') + '</span>') + '</td>' +

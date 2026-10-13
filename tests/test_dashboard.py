@@ -713,6 +713,28 @@ console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
     assert "/pair?symbol=QQQ" in rendered
 
 
+def test_current_net_uses_neutral_semantics_separate_from_edge(scanner_http):
+    with urlopen(scanner_http + "/opportunities") as response:
+        html = response.read().decode()
+    rendered = run_ui_script(html, """
+renderOpportunities({status:'healthy', rows:[{
+  canonical_symbol:'BABA', long_venue:'arcus', long_venue_symbol:'BABA-USD',
+  short_venue:'lighter', short_venue_symbol:'BABA', state:'eligible',
+  current_raw_spread_bps:1.16, current_net_spread_bps:-6.84,
+  rolling_mean_bps:-16.73, rolling_std_bps:1, basis_coverage:1,
+  convergence_edge_bps:9.89, round_trip_fee_bps:8,
+  freshness_seconds:4, observed_at_skew_seconds:1, primary_depth_status:'available'
+}]});
+console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
+""", setup="location.pathname='/opportunities';\n")
+    current_cell = re.search(r'<td class="current-cell">(.*?)</td>', rendered, re.S)
+    edge_cell = re.search(r'<td class="edge-cell">(.*?)</td>', rendered, re.S)
+    assert current_cell is not None and edge_cell is not None
+    assert 'class="current-net"' in current_cell.group(1)
+    assert "edge-positive" not in current_cell.group(1)
+    assert "edge-positive" in edge_cell.group(1)
+
+
 def test_terminal_anomalies_use_six_grouped_columns(scanner_http):
     with urlopen(scanner_http + "/anomalies") as response:
         html = response.read().decode()
