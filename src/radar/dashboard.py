@@ -574,10 +574,10 @@ function renderPair(data) {
   byId('pair-long-leg').innerHTML = '<h3>Long leg</h3>' + railLine('Venue', identity.long_venue ?? 'Unavailable') + railLine('Symbol', identity.long_venue_symbol ?? 'Unavailable') + railLine('$10k buy VWAP', number(current.long_buy_vwap));
   byId('pair-short-leg').innerHTML = '<h3>Short leg</h3>' + railLine('Venue', identity.short_venue ?? 'Unavailable') + railLine('Symbol', identity.short_venue_symbol ?? 'Unavailable') + railLine('$10k sell VWAP', number(current.short_sell_vwap));
   const trajectoryWindows = trajectory.windows || {};
-  const trajectoryClass = state => ['widening','reverting','flat'].includes(state) ? 'trajectory-' + state : 'trajectory-unavailable';
+  const trajectoryClass = state => ['widening','reverting','flat','gone'].includes(state) ? 'trajectory-' + state : 'trajectory-unavailable';
   const trajectoryValue = entry => {
-    if (!entry || entry.available !== true || typeof entry.distance_change_bps !== 'number' || !Number.isFinite(entry.distance_change_bps)) return '—';
-    return signedNumber(entry.distance_change_bps) + ' bps · ' + entry.state;
+    if (!entry || entry.available !== true || typeof entry.edge_change_bps !== 'number' || !Number.isFinite(entry.edge_change_bps)) return '—';
+    return signedNumber(entry.edge_change_bps) + ' bps · ' + entry.state;
   };
   const trajectoryLine = label => {
     const entry = trajectoryWindows[label];
@@ -585,15 +585,23 @@ function renderPair(data) {
     return '<div class="pair-rail-line"><span>' + esc(label) + '</span><span class="trajectory-state ' + trajectoryClass(state) + '">' + esc(trajectoryValue(entry)) + '</span></div>';
   };
   const referenceKind = trajectory.reference_kind === 'anomaly_frozen' ? 'frozen anomaly' : trajectory.reference_kind === 'rolling_24h' ? 'rolling 24h' : 'unavailable';
-  const peakOffset = typeof trajectory.distance_from_recent_peak_bps === 'number' && Number.isFinite(trajectory.distance_from_recent_peak_bps)
-    ? number(trajectory.distance_from_recent_peak_bps) + ' bps'
+  const currentEdge = typeof trajectory.current_edge_bps === 'number' && Number.isFinite(trajectory.current_edge_bps)
+    ? signedNumber(trajectory.current_edge_bps) + ' bps'
+    : '—';
+  const peakEdge = typeof trajectory.recent_peak_edge_bps === 'number' && Number.isFinite(trajectory.recent_peak_edge_bps)
+    ? signedNumber(trajectory.recent_peak_edge_bps) + ' bps'
+    : '—';
+  const peakOffset = typeof trajectory.edge_from_recent_peak_bps === 'number' && Number.isFinite(trajectory.edge_from_recent_peak_bps)
+    ? number(trajectory.edge_from_recent_peak_bps) + ' bps'
     : '—';
   byId('pair-trajectory-rail').innerHTML = trajectory.available === true
-    ? '<h3>Trajectory vs baseline</h3>' +
+    ? '<h3>Edge trajectory</h3>' +
+      railLine('Current edge', currentEdge + (trajectory.current_state === 'gone' ? ' · gone' : '')) +
       trajectoryLine('1m') + trajectoryLine('5m') + trajectoryLine('15m') +
-      railLine('Off 15m peak', peakOffset) +
-      '<small class="trajectory-note">Δ = change in absolute distance from ' + esc(referenceKind) + ' reference · display-only</small>'
-    : '<h3>Trajectory vs baseline</h3><span class="trajectory-state trajectory-unavailable">Unavailable</span>' +
+      railLine('15m peak', peakEdge) +
+      railLine('Off peak', peakOffset) +
+      '<small class="trajectory-note">Δ = change in directional convergence edge after RT fee vs ' + esc(referenceKind) + ' reference · display-only</small>'
+    : '<h3>Edge trajectory</h3><span class="trajectory-state trajectory-unavailable">Unavailable</span>' +
       '<small class="trajectory-note">Needs a current observation and usable baseline reference · display-only</small>';
   byId('pair-lifecycle-rail').innerHTML = '<h3>Lifecycle</h3>' + railLine('Duration', age(current.signal_duration_seconds)) + railLine('Candidate', lifecycle.candidate_started_at ?? 'Unavailable') + railLine('Confirmed', lifecycle.confirmed_at ?? 'Unavailable') + railLine('Status', lifecycle.available ? ((lifecycle.candidate_confirmed ? 'confirmed' : 'candidate') + ' · ' + (lifecycle.alerted ? 'alerted' : 'not alerted')) : 'Unavailable');
   const metrics = [
