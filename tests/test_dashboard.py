@@ -496,11 +496,11 @@ def test_opportunities_http_exposes_v3_scanner_fields_and_root_is_opportunities(
         html = response.read().decode()
     assert 'href="/opportunities"' in html
     assert 'id="nav-opportunities"' in html
-    assert ">Route<" in html
-    assert ">Current<" in html
-    assert ">Baseline<" in html
-    assert ">Edge<" in html
-    assert ">Execution<" in html
+    assert ">交易方向<" in html
+    assert ">目前價差<" in html
+    assert ">歷史基準<" in html
+    assert ">收斂優勢<" in html
+    assert ">可成交性<" in html
 
 
 def test_opportunities_ui_orders_scan_columns_and_exposes_terminal_hooks(scanner_http):
