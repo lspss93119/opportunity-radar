@@ -428,7 +428,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.min.js"></script>
 <script>
 const byId = id => document.getElementById(id);
-const esc = value => String(value ?? 'Unavailable').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const esc = value => String(value ?? '無資料').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const number = value => typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : '—';
 const age = value => typeof value !== 'number' || !Number.isFinite(value) ? '—' : value < 60 ? Math.round(value) + 's' : Math.floor(value / 60) + 'm ' + Math.round(value % 60) + 's';
 const compactUtc = value => {
@@ -438,8 +438,9 @@ const compactUtc = value => {
   return date.getUTCFullYear() + '-' + pad(date.getUTCMonth() + 1) + '-' + pad(date.getUTCDate()) +
     ' ' + pad(date.getUTCHours()) + ':' + pad(date.getUTCMinutes()) + ':' + pad(date.getUTCSeconds()) + 'Z';
 };
+const statusZh = value => ({healthy:'正常',degraded:'部分異常',down:'離線',eligible:'符合條件',pending:'等待中',unavailable:'不可用',stale:'資料過期',depth_unavailable:'深度不可用'}[value] ?? value ?? '未知');
 const statusClass = value => ['healthy','degraded','down'].includes(value) ? value : 'degraded';
-const text = (id, value) => { byId(id).textContent = value ?? 'Unavailable'; };
+const text = (id, value) => { byId(id).textContent = value ?? '無資料'; };
 const emptyRow = (columns, message) => '<tr><td colspan="' + columns + '" class="muted">' + esc(message) + '</td></tr>';
 const cell = (value, className = '') => '<td class="' + className + (value === null || value === undefined || value === '' ? ' unavailable' : '') + '">' + esc(value === null || value === undefined || value === '' ? '—' : value) + '</td>';
 const filterNames = ['symbol','long_venue','short_venue','max_std','min_edge','min_duration','basis_state','limit'];
@@ -495,7 +496,7 @@ function pairLink(row) {
 function pairCell(row, symbolField, includeState = true) {
   const link = pairLink(row);
   const symbol = esc(row[symbolField]);
-  const state = includeState && row.state ? '<small>' + esc(({eligible:'Eligible',pending:'Baseline pending',unavailable:'Baseline unavailable',stale:'Stale',depth_unavailable:'Depth unavailable'}[row.state] ?? row.state)) + '</small>' : '';
+  const state = includeState && row.state ? '<small>' + esc(({eligible:'符合條件',pending:'等待基準建立',unavailable:'基準不可用',stale:'資料過期',depth_unavailable:'深度不可用'}[row.state] ?? row.state)) + '</small>' : '';
   return link ? '<td class="symbol-cell"><a href="' + esc(link) + '">' + symbol + '</a>' + state + '</td>' : '<td class="symbol-cell">' + symbol + '<small>Exact identity unavailable</small>' + state + '</td>';
 }
 function directionCell(row, venueField, symbolField, direction) {
@@ -504,7 +505,7 @@ function directionCell(row, venueField, symbolField, direction) {
 function routeCell(row, extraClass = '') {
   const link = pairLink(row);
   const side = (direction, venueField, symbolField, className) => '<div class="route-side ' + className + '"><span class="route-label">' + direction + '</span><span class="route-venue">' + esc(row[venueField]) + '</span><span class="route-symbol">' + esc(row[symbolField]) + '</span></div>';
-  const body = side('LONG', 'long_venue', 'long_venue_symbol', 'long') + side('SHORT', 'short_venue', 'short_venue_symbol', 'short');
+  const body = side('做多', 'long_venue', 'long_venue_symbol', 'long') + side('做空', 'short_venue', 'short_venue_symbol', 'short');
   return '<td class="route-cell' + (extraClass ? ' ' + extraClass : '') + '">' + (link ? '<a class="route-link" href="' + esc(link) + '">' + body + '</a>' : body + '<small>Exact identity unavailable</small>') + '</td>';
 }
 function signedNumber(value) {
@@ -521,10 +522,10 @@ function renderOpportunities(data) {
     '<td class="edge-cell"><strong class="edge-value ' + edgeClass(row.convergence_edge_bps) + '">' + signedNumber(row.convergence_edge_bps) + ' bps</strong><small>after ' + number(row.round_trip_fee_bps) + ' RT fee</small></td>' +
     '<td class="current-cell">' + (typeof row.current_net_spread_bps === 'number' && Number.isFinite(row.current_net_spread_bps) ? '<strong class="current-net">' + signedNumber(row.current_net_spread_bps) + ' net</strong>' : '<span class="unavailable">Net unavailable</span>') + '<small class="current-raw">raw ' + signedNumber(row.current_raw_spread_bps) + ' bps</small></td>' +
     '<td class="baseline-cell">' + (row.basis_state === 'eligible' && typeof row.rolling_mean_bps === 'number'
-      ? '<strong class="baseline-primary">' + number(row.rolling_mean_bps) + ' bps mean</strong><small>σ ' + number(row.rolling_std_bps) + ' · ' + (typeof row.basis_coverage === 'number' ? number(row.basis_coverage * 100) + '% cov' : '—') + '</small>'
-      : '<span class="state-note state-' + stateClass(row.basis_state) + '">' + esc(row.basis_state === 'pending' ? 'Baseline pending' : row.basis_state === 'unavailable' ? 'Baseline unavailable' : 'Baseline unavailable') + '</span>') + '</td>' +
-    '<td class="execution-cell" title="' + sampleTitle(row) + '">' + (row.state === 'stale' ? '<span class="state-note state-stale">STALE</span>' : row.primary_depth_status !== 'available' ? '<span class="state-note state-depth-unavailable">Depth unavailable</span>' : '<span class="execution-primary">Depth available</span>') + '<small>age ' + age(row.freshness_seconds) + ' · skew ' + age(row.observed_at_skew_seconds) + '</small></td></tr>'
-  ).join('') || emptyRow(6, data.status === 'healthy' ? 'No matching opportunities' : 'No matching rows — degraded or unavailable data');
+      ? '<strong class="baseline-primary">' + number(row.rolling_mean_bps) + ' bps mean</strong><small>σ ' + number(row.rolling_std_bps) + ' · ' + (typeof row.basis_coverage === 'number' ? number(row.basis_coverage * 100) + '% 覆蓋率' : '—') + '</small>'
+      : '<span class="state-note state-' + stateClass(row.basis_state) + '">' + esc(row.basis_state === 'pending' ? '等待基準建立' : row.basis_state === 'unavailable' ? '基準不可用' : '基準不可用') + '</span>') + '</td>' +
+    '<td class="execution-cell" title="' + sampleTitle(row) + '">' + (row.state === 'stale' ? '<span class="state-note state-stale">STALE</span>' : row.primary_depth_status !== 'available' ? '<span class="state-note state-depth-unavailable">Depth unavailable</span>' : '<span class="execution-primary">Depth available</span>') + '<small>age ' + age(row.freshness_seconds) + ' · 時間差 ' + age(row.observed_at_skew_seconds) + '</small></td></tr>'
+  ).join('') || emptyRow(6, data.status === 'healthy' ? '沒有符合條件的套利機會' : '目前沒有符合的資料；部分來源可能異常');
 }
 function renderAnomalies(data) {
   byId('anomaly-rows').innerHTML = (data.rows || []).map(row => '<tr>' +
@@ -532,33 +533,33 @@ function renderAnomalies(data) {
     routeCell({...row, canonical_symbol: row.symbol}, 'anomaly-route') +
     '<td class="numeric"><strong class="edge-value anomaly-deviation">' + signedNumber(row.current_deviation_bps) + ' bps</strong><small>current ' + signedNumber(row.current_spread_bps) + '</small></td>' +
     '<td class="numeric"><strong>' + number(row.reference_mean_bps) + ' bps</strong><small>alignment ' + number(row.mean_alignment_bps) + '</small></td>' +
-    '<td><strong>' + age(row.episode_age_seconds) + '</strong><small>peak ' + signedNumber(row.post_confirmation_peak_deviation_bps) + ' · TG ' + esc(row.tg_status ?? 'Pending') + '</small></td>' +
-    '<td class="anomaly-context"><strong>' + (row.mean_12h_bps ?? '—') + ' / ' + (row.mean_24h_bps ?? '—') + ' / ' + (row.mean_48h_bps ?? '—') + '</strong><small>12h / 24h / 48h</small></td></tr>').join('') || emptyRow(6, 'No active confirmed anomalies');
+    '<td><strong>' + age(row.episode_age_seconds) + '</strong><small>peak ' + signedNumber(row.post_confirmation_peak_deviation_bps) + ' · TG ' + esc(row.tg_status ?? '等待中') + '</small></td>' +
+    '<td class="anomaly-context"><strong>' + (row.mean_12h_bps ?? '—') + ' / ' + (row.mean_24h_bps ?? '—') + ' / ' + (row.mean_48h_bps ?? '—') + '</strong><small>12h / 24h / 48h</small></td></tr>').join('') || emptyRow(6, '目前沒有有效且已確認的異常訊號');
 }
 function renderStatus(data) {
   const overall = data.overall || {}, heartbeat = data.heartbeat || {};
   const metric = (id, value, title) => { const element = byId(id); element.textContent = value ?? '—'; if (title) element.title = title; };
-  metric('heartbeat', (heartbeat.status ?? '—') + ' · age ' + age(heartbeat.age_seconds) + ' · ' + compactUtc(heartbeat.updated_at), heartbeat.updated_at);
+  metric('heartbeat', statusZh(heartbeat.status) + ' · age ' + age(heartbeat.age_seconds) + ' · ' + compactUtc(heartbeat.updated_at), heartbeat.updated_at);
   metric('sample', compactUtc(data.data_as_of) + ' · age ' + age(data.sample_age_seconds), data.data_as_of);
   metric('feeds', (overall.latest_feeds ?? '—') + ' / ' + (overall.configured_feeds ?? '—'));
   metric('primary', (overall.healthy_feeds ?? '—') + ' / ' + (overall.primary_vwap_ready ?? '—'));
   const parquet = data.parquet || {};
-  metric('parquet', (parquet.status ?? '—') + ' · files: ' + (parquet.files_considered ?? '—') + ' · latest file mtime: ' + compactUtc(parquet.latest_file_mtime), parquet.latest_file_mtime);
-  metric('sqlite', data.sqlite?.status);
+  metric('parquet', statusZh(parquet.status) + ' · 檔案數：' + (parquet.files_considered ?? '—') + ' · 最新檔案時間：' + compactUtc(parquet.latest_file_mtime), parquet.latest_file_mtime);
+  metric('sqlite', statusZh(data.sqlite?.status));
   metric('episodes-count', [overall.active_episodes,overall.confirmed_candidates,overall.active_alerted_episodes].map(value => value ?? '—').join(' / '));
   byId('venues').innerHTML = Object.entries(data.venues || {}).map(([venue, value]) => '<tr>' +
-    [venue,value.expected,value.available,value.latest,value.missing,age(value.max_observation_age_seconds)].map(cell).join('') + '</tr>').join('') || emptyRow(6, 'Venue evidence unavailable');
+    [venue,value.expected,value.available,value.latest,value.missing,age(value.max_observation_age_seconds)].map(cell).join('') + '</tr>').join('') || emptyRow(6, '交易所資料不可用');
   byId('feed-rows').innerHTML = (data.feeds || []).map(feed => '<tr>' +
-    [feed.canonical_symbol,feed.venue,feed.venue_symbol].map(cell).join('') + '<td class="' + statusClass(feed.status) + '">' + esc(feed.status) + '</td>' +
-    cell(age(feed.age_seconds)) + cell((feed.vwap_available ?? 'Unavailable') + '/' + (feed.vwap_total ?? 'Unavailable')) + '</tr>').join('') || emptyRow(6, 'No feed evidence');
+    [feed.canonical_symbol,feed.venue,feed.venue_symbol].map(cell).join('') + '<td class="' + statusClass(feed.status) + '">' + esc(statusZh(feed.status)) + '</td>' +
+    cell(age(feed.age_seconds)) + cell((feed.vwap_available ?? '無資料') + '/' + (feed.vwap_total ?? '無資料')) + '</tr>').join('') || emptyRow(6, '沒有資料源紀錄');
   byId('episode-rows').innerHTML = (data.episodes || []).map(row => '<tr>' + pairCell({...row,canonical_symbol:row.symbol}, 'symbol') +
-    cell((row.long_venue ?? 'Unavailable') + ' · ' + (row.long_venue_symbol ?? 'Unavailable')) +
-    cell((row.short_venue ?? 'Unavailable') + ' · ' + (row.short_venue_symbol ?? 'Unavailable')) +
-    cell(number(row.net_spread_bps)) + cell(row.candidate_confirmed ? 'yes' : 'no') + cell(row.alerted ? 'yes' : 'no') + '</tr>').join('') ||
-    emptyRow(6, data.sqlite?.status === 'healthy' ? 'No active episodes' : 'Episodes unavailable');
+    cell((row.long_venue ?? '無資料') + ' · ' + (row.long_venue_symbol ?? '無資料')) +
+    cell((row.short_venue ?? '無資料') + ' · ' + (row.short_venue_symbol ?? '無資料')) +
+    cell(number(row.net_spread_bps)) + cell(row.candidate_confirmed ? '是' : '否') + cell(row.alerted ? '是' : '否') + '</tr>').join('') ||
+    emptyRow(6, data.sqlite?.status === 'healthy' ? '目前沒有有效訊號週期' : '訊號週期資料不可用');
   byId('event-rows').innerHTML = (data.recent_events || []).map(row => '<tr>' +
     [row.occurred_at,row.symbol,row.event_type,number(row.net_spread_bps)].map(cell).join('') + '</tr>').join('') ||
-    emptyRow(4, data.sqlite?.status === 'healthy' ? 'No recent events' : 'Events unavailable');
+    emptyRow(4, data.sqlite?.status === 'healthy' ? '近期沒有事件' : '事件資料不可用');
 }
 function restorePairRange() {
   byId('pair-range').value = new URLSearchParams(location.search).get('range') ?? '24h';
@@ -567,35 +568,36 @@ function renderPair(data) {
   const identity = data.identity || {}, current = data.current || {}, basis = data.basis || {}, lifecycle = data.lifecycle || {}, trajectory = data.trajectory || {};
   const disabledMapping = (data.errors || []).some(error => String(error).includes('not an enabled configured mapping'));
   text('pair-identity', disabledMapping
-    ? 'This persisted route is no longer an enabled mapping in the current production universe.'
-    : (identity.canonical_symbol ?? 'Unavailable') + ' · Long ' +
-      (identity.long_venue ?? 'Unavailable') + ' / ' + (identity.long_venue_symbol ?? 'Unavailable') + ' → Short ' +
-      (identity.short_venue ?? 'Unavailable') + ' / ' + (identity.short_venue_symbol ?? 'Unavailable'));
+    ? '這組歷史配對已不在目前的監控清單中。'
+    : (identity.canonical_symbol ?? '無資料') + ' · 做多 ' +
+      (identity.long_venue ?? '無資料') + ' / ' + (identity.long_venue_symbol ?? '無資料') + ' → 做空 ' +
+      (identity.short_venue ?? '無資料') + ' / ' + (identity.short_venue_symbol ?? '無資料'));
   const finite = value => typeof value === 'number' && Number.isFinite(value);
   const baselineValue = finite(lifecycle.reference_mean_bps) ? lifecycle.reference_mean_bps : current.rolling_mean_bps;
   const baselineLabel = finite(baselineValue) ? number(baselineValue) + ' bps' : '—';
   const kpis = [
-    ['Edge after RT fee', finite(current.theoretical_edge_bps) ? signedNumber(current.theoretical_edge_bps) + ' bps' : '—', 'display-only'],
-    ['Current', finite(current.current_net_spread_bps) ? signedNumber(current.current_net_spread_bps) + ' net' : '—', 'raw ' + signedNumber(current.raw_spread_bps) + ' bps'],
-    ['Baseline', baselineLabel, finite(current.rolling_std_bps) ? 'σ ' + number(current.rolling_std_bps) + ' · ' + (typeof basis.coverage === 'number' ? number(basis.coverage * 100) + '% cov' : '—') : 'prior-only 24h mean'],
-    ['Execution', current.primary_depth_status === 'available' ? 'Depth available' : 'Depth unavailable', 'age ' + age(current.freshness_seconds) + ' · skew ' + age(current.observed_at_skew_seconds)],
+    ['扣費後預估收斂優勢', finite(current.theoretical_edge_bps) ? signedNumber(current.theoretical_edge_bps) + ' bps' : '—', '僅供觀察'],
+    ['目前價差', finite(current.current_net_spread_bps) ? signedNumber(current.current_net_spread_bps) + ' 淨價差' : '—', '原始 ' + signedNumber(current.raw_spread_bps) + ' bps'],
+    ['歷史基準', baselineLabel, finite(current.rolling_std_bps) ? 'σ ' + number(current.rolling_std_bps) + ' · ' + (typeof basis.coverage === 'number' ? number(basis.coverage * 100) + '% 覆蓋率' : '—') : '僅使用過去資料的 24 小時均值'],
+    ['可成交性', current.primary_depth_status === 'available' ? '深度可用' : '深度不可用', '延遲 ' + age(current.freshness_seconds) + ' · 時間差 ' + age(current.observed_at_skew_seconds)],
   ];
   byId('pair-summary').innerHTML = kpis.map(([label,value,detail]) => '<div class="card"><div class="metric-label">' + esc(label) + '</div><div class="metric-value">' + esc(value) + '</div><small>' + esc(detail) + '</small></div>').join('');
   const railLine = (label, value) => '<div class="pair-rail-line"><span>' + esc(label) + '</span><span>' + esc(value) + '</span></div>';
-  byId('pair-long-leg').innerHTML = '<h3>Long leg</h3>' + railLine('Venue', identity.long_venue ?? 'Unavailable') + railLine('Symbol', identity.long_venue_symbol ?? 'Unavailable') + railLine('$10k buy VWAP', number(current.long_buy_vwap));
-  byId('pair-short-leg').innerHTML = '<h3>Short leg</h3>' + railLine('Venue', identity.short_venue ?? 'Unavailable') + railLine('Symbol', identity.short_venue_symbol ?? 'Unavailable') + railLine('$10k sell VWAP', number(current.short_sell_vwap));
+  byId('pair-long-leg').innerHTML = '<h3>做多端</h3>' + railLine('交易所', identity.long_venue ?? '無資料') + railLine('標的', identity.long_venue_symbol ?? '無資料') + railLine('1 萬美元買入 VWAP', number(current.long_buy_vwap));
+  byId('pair-short-leg').innerHTML = '<h3>做空端</h3>' + railLine('交易所', identity.short_venue ?? '無資料') + railLine('標的', identity.short_venue_symbol ?? '無資料') + railLine('1 萬美元賣出 VWAP', number(current.short_sell_vwap));
   const trajectoryWindows = trajectory.windows || {};
-  const trajectoryClass = state => ['widening','reverting','flat','gone'].includes(state) ? 'trajectory-' + state : 'trajectory-unavailable';
+  const trajectoryClass = state => ['持續擴大','正在收斂','大致持平','優勢消失'].includes(state) ? 'trajectory-' + state : 'trajectory-unavailable';
   const trajectoryValue = entry => {
     if (!entry || entry.available !== true || typeof entry.edge_change_bps !== 'number' || !Number.isFinite(entry.edge_change_bps)) return '—';
-    return signedNumber(entry.edge_change_bps) + ' bps · ' + entry.state;
+    return signedNumber(entry.edge_change_bps) + ' bps · ' + statusTrajectoryZh(entry.state);
   };
+  const statusTrajectoryZh = value => ({widening:'持續擴大',reverting:'正在收斂',flat:'大致持平',gone:'優勢消失',unavailable:'不可用'}[value] ?? '不可用');
   const trajectoryLine = label => {
     const entry = trajectoryWindows[label];
     const state = entry?.state ?? 'unavailable';
     return '<div class="pair-rail-line"><span>' + esc(label) + '</span><span class="trajectory-state ' + trajectoryClass(state) + '">' + esc(trajectoryValue(entry)) + '</span></div>';
   };
-  const referenceKind = trajectory.reference_kind === 'anomaly_frozen' ? 'frozen anomaly' : trajectory.reference_kind === 'rolling_24h' ? 'rolling 24h' : 'unavailable';
+  const referenceKind = trajectory.reference_kind === 'anomaly_frozen' ? '異常訊號固定基準' : trajectory.reference_kind === 'rolling_24h' ? '滾動 24 小時' : 'unavailable';
   const currentEdge = typeof trajectory.current_edge_bps === 'number' && Number.isFinite(trajectory.current_edge_bps)
     ? signedNumber(trajectory.current_edge_bps) + ' bps'
     : '—';
@@ -606,32 +608,32 @@ function renderPair(data) {
     ? number(trajectory.edge_from_recent_peak_bps) + ' bps'
     : '—';
   byId('pair-trajectory-rail').innerHTML = trajectory.available === true
-    ? '<h3>Edge trajectory</h3>' +
-      railLine('Current edge', currentEdge + (trajectory.current_state === 'gone' ? ' · gone' : '')) +
+    ? '<h3>價差優勢走勢</h3>' +
+      railLine('目前收斂優勢', currentEdge + (trajectory.current_state === '優勢消失' ? ' · 優勢消失' : '')) +
       trajectoryLine('1m') + trajectoryLine('5m') + trajectoryLine('15m') +
-      railLine('15m peak', peakEdge) +
-      railLine('Off peak', peakOffset) +
-      '<small class="trajectory-note">Δ = change in directional convergence edge after RT fee vs ' + esc(referenceKind) + ' reference · display-only</small>'
+      railLine('15 分鐘高點', peakEdge) +
+      railLine('距高點回落', peakOffset) +
+      '<small class="trajectory-note">Δ = change in directional convergence edge after RT fee vs ' + esc(referenceKind) + ' 基準｜僅供觀察</small>'
     : '<h3>Edge trajectory</h3><span class="trajectory-state trajectory-unavailable">Unavailable</span>' +
       '<small class="trajectory-note">Needs a current observation and usable baseline reference · display-only</small>';
-  byId('pair-lifecycle-rail').innerHTML = '<h3>Lifecycle</h3>' + railLine('Duration', age(current.signal_duration_seconds)) + railLine('Candidate', lifecycle.candidate_started_at ?? 'Unavailable') + railLine('Confirmed', lifecycle.confirmed_at ?? 'Unavailable') + railLine('Status', lifecycle.available ? ((lifecycle.candidate_confirmed ? 'confirmed' : 'candidate') + ' · ' + (lifecycle.alerted ? 'alerted' : 'not alerted')) : 'Unavailable');
+  byId('pair-lifecycle-rail').innerHTML = '<h3>訊號生命週期</h3>' + railLine('持續時間', age(current.signal_duration_seconds)) + railLine('候選開始', lifecycle.candidate_started_at ?? '無資料') + railLine('確認時間', lifecycle.confirmed_at ?? '無資料') + railLine('狀態', lifecycle.available ? ((lifecycle.candidate_confirmed ? '已確認' : '候選') + ' · ' + (lifecycle.alerted ? '已通知' : '未通知')) : '無資料');
   const metrics = [
-    ['Raw spread (bps)', signedNumber(current.raw_spread_bps)], ['Current net spread (bps)',signedNumber(current.current_net_spread_bps)], ['24h Mean (bps)',number(current.rolling_mean_bps)], ['24h Std (bps)',number(current.rolling_std_bps)], ['Deviation (bps)',signedNumber(current.deviation_bps)],
-    ['Observed skew (s)',number(current.observed_at_skew_seconds)], ['Freshness (s)',number(current.freshness_seconds)], ['Signal duration (persisted)',age(current.signal_duration_seconds)],
-    ['Long $10k buy VWAP',number(current.long_buy_vwap)], ['Short $10k sell VWAP',number(current.short_sell_vwap)], ['RT Fee (bps, display-only)',number(current.round_trip_fee_bps)], ['Sample time (UTC)',current.sample_time ?? 'Unavailable'],
-    ['Lifecycle (persisted)',lifecycle.available ? 'Active · confirmed: ' + (lifecycle.candidate_confirmed ? 'yes' : 'no') + ' · alerted: ' + (lifecycle.alerted ? 'yes' : 'no') + ' · ' + (lifecycle.episode_id ?? 'Unavailable') : 'Inactive / unavailable']
+    ['原始價差（bps）', signedNumber(current.raw_spread_bps)], ['目前淨價差（bps）',signedNumber(current.current_net_spread_bps)], ['24 小時均值（bps）',number(current.rolling_mean_bps)], ['24 小時標準差（bps）',number(current.rolling_std_bps)], ['偏離幅度（bps）',signedNumber(current.deviation_bps)],
+    ['觀測時間差（秒）',number(current.observed_at_skew_seconds)], ['資料延遲（秒）',number(current.freshness_seconds)], ['訊號持續時間（持久化）',age(current.signal_duration_seconds)],
+    ['做多端 1 萬美元買入 VWAP',number(current.long_buy_vwap)], ['做空端 1 萬美元賣出 VWAP',number(current.short_sell_vwap)], ['來回手續費（bps，僅供觀察）',number(current.round_trip_fee_bps)], ['採樣時間（UTC）',current.sample_time ?? '無資料'],
+    ['訊號生命週期（持久化）',lifecycle.available ? '有效 · 已確認：' + (lifecycle.candidate_confirmed ? '是' : '否') + ' · 已通知：' + (lifecycle.alerted ? '是' : '否') + ' · ' + (lifecycle.episode_id ?? '無資料') : '非有效狀態／不可用']
   ];
   if (lifecycle.reference_mean_bps !== undefined) {
     metrics.push(
-      ['V2 reference mean (bps)', number(lifecycle.reference_mean_bps)],
-      ['V2 confirmation deviation (bps)', number(lifecycle.confirmation_deviation_bps)],
-      ['V2 post-confirm peak (bps)', number(lifecycle.post_confirmation_peak_deviation_bps)],
-      ['V2 Telegram', lifecycle.tg_status ?? 'Pending']
+      ['V2 固定參考均值（bps）', number(lifecycle.reference_mean_bps)],
+      ['V2 確認偏離幅度（bps）', number(lifecycle.confirmation_deviation_bps)],
+      ['V2 確認後最大偏離（bps）', number(lifecycle.post_confirmation_peak_deviation_bps)],
+      ['V2 Telegram', lifecycle.tg_status ?? '等待中']
     );
   }
   byId('pair-secondary').innerHTML = metrics.map(([label,value]) => '<div class="detail"><span class="detail-label">' + esc(label) + '</span><span class="detail-value">' + esc(value) + '</span></div>').join('');
-  text('pair-coverage', (basis.eligible ? '24h basis available' : '24h basis unavailable') + ' · prior samples: ' +
-    (basis.sample_count ?? 'Unavailable') + ' · coverage: ' + (typeof basis.coverage === 'number' ? number(basis.coverage * 100) + '%' : 'Unavailable'));
+  text('pair-coverage', (basis.eligible ? '24 小時基準可用' : '24 小時基準不可用') + ' · 過去樣本數：' +
+    (basis.sample_count ?? '無資料') + ' · 覆蓋率：' + (typeof basis.coverage === 'number' ? number(basis.coverage * 100) + '%' : '無資料'));
   renderPairChart(data);
 }
 
@@ -773,7 +775,7 @@ function renderPairChart(data) {
   if (renderInteractivePairChart(data, points, means)) return;
   const current = data.current;
   const lifecycle = data.lifecycle || {};
-  if (!points.length) { text('pair-chart', 'History unavailable'); return; }
+  if (!points.length) { text('pair-chart', '歷史資料不可用'); return; }
   const values = points.map(p => p.raw_spread_bps).concat(means.filter(p => finite(p.rolling_mean_bps)).map(p => p.rolling_mean_bps));
   if (current && finite(current.raw_spread_bps)) values.push(current.raw_spread_bps);
   const v2Reference = finite(lifecycle.reference_mean_bps) ? lifecycle.reference_mean_bps : null;
@@ -852,7 +854,7 @@ function renderPairChart(data) {
       return point && finite(point.raw_spread_bps) ? point.raw_spread_bps : null;
     };
     const markers = [
-      ['candidate', lifecycle.candidate_started_at, rawAt(lifecycle.candidate_started_at), '#fbbf24'],
+      ['候選', lifecycle.candidate_started_at, rawAt(lifecycle.candidate_started_at), '#fbbf24'],
       ['confirmation', lifecycle.confirmed_at, rawAt(lifecycle.confirmed_at), '#fb923c'],
       ['peak', lifecycle.post_confirmation_peak_at, rawAt(lifecycle.post_confirmation_peak_at), '#f87171'],
       ['return', lifecycle.active === false ? lifecycle.ended_at : null, lifecycle.active === false ? lifecycle.current_spread_bps : null, '#4ade80'],
@@ -881,8 +883,8 @@ function compactDataStatus(data) {
     .filter(value => typeof value === 'string' && value);
   byId('data-as-of').title = exactTimes.join(' · ');
   byId('refreshed').title = typeof data.generated_at === 'string' ? data.generated_at : '';
-  text('data-as-of', typeof ageSeconds === 'number' && Number.isFinite(ageSeconds) ? 'data age ' + age(ageSeconds) : '');
-  text('refreshed', 'read-only source');
+  text('data-as-of', typeof ageSeconds === 'number' && Number.isFinite(ageSeconds) ? '資料延遲 ' + age(ageSeconds) : '');
+  text('refreshed', '唯讀資料源');
 }
 let requestSequence = 0;
 let requestInFlight = false;
@@ -894,24 +896,24 @@ async function refresh(query = new URLSearchParams(location.search)) {
     const data = await response.json();
     if (sequence !== requestSequence) return;
     const status = isStatus ? data.overall?.status : data.status;
-    const statusLabel = isOpportunities && status === 'degraded' ? 'SCANNER DATA DEGRADED' : (status ?? 'degraded').toUpperCase();
+    const statusLabel = isOpportunities && status === 'degraded' ? '掃描資料異常' : statusZh(status);
     text('overall', statusLabel);
     byId('overall').className = statusClass(status);
-    text('scanner-status', 'SCANNER · ' + ((status ?? 'degraded').toUpperCase()));
+    text('scanner-status', '掃描器 · ' + statusZh(status));
     byId('scanner-status').className = 'scanner-status ' + statusClass(status);
     compactDataStatus(data);
     byId('errors').innerHTML = (data.errors || []).map(error => '<div class="error">' + esc(error) + '</div>').join('');
     if (isStatus) renderStatus(data); else if (isPair) renderPair(data); else if (isAnomalies) renderAnomalies(data); else renderOpportunities(data);
   } catch (error) {
     if (sequence !== requestSequence) return;
-    text('overall', 'DEGRADED — dashboard request failed');
+    text('overall', '儀表板讀取失敗');
     byId('overall').className = 'degraded';
     text('scanner-status', 'SCANNER · DEGRADED');
     byId('scanner-status').className = 'scanner-status degraded';
     compactDataStatus({});
-    text('refreshed', 'request failed');
+    text('refreshed', '請求失敗');
     byId('errors').innerHTML = '<div class="error">' + esc(error) + '</div>';
-    if (isStatus) renderStatus({}); else if (isPair) renderPair({}); else if (isAnomalies) byId('anomaly-rows').innerHTML = emptyRow(6, 'Data unavailable'); else byId('opportunity-rows').innerHTML = emptyRow(6, 'Data unavailable');
+    if (isStatus) renderStatus({}); else if (isPair) renderPair({}); else if (isAnomalies) byId('anomaly-rows').innerHTML = emptyRow(6, '資料不可用'); else byId('opportunity-rows').innerHTML = emptyRow(6, '資料不可用');
   } finally {
     if (sequence === requestSequence) requestInFlight = false;
   }
