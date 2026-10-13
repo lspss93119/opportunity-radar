@@ -673,6 +673,7 @@ function renderPair(data) {
 let lastPairPayload = null;
 let interactivePairChart = null;
 let interactivePairRange = null;
+let interactivePairLastTime = null;
 let interactivePairChartMarkers = null;
 let interactivePairReference = null;
 
@@ -758,6 +759,8 @@ function renderInteractivePairChart(data, points, means) {
     }
     const instance = interactivePairChart;
     const previousView = interactivePairRange === data.range ? instance.chart.timeScale().getVisibleRange() : null;
+    const wasFollowingLatest = previousView && typeof previousView.to === 'number' &&
+      typeof interactivePairLastTime === 'number' && previousView.to >= interactivePairLastTime - 1;
     instance.raw.setData(rawData);
     instance.mean.setData(toLine(means, 'rolling_mean_bps'));
     if (interactivePairReference) {
@@ -789,8 +792,10 @@ function renderInteractivePairChart(data, points, means) {
       if (!interactivePairChartMarkers) interactivePairChartMarkers = lib.createSeriesMarkers(instance.raw, markers);
       else interactivePairChartMarkers.setMarkers(markers);
     }
-    if (previousView) instance.chart.timeScale().setVisibleRange(previousView);
+    if (previousView && wasFollowingLatest) instance.chart.timeScale().scrollToRealTime();
+    else if (previousView) instance.chart.timeScale().setVisibleRange(previousView);
     else instance.chart.timeScale().fitContent();
+    interactivePairLastTime = rawData.at(-1).time;
     interactivePairRange = data.range;
     return true;
   } catch (error) {
@@ -799,6 +804,7 @@ function renderInteractivePairChart(data, points, means) {
     interactivePairChart = null;
     interactivePairChartMarkers = null;
     interactivePairReference = null;
+    interactivePairLastTime = null;
     return false;
   }
 }
