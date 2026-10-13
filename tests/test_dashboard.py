@@ -1372,3 +1372,89 @@ console.log(JSON.stringify(byId('pair-chart').innerHTML));
         assert raw.count("M") == 1
         assert mean.count("M") == 2
         assert "L" in mean
+
+
+
+def test_pair_api_exposes_display_only_trajectory_context(scanner_http):
+    query = urlencode(
+        {
+            "symbol": "BTC",
+            "long_venue": "lighter",
+            "long_venue_symbol": "BTC-USD",
+            "short_venue": "hyperliquid",
+            "short_venue_symbol": "xyz:BTC",
+            "range": "24h",
+        }
+    )
+    payload = http_json(scanner_http, "/api/pair?" + query)
+    trajectory = payload["trajectory"]
+
+    assert trajectory["available"] is True
+    assert trajectory["reference_kind"] == "rolling_24h"
+    assert trajectory["reference_bps"] == pytest.approx(payload["basis"]["mean_bps"])
+    assert set(trajectory["windows"]) == {"1m", "5m", "15m"}
+    assert all(
+        {
+            "available",
+            "seconds",
+            "prior_sample_time",
+            "spread_change_bps",
+            "distance_change_bps",
+            "state",
+        }
+        <= entry.keys()
+        for entry in trajectory["windows"].values()
+    )
+    assert trajectory["distance_from_recent_peak_bps"] >= 0
+
+
+def test_pair_ui_renders_compact_trajectory_without_creating_entry_rule(scanner_http):
+    with urlopen(scanner_http + "/pair") as response:
+        html = response.read().decode()
+
+    rendered = run_ui_script(
+        html,
+        """
+renderPair({
+  identity:{canonical_symbol:'QQQ',long_venue:'arcus',long_venue_symbol:'QQQ-USD',short_venue:'lighter_robinhood',short_venue_symbol:'QQQ'},
+  current:{raw_spread_bps:26,current_net_spread_bps:18,rolling_mean_bps:8,rolling_std_bps:1,deviation_bps:18,signal_duration_seconds:120,long_buy_vwap:100,short_sell_vwap:100.26,primary_depth_status:'available',round_trip_fee_bps:8,observed_at_skew_seconds:1,freshness_seconds:4,sample_time:'2026-09-23T12:00:00Z'},
+  basis:{eligible:true,sample_count:8500,coverage:.997},
+  history:[
+    {sample_time:'2026-09-23T11:45:00Z',raw_spread_bps:20,segment:0},
+    {sample_time:'2026-09-23T12:00:00Z',raw_spread_bps:26,segment:0}
+  ],
+  rolling_mean_series:[
+    {sample_time:'2026-09-23T11:45:00Z',rolling_mean_bps:8,segment:0},
+    {sample_time:'2026-09-23T12:00:00Z',rolling_mean_bps:8,segment:0}
+  ],
+  lifecycle:{available:false},
+  trajectory:{
+    available:true,
+    reference_bps:8,
+    reference_kind:'rolling_24h',
+    current_distance_bps:18,
+    recent_peak_distance_bps:21,
+    distance_from_recent_peak_bps:3,
+    recent_peak_at:'2026-09-23T11:58:00Z',
+    windows:{
+      '1m':{available:true,distance_change_bps:2,state:'widening'},
+      '5m':{available:true,distance_change_bps:-1.5,state:'reverting'},
+      '15m':{available:true,distance_change_bps:0,state:'flat'}
+    }
+  },
+  anomaly_markers:[]
+});
+console.log(JSON.stringify(byId('pair-trajectory-rail').innerHTML));
+""",
+        setup="location.pathname='/pair';\n",
+    )
+
+    assert "Trajectory vs baseline" in rendered
+    assert "+2.00 bps · widening" in rendered
+    assert "-1.50 bps · reverting" in rendered
+    assert "0.00 bps · flat" in rendered
+    assert "Off 15m peak" in rendered
+    assert "3.00 bps" in rendered
+    assert "rolling 24h reference" in rendered
+    assert "display-only" in rendered
+    assert "entry" not in rendered.lower()
