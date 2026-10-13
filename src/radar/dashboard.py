@@ -320,6 +320,12 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 .pair-rail-card h3 { margin: 0 0 7px; color: #91a8bd; font: 700 .65rem/1.1 "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
 .pair-rail-line { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; font-size: .72rem; }
 .pair-rail-line span:last-child { color: #dbe7f5; text-align: right; overflow-wrap: anywhere; }
+.trajectory-state { font: 700 .68rem/1.1 "SFMono-Regular", Consolas, monospace; }
+.trajectory-widening { color: #fbbf24; }
+.trajectory-reverting { color: #7dd3fc; }
+.trajectory-flat { color: #a9bbcc; }
+.trajectory-unavailable { color: #71869b; }
+.trajectory-note { display: block; margin-top: 6px; color: #71869b; font-size: .65rem; line-height: 1.3; }
 .pair-chart-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
 .pair-chart-header label { display: flex; align-items: center; gap: 7px; }
 #pair-chart { min-height: 270px; overflow: hidden; }
@@ -404,7 +410,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 <div class="chart-legend"><span class="raw-color">Raw spread</span><span class="mean-color">Rolling 24h mean</span><span class="current-color">Current</span></div>
 <div id="pair-chart" class="card">History unavailable</div>
 <p id="pair-coverage" class="muted"></p>
-</div><aside class="pair-right-rail"><div id="pair-long-leg" class="pair-rail-card"></div><div id="pair-short-leg" class="pair-rail-card"></div><div id="pair-lifecycle-rail" class="pair-rail-card"></div></aside></div>
+</div><aside class="pair-right-rail"><div id="pair-long-leg" class="pair-rail-card"></div><div id="pair-short-leg" class="pair-rail-card"></div><div id="pair-trajectory-rail" class="pair-rail-card"></div><div id="pair-lifecycle-rail" class="pair-rail-card"></div></aside></div>
 <details id="pair-details" class="pair-details"><summary>Secondary operational details</summary><div id="pair-secondary" class="pair-secondary"></div></details>
 <p class="muted">UTC exact sample_time joins · missing slots remain gaps · history is read-only and prior-only. Statistics and lifecycle values are not recomputed in the browser.</p>
 </section>
@@ -547,7 +553,7 @@ function restorePairRange() {
   byId('pair-range').value = new URLSearchParams(location.search).get('range') ?? '24h';
 }
 function renderPair(data) {
-  const identity = data.identity || {}, current = data.current || {}, basis = data.basis || {}, lifecycle = data.lifecycle || {};
+  const identity = data.identity || {}, current = data.current || {}, basis = data.basis || {}, lifecycle = data.lifecycle || {}, trajectory = data.trajectory || {};
   const disabledMapping = (data.errors || []).some(error => String(error).includes('not an enabled configured mapping'));
   text('pair-identity', disabledMapping
     ? 'This persisted route is no longer an enabled mapping in the current production universe.'
@@ -567,6 +573,25 @@ function renderPair(data) {
   const railLine = (label, value) => '<div class="pair-rail-line"><span>' + esc(label) + '</span><span>' + esc(value) + '</span></div>';
   byId('pair-long-leg').innerHTML = '<h3>Long leg</h3>' + railLine('Venue', identity.long_venue ?? 'Unavailable') + railLine('Symbol', identity.long_venue_symbol ?? 'Unavailable') + railLine('$10k buy VWAP', number(current.long_buy_vwap));
   byId('pair-short-leg').innerHTML = '<h3>Short leg</h3>' + railLine('Venue', identity.short_venue ?? 'Unavailable') + railLine('Symbol', identity.short_venue_symbol ?? 'Unavailable') + railLine('$10k sell VWAP', number(current.short_sell_vwap));
+  const trajectoryWindows = trajectory.windows || {};
+  const trajectoryClass = state => ['widening','reverting','flat'].includes(state) ? 'trajectory-' + state : 'trajectory-unavailable';
+  const trajectoryValue = entry => {
+    if (!entry || entry.available !== true || typeof entry.distance_change_bps !== 'number' || !Number.isFinite(entry.distance_change_bps)) return '—';
+    return signedNumber(entry.distance_change_bps) + ' bps · ' + entry.state;
+  };
+  const trajectoryLine = label => {
+    const entry = trajectoryWindows[label];
+    const state = entry?.state ?? 'unavailable';
+    return '<div class="pair-rail-line"><span>' + esc(label) + '</span><span class="trajectory-state ' + trajectoryClass(state) + '">' + esc(trajectoryValue(entry)) + '</span></div>';
+  };
+  const referenceKind = trajectory.reference_kind === 'anomaly_frozen' ? 'frozen anomaly' : trajectory.reference_kind === 'rolling_24h' ? 'rolling 24h' : 'unavailable';
+  const peakOffset = typeof trajectory.distance_from_recent_peak_bps === 'number' && Number.isFinite(trajectory.distance_from_recent_peak_bps)
+    ? number(trajectory.distance_from_recent_peak_bps) + ' bps'
+    : '—';
+  byId('pair-trajectory-rail').innerHTML = '<h3>Trajectory vs baseline</h3>' +
+    trajectoryLine('1m') + trajectoryLine('5m') + trajectoryLine('15m') +
+    railLine('Off 15m peak', peakOffset) +
+    '<small class="trajectory-note">Δ = change in absolute distance from ' + esc(referenceKind) + ' reference · display-only</small>';
   byId('pair-lifecycle-rail').innerHTML = '<h3>Lifecycle</h3>' + railLine('Duration', age(current.signal_duration_seconds)) + railLine('Candidate', lifecycle.candidate_started_at ?? 'Unavailable') + railLine('Confirmed', lifecycle.confirmed_at ?? 'Unavailable') + railLine('Status', lifecycle.available ? ((lifecycle.candidate_confirmed ? 'confirmed' : 'candidate') + ' · ' + (lifecycle.alerted ? 'alerted' : 'not alerted')) : 'Unavailable');
   const metrics = [
     ['Raw spread (bps)', signedNumber(current.raw_spread_bps)], ['Current net spread (bps)',signedNumber(current.current_net_spread_bps)], ['24h Mean (bps)',number(current.rolling_mean_bps)], ['24h Std (bps)',number(current.rolling_std_bps)], ['Deviation (bps)',signedNumber(current.deviation_bps)],
