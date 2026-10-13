@@ -427,7 +427,6 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 <p class="muted">歷史資料依 UTC 採樣時間精確對齊，缺漏區間保留斷線；資料僅供檢視，均值使用當下之前的資料。統計數值與訊號狀態不在瀏覽器重新計算。</p>
 </section>
 </main>
-<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.min.js"></script>
 <script>
 const byId = id => document.getElementById(id);
 const esc = value => String(value ?? '無資料').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
@@ -598,6 +597,7 @@ function restorePairRange() {
   byId('pair-range').value = new URLSearchParams(location.search).get('range') ?? '24h';
 }
 function renderPair(data) {
+  lastPairPayload = data;
   const identity = data.identity || {}, current = data.current || {}, basis = data.basis || {}, lifecycle = data.lifecycle || {}, trajectory = data.trajectory || {};
   const disabledMapping = (data.errors || []).some(error => String(error).includes('not an enabled configured mapping'));
   text('pair-identity', disabledMapping
@@ -670,6 +670,7 @@ function renderPair(data) {
   renderPairChart(data);
 }
 
+let lastPairPayload = null;
 let interactivePairChart = null;
 let interactivePairRange = null;
 let interactivePairChartMarkers = null;
@@ -953,6 +954,15 @@ async function refresh(query = new URLSearchParams(location.search)) {
   } finally {
     if (sequence === requestSequence) requestInFlight = false;
   }
+}
+// Load the chart only on Pair Detail, without blocking Opportunities / Anomalies / Status.
+if (isPair && document.createElement && document.head?.appendChild) {
+  const chartScript = document.createElement('script');
+  chartScript.src = 'https://cdn.jsdelivr.net/npm/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.min.js';
+  chartScript.async = true;
+  chartScript.onload = () => { if (lastPairPayload) renderPairChart(lastPairPayload); };
+  chartScript.onerror = () => { text('chart-library-status', '互動圖表載入失敗；仍可查看基本歷史圖表'); };
+  document.head.appendChild(chartScript);
 }
 restoreFilters();
 restorePairRange();
