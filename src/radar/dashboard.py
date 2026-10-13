@@ -757,7 +757,7 @@ function renderInteractivePairChart(data, points, means) {
       interactivePairChart = {chart,raw,mean};
     }
     const instance = interactivePairChart;
-    const previousView = interactivePairRange === data.range ? instance.chart.timeScale().getVisibleLogicalRange() : null;
+    const previousView = interactivePairRange === data.range ? instance.chart.timeScale().getVisibleRange() : null;
     instance.raw.setData(rawData);
     instance.mean.setData(toLine(means, 'rolling_mean_bps'));
     if (interactivePairReference) {
@@ -789,7 +789,7 @@ function renderInteractivePairChart(data, points, means) {
       if (!interactivePairChartMarkers) interactivePairChartMarkers = lib.createSeriesMarkers(instance.raw, markers);
       else interactivePairChartMarkers.setMarkers(markers);
     }
-    if (previousView) instance.chart.timeScale().setVisibleLogicalRange(previousView);
+    if (previousView) instance.chart.timeScale().setVisibleRange(previousView);
     else instance.chart.timeScale().fitContent();
     interactivePairRange = data.range;
     return true;
