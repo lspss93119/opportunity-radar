@@ -44,6 +44,11 @@ SCANNER_MAX_MISSING_FEEDS = 1
 SCANNER_BATCH_ROWS = 8_192
 PAIR_RANGES = ("1h", "6h", "24h", "3d", "7d", "all")
 PairRange = Literal["1h", "6h", "24h", "3d", "7d", "all"]
+PAIR_TRAJECTORY_WINDOWS = (("1m", 60), ("5m", 300), ("15m", 900))
+PAIR_TRAJECTORY_TOLERANCE_SECONDS = EXPECTED_INTERVAL_SECONDS * 2
+# Display-only deadband. This classifies tiny changes as flat; it is not a
+# detector threshold or an entry rule.
+PAIR_TRAJECTORY_FLAT_EPSILON_BPS = 0.25
 VWAP_FIELDS = (
     ("buy_1k_vwap", "sell_1k_vwap"),
     ("buy_5k_vwap", "sell_5k_vwap"),
@@ -1015,6 +1020,7 @@ class DashboardQueryService:
                 "current": None,
                 "basis": self._unavailable_basis(),
                 "lifecycle": self._unavailable_lifecycle(),
+                "trajectory": self._unavailable_trajectory(),
                 "history": [],
                 "rolling_mean_series": [],
                 "errors": ["pair identity is not an enabled configured mapping"],
@@ -1081,6 +1087,20 @@ class DashboardQueryService:
         v2_lifecycle = self._anomaly_lifecycle_for(key, v2_by_key, v2_events, now)
         if v2_lifecycle["available"]:
             lifecycle = v2_lifecycle
+
+        trajectory_reference = _finite_float(lifecycle.get("reference_mean_bps"))
+        trajectory_reference_kind = "anomaly_frozen"
+        if trajectory_reference is None:
+            trajectory_reference = _finite_float(basis.get("mean_bps"))
+            trajectory_reference_kind = (
+                "rolling_24h" if trajectory_reference is not None else "unavailable"
+            )
+        trajectory = self._pair_trajectory(
+            observations,
+            current_observation,
+            reference_bps=trajectory_reference,
+            reference_kind=trajectory_reference_kind,
+        )
         current_payload = (
             self._current_payload(current_observation, basis, lifecycle)
             if current_observation is not None
@@ -1100,6 +1120,7 @@ class DashboardQueryService:
             "current": current_payload,
             "basis": basis,
             "lifecycle": lifecycle,
+            "trajectory": trajectory,
             "anomaly_markers": self._anomaly_markers_for(key, v2_events),
             "history": history,
             "rolling_mean_series": rolling_mean_series,
@@ -1803,6 +1824,128 @@ class DashboardQueryService:
         if not fees_available:
             return "unavailable"
         return basis_state
+
+    @staticmethod
+    def _unavailable_trajectory(
+        *,
+        reference_bps: float | None = None,
+        reference_kind: str = "unavailable",
+    ) -> dict[str, object]:
+        windows = {
+            label: {
+                "available": False,
+                "seconds": seconds,
+                "prior_sample_time": None,
+                "spread_change_bps": None,
+                "distance_change_bps": None,
+                "state": "unavailable",
+            }
+            for label, seconds in PAIR_TRAJECTORY_WINDOWS
+        }
+        return {
+            "available": False,
+            "reference_bps": reference_bps,
+            "reference_kind": reference_kind,
+            "current_distance_bps": None,
+            "recent_peak_distance_bps": None,
+            "distance_from_recent_peak_bps": None,
+            "recent_peak_at": None,
+            "windows": windows,
+        }
+
+    @staticmethod
+    def _pair_trajectory(
+        observations: Iterable[_PairObservation],
+        current: _PairObservation | None,
+        *,
+        reference_bps: float | None,
+        reference_kind: str,
+    ) -> dict[str, object]:
+        if current is None or reference_bps is None or not math.isfinite(reference_bps):
+            return DashboardQueryService._unavailable_trajectory(
+                reference_bps=reference_bps,
+                reference_kind=reference_kind,
+            )
+
+        current_distance = abs(current.raw_spread_bps - reference_bps)
+        prior = sorted(
+            (
+                observation
+                for observation in observations
+                if observation.key == current.key
+                and observation.valid_for_history
+                and observation.sample_time < current.sample_time
+            ),
+            key=lambda observation: observation.sample_time,
+        )
+
+        windows: dict[str, dict[str, object]] = {}
+        for label, seconds in PAIR_TRAJECTORY_WINDOWS:
+            target = current.sample_time - timedelta(seconds=seconds)
+            previous: _PairObservation | None = None
+            for observation in reversed(prior):
+                if observation.sample_time > target:
+                    continue
+                lag = (target - observation.sample_time).total_seconds()
+                if lag <= PAIR_TRAJECTORY_TOLERANCE_SECONDS:
+                    previous = observation
+                break
+
+            if previous is None:
+                windows[label] = {
+                    "available": False,
+                    "seconds": seconds,
+                    "prior_sample_time": None,
+                    "spread_change_bps": None,
+                    "distance_change_bps": None,
+                    "state": "unavailable",
+                }
+                continue
+
+            previous_distance = abs(previous.raw_spread_bps - reference_bps)
+            distance_change = current_distance - previous_distance
+            if distance_change > PAIR_TRAJECTORY_FLAT_EPSILON_BPS:
+                state = "widening"
+            elif distance_change < -PAIR_TRAJECTORY_FLAT_EPSILON_BPS:
+                state = "reverting"
+            else:
+                state = "flat"
+            windows[label] = {
+                "available": True,
+                "seconds": seconds,
+                "prior_sample_time": previous.sample_time.isoformat(),
+                "spread_change_bps": current.raw_spread_bps - previous.raw_spread_bps,
+                # Positive means farther from the displayed reference; negative
+                # means closer. This is display context only.
+                "distance_change_bps": distance_change,
+                "state": state,
+            }
+
+        peak_start = current.sample_time - timedelta(
+            seconds=PAIR_TRAJECTORY_WINDOWS[-1][1]
+        )
+        peak_candidates = [
+            observation
+            for observation in prior
+            if observation.sample_time >= peak_start
+        ]
+        peak_candidates.append(current)
+        peak = max(
+            peak_candidates,
+            key=lambda observation: abs(observation.raw_spread_bps - reference_bps),
+        )
+        peak_distance = abs(peak.raw_spread_bps - reference_bps)
+
+        return {
+            "available": True,
+            "reference_bps": reference_bps,
+            "reference_kind": reference_kind,
+            "current_distance_bps": current_distance,
+            "recent_peak_distance_bps": peak_distance,
+            "distance_from_recent_peak_bps": max(0.0, peak_distance - current_distance),
+            "recent_peak_at": peak.sample_time.isoformat(),
+            "windows": windows,
+        }
 
     def _current_payload(
         self,
