@@ -441,6 +441,37 @@ const compactUtc = value => {
     ' ' + pad(date.getUTCHours()) + ':' + pad(date.getUTCMinutes()) + ':' + pad(date.getUTCSeconds()) + 'Z';
 };
 const statusZh = value => ({healthy:'正常',degraded:'部分異常',down:'離線',eligible:'符合條件',pending:'等待中',unavailable:'不可用',stale:'資料過期',depth_unavailable:'深度不可用'}[value] ?? value ?? '未知');
+
+const telegramZh = value => ({
+  'Eligible / sent':'符合條件／已通知',
+  'Eligible / pending':'符合條件／待通知',
+  'Suppressed: alignment':'已抑制／基準不一致',
+  'Suppressed: context unavailable':'已抑制／缺少歷史比較資料',
+  'Pending':'等待中',
+  'Resolved':'已結束'
+}[value] ?? value ?? '無資料');
+const eventZh = value => ({
+  anomaly_candidate:'異常候選',
+  anomaly_confirmed:'異常已確認',
+  anomaly_resolved:'異常已結束',
+  anomaly_alerted:'異常已通知',
+  candidate_started:'候選開始',
+  candidate_confirmed:'候選已確認',
+  episode_started:'週期開始',
+  episode_ended:'週期結束'
+}[value] ?? value ?? '無資料');
+const errorZh = value => {
+  const original = String(value ?? '');
+  if (original.includes('current exact pair observation unavailable')) return '目前缺少這組配對的最新同步採樣資料（歷史資料仍可查看）';
+  if (original.includes('not an enabled configured mapping')) return '這組配對已不在目前監控清單中';
+  if (original.includes('market data read failed')) return '市場資料讀取失敗（詳情請查看系統日誌）';
+  if (original.includes('monitor state read failed')) return '監控狀態讀取失敗';
+  if (original.includes('anomaly state read failed')) return '異常訊號狀態讀取失敗';
+  if (original.includes('event JSON')) return '歷史事件資料格式異常';
+  if (original.startsWith('invalid ') || original.startsWith('ambiguous ')) return '歷史資料欄位或配對識別異常';
+  return '資料來源訊息：' + original;
+};
+
 const statusClass = value => ['healthy','degraded','down'].includes(value) ? value : 'degraded';
 const text = (id, value) => { byId(id).textContent = value ?? '無資料'; };
 const emptyRow = (columns, message) => '<tr><td colspan="' + columns + '" class="muted">' + esc(message) + '</td></tr>';
@@ -535,7 +566,7 @@ function renderAnomalies(data) {
     routeCell({...row, canonical_symbol: row.symbol}, 'anomaly-route') +
     '<td class="numeric"><strong class="edge-value anomaly-deviation">' + signedNumber(row.current_deviation_bps) + ' bps</strong><small>目前 ' + signedNumber(row.current_spread_bps) + '</small></td>' +
     '<td class="numeric"><strong>' + number(row.reference_mean_bps) + ' bps</strong><small>基準差距 ' + number(row.mean_alignment_bps) + '</small></td>' +
-    '<td><strong>' + age(row.episode_age_seconds) + '</strong><small>高峰 ' + signedNumber(row.post_confirmation_peak_deviation_bps) + ' · TG ' + esc(row.tg_status ?? '等待中') + '</small></td>' +
+    '<td><strong>' + age(row.episode_age_seconds) + '</strong><small>高峰 ' + signedNumber(row.post_confirmation_peak_deviation_bps) + ' · TG ' + esc(telegramZh(row.tg_status)) + '</small></td>' +
     '<td class="anomaly-context"><strong>' + (row.mean_12h_bps ?? '—') + ' / ' + (row.mean_24h_bps ?? '—') + ' / ' + (row.mean_48h_bps ?? '—') + '</strong><small>12h / 24h / 48h</small></td></tr>').join('') || emptyRow(6, '目前沒有有效且已確認的異常訊號');
 }
 function renderStatus(data) {
@@ -560,7 +591,7 @@ function renderStatus(data) {
     cell(number(row.net_spread_bps)) + cell(row.candidate_confirmed ? '是' : '否') + cell(row.alerted ? '是' : '否') + '</tr>').join('') ||
     emptyRow(6, data.sqlite?.status === 'healthy' ? '目前沒有有效訊號週期' : '訊號週期資料不可用');
   byId('event-rows').innerHTML = (data.recent_events || []).map(row => '<tr>' +
-    [row.occurred_at,row.symbol,row.event_type,number(row.net_spread_bps)].map(cell).join('') + '</tr>').join('') ||
+    [row.occurred_at,row.symbol,eventZh(row.event_type),number(row.net_spread_bps)].map(cell).join('') + '</tr>').join('') ||
     emptyRow(4, data.sqlite?.status === 'healthy' ? '近期沒有事件' : '事件資料不可用');
 }
 function restorePairRange() {
@@ -630,7 +661,7 @@ function renderPair(data) {
       ['V2 固定參考均值（bps）', number(lifecycle.reference_mean_bps)],
       ['V2 確認偏離幅度（bps）', number(lifecycle.confirmation_deviation_bps)],
       ['V2 確認後最大偏離（bps）', number(lifecycle.post_confirmation_peak_deviation_bps)],
-      ['V2 Telegram', lifecycle.tg_status ?? '等待中']
+      ['V2 Telegram', telegramZh(lifecycle.tg_status)]
     );
   }
   byId('pair-secondary').innerHTML = metrics.map(([label,value]) => '<div class="detail"><span class="detail-label">' + esc(label) + '</span><span class="detail-value">' + esc(value) + '</span></div>').join('');
@@ -907,7 +938,7 @@ async function refresh(query = new URLSearchParams(location.search)) {
     text('scanner-status', '掃描器 · ' + statusZh(status));
     byId('scanner-status').className = 'scanner-status ' + statusClass(status);
     compactDataStatus(data);
-    byId('errors').innerHTML = (data.errors || []).map(error => '<div class="error">' + esc(error) + '</div>').join('');
+    byId('errors').innerHTML = (data.errors || []).map(error => '<div class="error">' + esc(errorZh(error)) + '</div>').join('');
     if (isStatus) renderStatus(data); else if (isPair) renderPair(data); else if (isAnomalies) renderAnomalies(data); else renderOpportunities(data);
   } catch (error) {
     if (sequence !== requestSequence) return;
@@ -917,7 +948,7 @@ async function refresh(query = new URLSearchParams(location.search)) {
     byId('scanner-status').className = 'scanner-status degraded';
     compactDataStatus({});
     text('refreshed', '請求失敗');
-    byId('errors').innerHTML = '<div class="error">' + esc(error) + '</div>';
+    byId('errors').innerHTML = '<div class="error">' + esc(errorZh(error)) + '</div>';
     if (isStatus) renderStatus({}); else if (isPair) renderPair({}); else if (isAnomalies) byId('anomaly-rows').innerHTML = emptyRow(6, '資料不可用'); else byId('opportunity-rows').innerHTML = emptyRow(6, '資料不可用');
   } finally {
     if (sequence === requestSequence) requestInFlight = false;
