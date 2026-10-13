@@ -1868,16 +1868,20 @@ class DashboardQueryService:
             )
 
         current_distance = abs(current.raw_spread_bps - reference_bps)
-        prior = sorted(
-            (
-                observation
-                for observation in observations
-                if observation.key == current.key
-                and observation.valid_for_history
-                and observation.sample_time < current.sample_time
-            ),
-            key=lambda observation: observation.sample_time,
+        earliest_needed = current.sample_time - timedelta(
+            seconds=PAIR_TRAJECTORY_WINDOWS[-1][1]
+            + PAIR_TRAJECTORY_TOLERANCE_SECONDS
         )
+        # Pair observations are already sample-time ordered. Bound the copied
+        # working set to the trajectory horizon so 90-day Pair Detail reads do
+        # not sort or duplicate the full history.
+        prior = [
+            observation
+            for observation in observations
+            if observation.key == current.key
+            and observation.valid_for_history
+            and earliest_needed <= observation.sample_time < current.sample_time
+        ]
 
         windows: dict[str, dict[str, object]] = {}
         for label, seconds in PAIR_TRAJECTORY_WINDOWS:
