@@ -536,7 +536,7 @@ console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
     rendered = result
     assert 'class="state-note state-stale"' in rendered
     assert '延遲 1m 9s · 時間差 0s' in rendered
-    assert 'raw 0.00 bps' in rendered
+    assert '原始 0.00 bps' in rendered
     assert '淨價差不可用' in rendered
     assert 'Unavailable' not in rendered
 
