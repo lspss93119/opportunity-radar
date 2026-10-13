@@ -332,6 +332,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 #pair-chart { min-height: 270px; overflow: hidden; position: relative; padding: 7px; }
 
 .pair-chart-surface { width: 100%; height: min(62vh, 560px); min-height: 360px; }
+.chart-help { margin: 5px 0 7px; font-size: .72rem; }
 .pair-chart-tooltip { position: absolute; z-index: 2; top: 13px; left: 15px; max-width: calc(100% - 30px); padding: 6px 10px;
   background: rgba(7,17,31,.85); border: 1px solid #35516a; border-radius: 4px; color: #cbd5e1; font-size: .75rem;
   font-variant-numeric: tabular-nums; pointer-events: none; }
@@ -419,6 +420,7 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 <div class="pair-chart-header"><strong>方向性可成交價差</strong><div class="pair-chart-controls"><button type="button" id="pair-chart-reset">重設視圖</button><button type="button" id="pair-chart-latest">跳至最新</button><label>歷史範圍<select id="pair-range" aria-label="歷史資料範圍"><option value="1h">1 小時</option><option value="6h">6 小時</option><option value="24h" selected>24 小時</option><option value="3d">3 天</option><option value="7d">7 天</option><option value="all">全部資料（最多 90 天）</option></select></label></div></div>
 <div class="chart-legend"><span class="raw-color">原始價差</span><span class="mean-color">滾動 24 小時均值</span><span class="current-color">目前價差</span></div>
 <div id="pair-chart" class="card">無歷史資料</div>
+<p id="chart-library-status" class="chart-help muted" aria-live="polite">互動圖表載入中…</p>
 <p id="pair-coverage" class="muted"></p>
 </div><aside class="pair-right-rail"><div id="pair-long-leg" class="pair-rail-card"></div><div id="pair-short-leg" class="pair-rail-card"></div><div id="pair-trajectory-rail" class="pair-rail-card"></div><div id="pair-lifecycle-rail" class="pair-rail-card"></div></aside></div>
 <details id="pair-details" class="pair-details"><summary>其他運作細節</summary><div id="pair-secondary" class="pair-secondary"></div></details>
@@ -773,11 +775,12 @@ function renderPairChart(data) {
   const finite = value => typeof value === 'number' && Number.isFinite(value);
   const points = (data.history || []).filter(p => finite(p.raw_spread_bps) && Number.isFinite(Date.parse(p.sample_time)));
   const means = data.rolling_mean_series || [];
-  if (renderInteractivePairChart(data, points, means)) return;
+  if (renderInteractivePairChart(data, points, means)) { text('chart-library-status', '滾輪縮放 · 拖曳移動 · 十字游標查看數值 · 資料時間為 UTC'); return; }
+  text('chart-library-status', '互動圖表暫時無法載入；正在顯示基本歷史圖表');
   if (interactivePairChart) { interactivePairChart.chart.remove(); interactivePairChart = null; interactivePairChartMarkers = null; interactivePairReference = null; }
   const current = data.current;
   const lifecycle = data.lifecycle || {};
-  if (!points.length) { if (interactivePairChart) { interactivePairChart.chart.remove(); interactivePairChart = null; interactivePairChartMarkers = null; interactivePairReference = null; } text('pair-chart', '歷史資料不可用'); return; }
+  if (!points.length) { if (interactivePairChart) { interactivePairChart.chart.remove(); interactivePairChart = null; interactivePairChartMarkers = null; interactivePairReference = null; } text('pair-chart', '歷史資料不可用'); text('chart-library-status', '目前沒有可用的歷史採樣'); return; }
   const values = points.map(p => p.raw_spread_bps).concat(means.filter(p => finite(p.rolling_mean_bps)).map(p => p.rolling_mean_bps));
   if (current && finite(current.raw_spread_bps)) values.push(current.raw_spread_bps);
   const v2Reference = finite(lifecycle.reference_mean_bps) ? lifecycle.reference_mean_bps : null;
