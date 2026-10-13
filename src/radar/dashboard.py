@@ -209,11 +209,11 @@ def parse_anomaly_query(query: str) -> dict[str, object]:
 
 
 HTML = r"""<!doctype html>
-<html lang="en">
+<html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Opportunity Radar</title>
+<title>Opportunity Radar｜價差監控儀表板</title>
 <style>
 :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #07111f; color: #dbe7f5; }
 * { box-sizing: border-box; }
@@ -360,69 +360,69 @@ td small { display: block; color: #7890a6; margin-top: 3px; font-size: .68rem; l
 </head>
 <body data-view="__VIEW__">
 <main>
-<header class="terminal-header"><div class="brand-line"><span class="brand-mark">◆</span><h1>OPPORTUNITY RADAR</h1></div><div class="terminal-meta"><span class="read-only">READ ONLY</span><span class="muted">$10k executable VWAP</span><span id="scanner-status" class="scanner-status" data-scanner-status>SCANNER · —</span></div></header>
-<nav aria-label="Dashboard"><a id="nav-opportunities" href="/opportunities">Opportunities</a><a id="nav-anomalies" href="/anomalies">Anomalies</a><a id="nav-status" href="/status">Status</a></nav>
-<div class="summary" aria-live="polite"><span id="overall">Loading…</span><span id="data-as-of" class="muted">Data age —</span><span id="refreshed" class="muted"></span></div>
+<header class="terminal-header"><div class="brand-line"><span class="brand-mark">◆</span><h1>OPPORTUNITY RADAR｜價差雷達</h1></div><div class="terminal-meta"><span class="read-only">唯讀模式</span><span class="muted">1 萬美元可成交 VWAP</span><span id="scanner-status" class="scanner-status" data-scanner-status>掃描器 · —</span></div></header>
+<nav aria-label="儀表板導覽"><a id="nav-opportunities" href="/opportunities">套利機會</a><a id="nav-anomalies" href="/anomalies">異常訊號</a><a id="nav-status" href="/status">系統狀態</a></nav>
+<div class="summary" aria-live="polite"><span id="overall">載入中…</span><span id="data-as-of" class="muted">資料延遲 —</span><span id="refreshed" class="muted"></span></div>
 <div id="errors" role="alert"></div>
 <section id="anomalies-view">
-<h2>Active Anomalies</h2>
-<p class="table-help">Confirmed v2 episodes · lifecycle and Telegram state from read-only SQLite.</p>
+<h2>有效異常訊號</h2>
+<p class="table-help">已確認的 V2 訊號｜事件生命週期與 Telegram 狀態取自唯讀 SQLite。</p>
 <form id="anomaly-filters">
-<label>Symbol<input id="anomaly-symbol" name="symbol" placeholder="All symbols"></label>
-<label>Long venue<input id="anomaly-long-venue" name="long_venue" placeholder="All venues"></label>
-<label>Short venue<input id="anomaly-short-venue" name="short_venue" placeholder="All venues"></label>
-<label class="check"><input id="anomaly-eligible-only" name="eligible_only" type="checkbox">TG eligible only</label>
-<span class="filter-actions"><button type="submit">Apply filters</button><button id="anomaly-reset" type="button">Reset</button></span>
+<label>交易標的<input id="anomaly-symbol" name="symbol" placeholder="全部標的"></label>
+<label>做多交易所<input id="anomaly-long-venue" name="long_venue" placeholder="全部交易所"></label>
+<label>做空交易所<input id="anomaly-short-venue" name="short_venue" placeholder="全部交易所"></label>
+<label class="check"><input id="anomaly-eligible-only" name="eligible_only" type="checkbox">僅顯示符合 Telegram 條件</label>
+<span class="filter-actions"><button type="submit">套用篩選</button><button id="anomaly-reset" type="button">清除篩選</button></span>
 </form>
-<div class="table-wrap terminal-table-wrap"><table class="anomaly-terminal-table" aria-label="Active anomalies"><thead><tr><th>Symbol</th><th>Route</th><th>Deviation</th><th>Reference</th><th>Episode</th><th>Context</th></tr></thead><tbody id="anomaly-rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table></div>
+<div class="table-wrap terminal-table-wrap"><table class="anomaly-terminal-table" aria-label="有效異常訊號"><thead><tr><th>交易標的</th><th>交易方向</th><th>偏離幅度</th><th>參考基準</th><th>訊號週期</th><th>歷史比較</th></tr></thead><tbody id="anomaly-rows"><tr><td colspan="6" class="muted">載入中…</td></tr></tbody></table></div>
 </section>
 <section id="opportunities-view">
 <form id="filters" class="filter-toolbar">
 <div class="filter-primary">
-<label>Symbol<input id="symbol" name="symbol" placeholder="All symbols"></label>
-<label>Long venue<input id="long_venue" name="long_venue" placeholder="All venues"></label>
-<label>Short venue<input id="short_venue" name="short_venue" placeholder="All venues"></label>
-<label>Min convergence edge (bps)<input id="min_edge" name="min_edge" type="number" min="0" step="any"></label>
-<label>Basis state<select id="basis_state" name="basis_state"><option value="">All states</option><option value="eligible">Eligible</option><option value="pending">Baseline pending</option><option value="unavailable">Baseline unavailable</option></select></label>
-<span class="filter-actions"><button type="submit">Apply filters</button><button id="reset" type="button">Reset</button></span>
+<label>交易標的<input id="symbol" name="symbol" placeholder="全部標的"></label>
+<label>做多交易所<input id="long_venue" name="long_venue" placeholder="全部交易所"></label>
+<label>做空交易所<input id="short_venue" name="short_venue" placeholder="全部交易所"></label>
+<label>最低預估收斂優勢（bps）<input id="min_edge" name="min_edge" type="number" min="0" step="any"></label>
+<label>基準狀態<select id="basis_state" name="basis_state"><option value="">全部狀態</option><option value="eligible">符合條件</option><option value="pending">等待基準建立</option><option value="unavailable">基準不可用</option></select></label>
+<span class="filter-actions"><button type="submit">套用篩選</button><button id="reset" type="button">清除篩選</button></span>
 </div>
-<details id="more-filters" class="more-filters"><summary>More filters</summary><div class="filter-secondary">
-<label>Max 24h std (bps)<input id="max_std" name="max_std" type="number" min="0" step="any"></label>
-<label>Min duration (s)<input id="min_duration" name="min_duration" type="number" min="0" step="1"></label>
-<label>Limit<input id="limit" name="limit" type="number" min="1" max="512" step="1" placeholder="512"></label>
-<label class="check"><input id="active_only" name="active_only" type="checkbox">Active only</label>
+<details id="more-filters" class="more-filters"><summary>更多篩選條件</summary><div class="filter-secondary">
+<label>24 小時標準差上限（bps）<input id="max_std" name="max_std" type="number" min="0" step="any"></label>
+<label>最短持續時間（秒）<input id="min_duration" name="min_duration" type="number" min="0" step="1"></label>
+<label>顯示筆數<input id="limit" name="limit" type="number" min="1" max="512" step="1" placeholder="512"></label>
+<label class="check"><input id="active_only" name="active_only" type="checkbox">僅顯示有效訊號</label>
 </div></details>
 </form>
-<p class="table-help">Actionable first · edge after RT fee descending · values are display-only · duration comes from persisted SQLite.</p>
-<div class="table-wrap terminal-table-wrap"><table aria-label="Opportunities" class="opportunity-terminal-table"><thead><tr><th>Symbol</th><th>Route</th><th>Edge</th><th>Current</th><th>Baseline</th><th>Execution</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table></div>
+<p class="table-help">依可操作性排序，再依扣除來回手續費後的收斂優勢排序｜僅供觀察｜持續時間取自 SQLite。</p>
+<div class="table-wrap terminal-table-wrap"><table aria-label="套利機會" class="opportunity-terminal-table"><thead><tr><th>交易標的</th><th>交易方向</th><th>收斂優勢</th><th>目前價差</th><th>歷史基準</th><th>可成交性</th></tr></thead><tbody id="opportunity-rows"><tr><td colspan="6" class="muted">載入中…</td></tr></tbody></table></div>
 </section>
 <section id="status-view">
 <div class="metrics">
-<div class="card"><div class="metric-label">Radar heartbeat</div><div id="heartbeat" class="metric-value">Unavailable</div></div>
-<div class="card"><div class="metric-label">Latest sample / age</div><div id="sample" class="metric-value">Unavailable</div></div>
-<div class="card"><div class="metric-label">Rows at latest sample / configured feeds</div><div id="feeds" class="metric-value">Unavailable</div></div>
-<div class="card"><div class="metric-label">Healthy feeds / primary VWAP ready</div><div id="primary" class="metric-value">Unavailable</div></div>
-<div class="card"><div class="metric-label">Parquet read / file evidence</div><div id="parquet" class="metric-value">Unavailable</div></div>
-<div class="card"><div class="metric-label">SQLite read status</div><div id="sqlite" class="metric-value">Unavailable</div></div>
-<div class="card"><div class="metric-label">Active / confirmed / alerted episodes</div><div id="episodes-count" class="metric-value">Unavailable</div></div>
+<div class="card"><div class="metric-label">Radar 心跳</div><div id="heartbeat" class="metric-value">無資料</div></div>
+<div class="card"><div class="metric-label">最新採樣／資料延遲</div><div id="sample" class="metric-value">無資料</div></div>
+<div class="card"><div class="metric-label">最新採樣筆數／已設定資料源</div><div id="feeds" class="metric-value">無資料</div></div>
+<div class="card"><div class="metric-label">正常資料源／VWAP 就緒</div><div id="primary" class="metric-value">無資料</div></div>
+<div class="card"><div class="metric-label">Parquet 讀取／檔案狀態</div><div id="parquet" class="metric-value">無資料</div></div>
+<div class="card"><div class="metric-label">SQLite 讀取狀態</div><div id="sqlite" class="metric-value">無資料</div></div>
+<div class="card"><div class="metric-label">有效／已確認／已通知訊號</div><div id="episodes-count" class="metric-value">無資料</div></div>
 </div>
-<section class="section"><h2>Venues — missing counts refer to the latest dataset sample</h2><div class="table-wrap"><table><thead><tr><th>Venue</th><th>Expected</th><th>Available</th><th>Latest</th><th>Missing</th><th>Max age</th></tr></thead><tbody id="venues"></tbody></table></div></section>
-<section class="section"><h2>Market feeds</h2><div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Venue</th><th>Venue symbol</th><th>Status</th><th>Age</th><th>VWAP</th></tr></thead><tbody id="feed-rows"></tbody></table></div></section>
-<section class="section"><h2>Active episodes — persisted production state</h2><div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Long</th><th>Short</th><th>Net bps</th><th>Confirmed</th><th>Alerted</th></tr></thead><tbody id="episode-rows"></tbody></table></div></section>
-<section class="section"><h2>Recent events</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Type</th><th>Net bps</th></tr></thead><tbody id="event-rows"></tbody></table></div></section>
-<p id="unavailable" class="muted">Unavailable from persisted sources: deployed SHA, Telegram transport health, collector error counters.</p>
+<section class="section"><h2>交易所資料｜缺少筆數以最新採樣為準</h2><div class="table-wrap"><table><thead><tr><th>交易所</th><th>預期筆數</th><th>可用筆數</th><th>最新筆數</th><th>缺少筆數</th><th>最大延遲</th></tr></thead><tbody id="venues"></tbody></table></div></section>
+<section class="section"><h2>市場資料源</h2><div class="table-wrap"><table><thead><tr><th>交易標的</th><th>交易所</th><th>交易所標的</th><th>系統狀態</th><th>資料延遲</th><th>VWAP 狀態</th></tr></thead><tbody id="feed-rows"></tbody></table></div></section>
+<section class="section"><h2>有效訊號週期｜Production 持久化狀態</h2><div class="table-wrap"><table><thead><tr><th>交易標的</th><th>做多</th><th>做空</th><th>淨價差（bps）</th><th>已確認</th><th>已通知</th></tr></thead><tbody id="episode-rows"></tbody></table></div></section>
+<section class="section"><h2>近期事件</h2><div class="table-wrap"><table><thead><tr><th>時間</th><th>交易標的</th><th>事件類型</th><th>淨價差（bps）</th></tr></thead><tbody id="event-rows"></tbody></table></div></section>
+<p id="unavailable" class="muted">持久化資料目前不提供：部署 SHA、Telegram 傳輸健康度、資料收集器錯誤計數。</p>
 </section>
 <section id="pair-view">
-<h2 id="pair-identity">Pair Detail — exact identity unavailable</h2>
+<h2 id="pair-identity">配對詳情｜無法辨識完整配對</h2>
 <div id="pair-summary" class="pair-kpis metrics"></div>
 <div class="pair-layout"><div class="pair-main">
-<div class="pair-chart-header"><strong>Directional executable spread</strong><div class="pair-chart-controls"><button type="button" id="pair-chart-reset">重設視圖</button><button type="button" id="pair-chart-latest">跳至最新</button><label>Range<select id="pair-range" aria-label="History range"><option value="1h">1h</option><option value="6h">6h</option><option value="24h" selected>24h</option><option value="3d">3d</option><option value="7d">7d</option><option value="all">All available (90 days)</option></select></label></div></div>
-<div class="chart-legend"><span class="raw-color">Raw spread</span><span class="mean-color">Rolling 24h mean</span><span class="current-color">Current</span></div>
-<div id="pair-chart" class="card">History unavailable</div>
+<div class="pair-chart-header"><strong>方向性可成交價差</strong><div class="pair-chart-controls"><button type="button" id="pair-chart-reset">重設視圖</button><button type="button" id="pair-chart-latest">跳至最新</button><label>歷史範圍<select id="pair-range" aria-label="歷史資料範圍"><option value="1h">1h</option><option value="6h">6h</option><option value="24h" selected>24h</option><option value="3d">3d</option><option value="7d">7d</option><option value="all">全部資料（最多 90 天）</option></select></label></div></div>
+<div class="chart-legend"><span class="raw-color">原始價差</span><span class="mean-color">滾動 24 小時均值</span><span class="current-color">目前價差</span></div>
+<div id="pair-chart" class="card">無歷史資料</div>
 <p id="pair-coverage" class="muted"></p>
 </div><aside class="pair-right-rail"><div id="pair-long-leg" class="pair-rail-card"></div><div id="pair-short-leg" class="pair-rail-card"></div><div id="pair-trajectory-rail" class="pair-rail-card"></div><div id="pair-lifecycle-rail" class="pair-rail-card"></div></aside></div>
-<details id="pair-details" class="pair-details"><summary>Secondary operational details</summary><div id="pair-secondary" class="pair-secondary"></div></details>
-<p class="muted">UTC exact sample_time joins · missing slots remain gaps · history is read-only and prior-only. Statistics and lifecycle values are not recomputed in the browser.</p>
+<details id="pair-details" class="pair-details"><summary>其他運作細節</summary><div id="pair-secondary" class="pair-secondary"></div></details>
+<p class="muted">歷史資料依 UTC 採樣時間精確對齊，缺漏區間保留斷線；資料僅供檢視，均值使用當下之前的資料。統計數值與訊號狀態不在瀏覽器重新計算。</p>
 </section>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.min.js"></script>
