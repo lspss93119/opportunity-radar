@@ -535,16 +535,16 @@ console.log(JSON.stringify(byId('opportunity-rows').innerHTML));
 """, setup="location.pathname='/opportunities';\n")
     rendered = result
     assert 'class="state-note state-stale"' in rendered
-    assert 'age 1m 9s · skew 0s' in rendered
+    assert '延遲 1m 9s · 時間差 0s' in rendered
     assert 'raw 0.00 bps' in rendered
-    assert 'Net unavailable' in rendered
+    assert '淨價差不可用' in rendered
     assert 'Unavailable' not in rendered
 
 
 def test_opportunities_ui_describes_the_actual_backend_sort(scanner_http):
     with urlopen(scanner_http + "/opportunities") as response:
         html = response.read().decode()
-    assert "Actionable first · edge after RT fee descending" in html
+    assert "依可操作性排序，再依扣除來回手續費後的收斂優勢排序" in html
     assert "Sorted by deviation" not in html
 
 
@@ -986,9 +986,9 @@ def test_dashboard_polling_renders_delayed_successes_without_overlap(scanner_htt
   console.log(JSON.stringify({rendered, requests:requests.length, interval}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """, setup=POLLING_SETUP + f"location.pathname = {json.dumps(path)};\n")
-    assert [view["overall"] for view in result["rendered"]] == ["HEALTHY"] * 3
+    assert [view["overall"] for view in result["rendered"]] == ["正常"] * 3
     for cycle, view in enumerate(result["rendered"]):
-        assert view["sample"] == "data age 4s"
+        assert view["sample"] == "資料延遲 4s"
         assert f"sample-{cycle}" in view["view"]
     assert result["requests"] == 3
     assert result["interval"] == 10_000
@@ -1023,8 +1023,8 @@ def test_dashboard_filter_refresh_invalidates_pending_response(scanner_http, act
   console.log(JSON.stringify({rendered, urls:requests.map(request => request.url)}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """, setup=POLLING_SETUP + f"location.pathname = '/opportunities'; const action = {json.dumps(action)}, oldFirst = {json.dumps(old_first)};\n")
-    assert result["rendered"]["overall"] == "HEALTHY"
-    assert result["rendered"]["sample"] == "data age 4s"
+    assert result["rendered"]["overall"] == "正常"
+    assert result["rendered"]["sample"] == "資料延遲 4s"
     assert "current" in result["rendered"]["rows"]
     assert "obsolete" not in result["rendered"]["rows"]
     expected_query = {"submit": {"symbol": ["BTC"], "active_only": ["true"]},
@@ -1050,8 +1050,8 @@ def test_dashboard_polling_resumes_after_request_failure(scanner_http, path):
     sample:byId('data-as-of').textContent, requests:requests.length}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """, setup=POLLING_SETUP + f"location.pathname = {json.dumps(path)};\n")
-    assert result == {"failed": "DEGRADED — dashboard request failed", "overall": "HEALTHY",
-                      "sample": "data age 4s", "requests": 2}
+    assert result == {"failed": "儀表板讀取失敗", "overall": "正常",
+                      "sample": "資料延遲 4s", "requests": 2}
 
 
 def test_scanner_exact_pair_links_and_missing_identity_never_guessed(scanner_http):
