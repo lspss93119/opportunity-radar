@@ -31,6 +31,24 @@ def test_shadow_invalid_book_is_reported_not_misclassified_as_valid():
     assert row["source"] == "ws"
 
 
+@pytest.mark.parametrize(
+    ("bid_price", "ask_price"),
+    [("101", "101"), ("102", "101")],
+)
+def test_shadow_locked_or_crossed_book_is_not_reported_as_valid(
+    bid_price: str, ask_price: str
+):
+    row = _event(
+        "ws",
+        "BTC-USD",
+        {"bids": [[bid_price, "1"]], "asks": [[ask_price, "1"]]},
+        "2026-10-14T00:00:00Z",
+    )
+
+    assert row["status"] == "invalid_book"
+    assert row["detail"] == "ValueError"
+
+
 @pytest.mark.asyncio
 async def test_shadow_probe_rejects_invalid_market_without_network(tmp_path: Path):
     with pytest.raises(ValueError, match="market"):

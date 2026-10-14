@@ -7,9 +7,11 @@ orders, or writes raw L2 levels. It records BBO/VWAP summaries only.
 
 Source protocol: [Arcus open-source Go websocket adapter](https://pkg.go.dev/github.com/k4k3ru-hub/onchain/go/venues/arcus) and
 [order-book response model](https://docs.rs/perp_dex/latest/perp_dex/exchange/arcus/schemas/rest/orderbook/struct.RestOrderBookArcus.html).
-This third-party implementation documents `wss://api.arcus.xyz/v1/ws`,
-`l2Orderbook`, `id` as market display name, and full snapshot metadata.
-**Live protocol compatibility remains to be confirmed on the target Mac.**
+This implementation documents `wss://api.arcus.xyz/v1/ws`, `l2Orderbook`,
+`id` as market display name, and full snapshot metadata. A read-only live
+check on `trading-mini` confirmed the expected `connected` → `subscribed`
+sequence for `SNDK-USD`, with 20 bid/ask levels and all five metadata fields
+(`timestamp`, `lastSequenceId`, `globalSequenceId`, `bids`, `asks`) present.
 
 ## Run separately from Production
 
@@ -29,7 +31,9 @@ do not assume arrival timestamps equal exchange timestamps.
 CSV fields include:
 - `received_at_utc`: local completion/receipt timestamp.
 - `request_started_at_utc` and `request_duration_ms`: REST call latency.
-- `venue_timestamp_raw`: raw server timestamp with **unverified units**.
+- `venue_timestamp_raw`: raw server timestamp; the current public Arcus feed
+  returned Unix microseconds in the live check. Keep it as source metadata and
+  do not substitute it for local receipt time when measuring latency.
 - `last_sequence_id` and `global_sequence_id`: audit-only (not a reconstructed book).
 - `best_bid`, `best_ask`, 1k/5k/10k VWAP, status and error type.
 

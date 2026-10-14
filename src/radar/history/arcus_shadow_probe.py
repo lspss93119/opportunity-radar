@@ -39,12 +39,16 @@ def summarize_book(payload: object) -> dict[str, object]:
     """Normalize one *full* L2 snapshot, preserving raw venue time metadata."""
     bids, asks = parse_arcus_l2_order_book(payload)
     assert isinstance(payload, dict)
+    best_bid = bids[0].price
+    best_ask = asks[0].price
+    if best_bid >= best_ask:
+        raise ValueError("book must not be crossed or locked")
     return {
         "venue_timestamp_raw": payload.get("timestamp"),
         "last_sequence_id": payload.get("lastSequenceId"),
         "global_sequence_id": payload.get("globalSequenceId"),
-        "best_bid": bids[0].price,
-        "best_ask": asks[0].price,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
         "buy_1k_vwap": buy_vwap(asks, 1_000),
         "sell_1k_vwap": sell_vwap(bids, 1_000),
         "buy_5k_vwap": buy_vwap(asks, 5_000),

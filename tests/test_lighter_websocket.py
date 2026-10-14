@@ -518,6 +518,75 @@ async def test_lighter_missing_initial_snapshot_retries_subscription():
 
 
 @pytest.mark.asyncio
+async def test_lighter_reconnects_when_server_rejects_gap_resubscription():
+    first = FakeWebSocket([{"type": "connected"}, snapshot_message(1)])
+    second = FakeWebSocket([{"type": "connected"}])
+    subscribe_count = 0
+
+    async def first_send(message: str) -> None:
+        nonlocal subscribe_count
+        payload = json.loads(message)
+        first.sent.append(payload)
+        if payload.get("type") == "subscribe":
+            subscribe_count += 1
+            if subscribe_count == 2:
+                first.push({"type": "error", "message": "subscription rejected"})
+
+    first.send = first_send  # type: ignore[method-assign]
+    connections = [first, second]
+
+    def connect(_url: str):
+        return connections.pop(0)
+
+    feed = LighterOrderBookFeed(
+        "wss://example.test/stream",
+        (1,),
+        connect=connect,
+        reconnect_delay_seconds=0,
+        snapshot_timeout_seconds=1.0,
+    )
+    await feed.start()
+    try:
+        await wait_for_book(feed, 1)
+        first.push(update_message(1, begin_nonce=999, nonce=1000))
+        await wait_until(lambda: feed.reconnect_count >= 1)
+        second.push(snapshot_message(1, nonce=20))
+        recovered = await wait_for_book(feed, 1)
+
+        assert recovered.bids[0].price == 99.0
+        assert feed.reconnect_count == 1
+    finally:
+        await feed.stop()
+
+
+@pytest.mark.asyncio
+async def test_lighter_stop_cleans_snapshot_watchdogs():
+    websocket = FakeWebSocket([{"type": "connected"}])
+    feed = LighterOrderBookFeed(
+        "wss://example.test/stream",
+        (1,),
+        connect=lambda _url: websocket,
+        snapshot_timeout_seconds=60.0,
+    )
+
+    await feed.start()
+    await wait_until(
+        lambda: any(
+            task.get_name() == "lighter-book-snapshot-1"
+            and not task.done()
+            for task in asyncio.all_tasks()
+        )
+    )
+    await feed.stop()
+    await asyncio.sleep(0)
+
+    assert not any(
+        task.get_name() == "lighter-book-snapshot-1" and not task.done()
+        for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
 async def test_lighter_order_book_feed_handles_application_ping():
     websocket = FakeWebSocket([{"type": "connected"}])
 
