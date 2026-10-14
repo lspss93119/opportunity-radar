@@ -20,7 +20,14 @@ from pathlib import Path
 from statistics import median
 from zoneinfo import ZoneInfo
 
-from radar.history.stable_baseline import Pair, _as_datetime, _quantile
+from radar.history.stable_baseline import (
+    Pair,
+    Params as V1Params,
+    _as_datetime,
+    _quantile,
+    _sample_pairs,
+    csv_or_parquet_quotes,
+)
 
 
 BASIS_TYPES = ("mid", "exec_buy_a_sell_b", "exec_buy_b_sell_a")
@@ -834,6 +841,11 @@ def _pair_latest_stats(connection, table_name: str) -> dict[Pair, dict[str, int]
     valid_time_a = "a.observed_at <= a.sample_time AND EXTRACT(EPOCH FROM (a.sample_time - a.observed_at)) <= 12"
     valid_time_b = "b.observed_at <= b.sample_time AND EXTRACT(EPOCH FROM (b.sample_time - b.observed_at)) <= 12"
     both_valid = f"({valid_vwap_a}) AND ({valid_vwap_b}) AND ({valid_time_a}) AND ({valid_time_b})"
+    pair_vwap_a = valid_vwap_a.replace("a.buy_price", "p.buy_a").replace("a.sell_price", "p.sell_a")
+    pair_vwap_b = valid_vwap_b.replace("b.buy_price", "p.buy_b").replace("b.sell_price", "p.sell_b")
+    pair_time_a = valid_time_a.replace("a.observed_at", "p.observed_a").replace("a.sample_time", "p.sample_time")
+    pair_time_b = valid_time_b.replace("b.observed_at", "p.observed_b").replace("b.sample_time", "p.sample_time")
+    pair_both_valid = f"({pair_vwap_a}) AND ({pair_vwap_b}) AND ({pair_time_a}) AND ({pair_time_b})"
     rows = connection.execute(
         f"""
         WITH pair_slots AS (
@@ -852,8 +864,8 @@ def _pair_latest_stats(connection, table_name: str) -> dict[Pair, dict[str, int]
         )
         SELECT symbol, venue_a, symbol_a, venue_b, symbol_b,
                COUNT(*) AS common_slots,
-               SUM(CASE WHEN NOT ({valid_vwap_a.replace('a.', 'p.').replace('b.', 'p.')})
-                              OR NOT ({valid_vwap_b.replace('a.', 'p.').replace('b.', 'p.')})
+               SUM(CASE WHEN NOT ({pair_vwap_a})
+                              OR NOT ({pair_vwap_b})
                         THEN 1 ELSE 0 END) AS invalid_vwap_slots,
                SUM(CASE WHEN p.observed_a > p.sample_time OR p.observed_b > p.sample_time
                         THEN 1 ELSE 0 END) AS after_sample_slots,
@@ -862,16 +874,16 @@ def _pair_latest_stats(connection, table_name: str) -> dict[Pair, dict[str, int]
                               AND (EXTRACT(EPOCH FROM (p.sample_time - p.observed_a)) > 12
                                    OR EXTRACT(EPOCH FROM (p.sample_time - p.observed_b)) > 12)
                         THEN 1 ELSE 0 END) AS stale_slots,
-               SUM(CASE WHEN ({both_valid.replace('a.', 'p.').replace('b.', 'p.')})
+               SUM(CASE WHEN ({pair_both_valid})
                               AND ABS(EXTRACT(EPOCH FROM (p.observed_a - p.observed_b))) > 3
                         THEN 1 ELSE 0 END) AS skew_3_slots,
-               SUM(CASE WHEN ({both_valid.replace('a.', 'p.').replace('b.', 'p.')})
+               SUM(CASE WHEN ({pair_both_valid})
                               AND ABS(EXTRACT(EPOCH FROM (p.observed_a - p.observed_b))) <= 3
                         THEN 1 ELSE 0 END) AS valid_sync_3,
-               SUM(CASE WHEN ({both_valid.replace('a.', 'p.').replace('b.', 'p.')})
+               SUM(CASE WHEN ({pair_both_valid})
                               AND ABS(EXTRACT(EPOCH FROM (p.observed_a - p.observed_b))) <= 5
                         THEN 1 ELSE 0 END) AS valid_sync_5,
-               SUM(CASE WHEN ({both_valid.replace('a.', 'p.').replace('b.', 'p.')})
+               SUM(CASE WHEN ({pair_both_valid})
                               AND ABS(EXTRACT(EPOCH FROM (p.observed_a - p.observed_b))) <= 10
                         THEN 1 ELSE 0 END) AS valid_sync_10
         FROM pair_slots AS p
@@ -1588,15 +1600,15 @@ def iter_pair_points(
     size_usd: int = 1000,
     sample_seconds: int = 60,
 ) -> Iterator[PairPoint]:
-    """Yield exact-sample-time pair slots using the latest duplicate row.
+    """Yield valid synchronized pair slots with the canonical V1 semantics.
 
-    The query intentionally emits only slots where both configured markets have
-    a row.  Missing-leg attribution is performed from the market slot counts
-    and from ``PairPoint`` fixtures in the pure classifier; valid synchronized
-    rows are the stream consumed by baseline and episode analysis.
+    V2 keeps the quality-attribution SQL separate from this timeline.  The
+    baseline and episode stream reuses V1's sorted quote iterator and
+    ``_sample_pairs`` so duplicate selection, quote-age validation, and
+    observed-at skew have exactly the same semantics as the production V1
+    replay.  This avoids a second all-pairs SQL self-join and its global sort
+    over the full Production history.
     """
-
-    import duckdb  # type: ignore[import-untyped]
 
     if not files:
         raise ValueError("files required")
@@ -1607,89 +1619,36 @@ def iter_pair_points(
     if not configured:
         return
 
-    buy = f"buy_{size_usd // 1000}k_vwap"
-    sell = f"sell_{size_usd // 1000}k_vwap"
-    placeholders = ", ".join("(?, ?, ?)" for _ in configured)
-    config_values = [value for row in sorted(configured) for value in row]
-    connection = duckdb.connect()
-    try:
-        connection.execute(
-            "CREATE TEMP TABLE configured_markets "
-            "(venue VARCHAR, venue_symbol VARCHAR, canonical_symbol VARCHAR)"
+    v1_params = V1Params(
+        sample_seconds=sample_seconds,
+        max_quote_age_seconds=12,
+        max_skew_seconds=3,
+        max_gap_seconds=120,
+    )
+    for timestamp, pair, quote_a, quote_b in _sample_pairs(
+        csv_or_parquet_quotes(files, size_usd=size_usd, sample_seconds=sample_seconds),
+        v1_params,
+        configured,
+    ):
+        yield PairPoint(
+            sample_time=_as_datetime(timestamp),
+            pair=pair,
+            a=MarketObservation(
+                sample_time=_as_datetime(quote_a.sample_time),
+                observed_at=_as_datetime(quote_a.observed_at),
+                venue=quote_a.venue,
+                venue_symbol=quote_a.venue_symbol,
+                symbol=quote_a.symbol,
+                buy=quote_a.buy,
+                sell=quote_a.sell,
+            ),
+            b=MarketObservation(
+                sample_time=_as_datetime(quote_b.sample_time),
+                observed_at=_as_datetime(quote_b.observed_at),
+                venue=quote_b.venue,
+                venue_symbol=quote_b.venue_symbol,
+                symbol=quote_b.symbol,
+                buy=quote_b.buy,
+                sell=quote_b.sell,
+            ),
         )
-        connection.execute(
-            f"INSERT INTO configured_markets VALUES {placeholders}", config_values
-        )
-        query = f"""
-            WITH latest AS (
-                SELECT
-                    CAST(r.sample_time AS TIMESTAMPTZ) AS sample_time,
-                    CAST(r.observed_at AS TIMESTAMPTZ) AS observed_at,
-                    r.venue,
-                    r.venue_symbol,
-                    r.canonical_symbol,
-                    r.{buy} AS buy_price,
-                    r.{sell} AS sell_price
-                FROM read_parquet(?, union_by_name=true) AS r
-                INNER JOIN configured_markets AS c
-                    ON c.venue = r.venue
-                   AND c.venue_symbol = r.venue_symbol
-                   AND c.canonical_symbol = r.canonical_symbol
-                WHERE CAST(EXTRACT(EPOCH FROM CAST(r.sample_time AS TIMESTAMPTZ)) AS BIGINT) % ? = 0
-                QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY r.sample_time, r.venue, r.venue_symbol, r.canonical_symbol
-                    ORDER BY r.observed_at DESC
-                ) = 1
-            )
-            SELECT
-                a.sample_time,
-                a.observed_at, a.venue, a.venue_symbol, a.canonical_symbol,
-                a.buy_price, a.sell_price,
-                b.observed_at, b.venue, b.venue_symbol, b.canonical_symbol,
-                b.buy_price, b.sell_price
-            FROM latest AS a
-            INNER JOIN latest AS b
-                ON b.sample_time = a.sample_time
-               AND b.canonical_symbol = a.canonical_symbol
-               AND a.venue < b.venue
-            ORDER BY a.canonical_symbol, a.venue, a.venue_symbol,
-                     b.venue, b.venue_symbol, a.sample_time
-        """
-        cursor = connection.execute(query, [files, sample_seconds])
-        while chunk := cursor.fetchmany(8192):
-            for row in chunk:
-                (
-                    sample_time,
-                    observed_a, venue_a, symbol_a, canonical_a, buy_a, sell_a,
-                    observed_b, venue_b, symbol_b, canonical_b, buy_b, sell_b,
-                ) = row
-                timestamp = _as_datetime(sample_time)
-                a = MarketObservation(
-                    sample_time=timestamp,
-                    observed_at=_as_datetime(observed_a),
-                    venue=str(venue_a),
-                    venue_symbol=str(symbol_a),
-                    symbol=str(canonical_a),
-                    buy=float(buy_a) if buy_a is not None else None,
-                    sell=float(sell_a) if sell_a is not None else None,
-                )
-                b = MarketObservation(
-                    sample_time=timestamp,
-                    observed_at=_as_datetime(observed_b),
-                    venue=str(venue_b),
-                    venue_symbol=str(symbol_b),
-                    symbol=str(canonical_b),
-                    buy=float(buy_b) if buy_b is not None else None,
-                    sell=float(sell_b) if sell_b is not None else None,
-                )
-                yield PairPoint(
-                    sample_time=timestamp,
-                    pair=Pair(
-                        str(canonical_a), str(venue_a), str(symbol_a),
-                        str(venue_b), str(symbol_b),
-                    ),
-                    a=a,
-                    b=b,
-                )
-    finally:
-        connection.close()

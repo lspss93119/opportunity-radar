@@ -16,6 +16,7 @@ from radar.history.stable_baseline_v2 import (
     _attribute_pair_slot,
     build_baseline_rows,
     causal_baseline,
+    collect_data_quality,
     _classify_observation,
     build_daily_series,
     iter_pair_points,
@@ -490,3 +491,29 @@ def test_v2_writer_emits_requested_files_with_stable_headers(tmp_path: Path):
         "opportunity_funnel.csv",
         "candidate_ranking.csv",
     } <= {path.name for path in tmp_path.iterdir()}
+
+
+def test_collect_data_quality_attributes_pair_without_sql_alias_error(tmp_path: Path):
+    import duckdb
+
+    parquet_path = tmp_path / "quality.parquet"
+    connection = duckdb.connect()
+    try:
+        connection.execute(
+            """
+            CREATE TABLE quotes AS SELECT * FROM (VALUES
+              (TIMESTAMPTZ '2026-10-01 12:00:00+00', TIMESTAMPTZ '2026-10-01 12:00:00+00', 'venue_a', 'TEST', 'TEST', 101.0, 99.0),
+              (TIMESTAMPTZ '2026-10-01 12:00:00+00', TIMESTAMPTZ '2026-10-01 12:00:00+00', 'venue_b', 'TEST', 'TEST', 102.0, 100.0)
+            ) AS t(sample_time, observed_at, venue, venue_symbol, canonical_symbol,
+                   buy_1k_vwap, sell_1k_vwap)
+            """
+        )
+        connection.execute("COPY quotes TO ? (FORMAT PARQUET)", [str(parquet_path)])
+    finally:
+        connection.close()
+
+    _, metrics = collect_data_quality(
+        [str(parquet_path)], MARKETS, params=AnalysisParams(),
+    )
+
+    assert metrics[PAIR]["valid_sync_samples"] == 1
