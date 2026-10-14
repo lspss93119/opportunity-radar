@@ -213,6 +213,21 @@ def us_session_regime(timestamp: datetime) -> str:
     return "us_extended"
 
 
+def _expected_slots_for_day(
+    day: date,
+    *,
+    sample_seconds: int,
+    regime: str,
+) -> int:
+    if regime == "all":
+        return int(86400 / sample_seconds)
+    start = datetime.combine(day, time.min, tzinfo=UTC)
+    return sum(
+        us_session_regime(start + timedelta(seconds=offset)) == regime
+        for offset in range(0, 86400, sample_seconds)
+    )
+
+
 def _basis_values(point: PairPoint) -> dict[str, float]:
     if point.a is None or point.b is None:
         raise ValueError("basis requires both observations")
@@ -246,13 +261,14 @@ def build_daily_series(
         )
         for basis, value in _basis_values(point).items():
             day_values[basis].append(value)
-    expected = 86400 / params.sample_seconds
     return {
         day: DailySeries(
             day=day,
             values={basis: tuple(day_values[basis]) for basis in BASIS_TYPES},
             sample_count=len(day_values["mid"]),
-            coverage=len(day_values["mid"]) / expected,
+            coverage=len(day_values["mid"]) / _expected_slots_for_day(
+                day, sample_seconds=params.sample_seconds, regime=regime,
+            ),
         )
         for day, day_values in values_by_day.items()
     }
@@ -1397,13 +1413,14 @@ def _collect_size_analysis(
                 day_values[basis].append(value)
     for pair in pairs:
         for regime, values_by_day in values_by_pair[pair].items():
-            expected = 86400 / params.sample_seconds
             histories[pair][regime] = {
                 day: DailySeries(
                     day=day,
                     values={basis: tuple(day_values[basis]) for basis in BASIS_TYPES},
                     sample_count=len(day_values["mid"]),
-                    coverage=len(day_values["mid"]) / expected,
+                    coverage=len(day_values["mid"]) / _expected_slots_for_day(
+                        day, sample_seconds=params.sample_seconds, regime=regime,
+                    ),
                 )
                 for day, day_values in values_by_day.items()
             }

@@ -222,6 +222,19 @@ def test_us_session_regime_handles_regular_extended_and_closed_hours():
     assert us_session_regime(datetime(2026, 10, 3, 14, tzinfo=UTC)) == "us_closed"
 
 
+def test_session_regime_coverage_uses_regime_specific_expected_slots():
+    start = datetime(2026, 10, 1, 13, 30, tzinfo=UTC)
+    points = [
+        pair_point(start + timedelta(minutes=offset), 0.0)
+        for offset in range(390)
+    ]
+
+    history = build_daily_series(iter(points), params=PARAMS, regime="us_regular")
+
+    assert history[start.date()].sample_count == 390
+    assert history[start.date()].coverage == pytest.approx(1.0)
+
+
 def baseline_reference(value: float = 100.0) -> BaselineReference:
     return BaselineReference(
         baseline_bps=value,
