@@ -85,3 +85,31 @@ def test_forward_fill_not_invented_on_gap():
     data = rows()
     gap_minute = datetime(2026, 10, 3, 12, 1, tzinfo=UTC)
     assert run([x for x in data if x.sample_time != gap_minute])["summary"]["closed_trades"] == 0
+
+
+def test_negative_deviation_opens_reverse_pair_and_converges():
+    trade, = run(rows(anomaly=45.0))["trades"]
+    assert trade["direction"] == "buy_b_sell_a"
+    assert trade["net_usd"] > 0
+
+
+def test_no_prior_days_never_trades():
+    values = rows()
+    only_last_day = [q for q in values if q.sample_time.date().day == 3]
+    result = run(only_last_day)
+    assert result["summary"]["closed_trades"] == 0
+    assert result["pairs"][0]["status"] == "insufficient_history"
+
+
+def test_gap_close_is_reported_but_excluded_from_ranked_pnl():
+    values = rows()
+    start = datetime(2026, 10, 3, 12, tzinfo=UTC)
+    first = [x for x in values if x.sample_time < start + timedelta(minutes=3)]
+    ts = start + timedelta(minutes=13)
+    first += [quote(ts, "a"), quote(ts, "b", 101)]
+    result = run(first)
+    assert result["summary"]["excluded_gap_exits"] == 1
+    assert result["trades"][0]["exit_reason"] == "data_gap"
+    assert result["pairs"][0]["excluded_gap_exits"] == 1
+    assert result["pairs"][0]["scored_trades"] == 0
+    assert result["pairs"][0]["total_net_usd"] == 0
