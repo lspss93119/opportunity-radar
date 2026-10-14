@@ -194,9 +194,12 @@ class LighterOrderBookFeed:
         error_handler: CollectorErrorHandler | None = None,
         venue: str = "lighter",
         reconnect_delay_seconds: float = 1.0,
+        snapshot_timeout_seconds: float = 10.0,
     ) -> None:
         if reconnect_delay_seconds < 0:
             raise ValueError("reconnect_delay_seconds must be non-negative")
+        if snapshot_timeout_seconds <= 0:
+            raise ValueError("snapshot_timeout_seconds must be positive")
         self.ws_url = ws_url
         self._market_ids = tuple(sorted(set(market_ids)))
         self._connect = connect
@@ -206,6 +209,9 @@ class LighterOrderBookFeed:
         self._on_book = on_book
         self._on_invalidate = on_invalidate
         self._reconnect_delay_seconds = reconnect_delay_seconds
+        self._snapshot_timeout_seconds = snapshot_timeout_seconds
+        self._awaiting_snapshot: set[int] = set()
+        self._snapshot_watchdogs: dict[int, asyncio.Task[None]] = {}
         self._states: dict[int, LighterOrderBookState] = {
             market_id: LighterOrderBookState(market_id)
             for market_id in self._market_ids
@@ -275,10 +281,65 @@ class LighterOrderBookFeed:
                 report_collector_error(self._error_handler, self._venue, error)
 
     def _clear_states(self) -> None:
+        for task in self._snapshot_watchdogs.values():
+            task.cancel()
+        self._snapshot_watchdogs.clear()
+        self._awaiting_snapshot.clear()
         for state in self._states.values():
             state.clear()
             if self._on_invalidate is not None:
                 self._on_invalidate(state.market_id)
+
+    async def _replace_subscription(self, websocket: Any, market_id: int) -> None:
+        channel = f"order_book/{market_id}"
+        await websocket.send(json.dumps({"type": "unsubscribe", "channel": channel}))
+        await websocket.send(json.dumps({"type": "subscribe", "channel": channel}))
+
+    def _start_snapshot_watchdog(self, websocket: Any, market_id: int) -> None:
+        if market_id in self._snapshot_watchdogs:
+            return
+        self._snapshot_watchdogs[market_id] = asyncio.create_task(
+            self._watch_snapshot(websocket, market_id),
+            name=f"{self._venue}-book-snapshot-{market_id}",
+        )
+
+    async def _watch_snapshot(self, websocket: Any, market_id: int) -> None:
+        try:
+            while (
+                not self._stopping
+                and self._websocket is websocket
+                and market_id in self._awaiting_snapshot
+            ):
+                await asyncio.sleep(self._snapshot_timeout_seconds)
+                if (
+                    self._stopping
+                    or self._websocket is not websocket
+                    or market_id not in self._awaiting_snapshot
+                ):
+                    break
+                report_collector_error(
+                    self._error_handler,
+                    self._venue,
+                    TimeoutError(f"order book snapshot timeout: market={market_id}"),
+                )
+                await self._replace_subscription(websocket, market_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            report_collector_error(self._error_handler, self._venue, error)
+            # A failed replacement means this connection cannot be trusted.
+            await websocket.close()
+        finally:
+            if self._snapshot_watchdogs.get(market_id) is asyncio.current_task():
+                self._snapshot_watchdogs.pop(market_id, None)
+
+    async def _recover_book(self, websocket: Any, market_id: int) -> None:
+        # Ignore deltas until an authoritative subscribed/order_book snapshot.
+        if market_id in self._awaiting_snapshot:
+            return
+        self._awaiting_snapshot.add(market_id)
+        self._start_snapshot_watchdog(websocket, market_id)
+        await self._replace_subscription(websocket, market_id)
 
     async def _run(self) -> None:
         while not self._stopping:
@@ -316,11 +377,13 @@ class LighterOrderBookFeed:
         message_type = message.get("type")
         if message_type == "connected":
             for market_id in self._market_ids:
+                self._awaiting_snapshot.add(market_id)
                 await websocket.send(
                     json.dumps(
                         {"type": "subscribe", "channel": f"order_book/{market_id}"}
                     )
                 )
+                self._start_snapshot_watchdog(websocket, market_id)
             return
         if message_type == "ping":
             await websocket.send(json.dumps({"type": "pong"}))
@@ -332,10 +395,16 @@ class LighterOrderBookFeed:
         state = self._states.get(market_id)
         if state is None:
             raise ValueError(f"websocket market {market_id} is not configured")
+        if message_type == "update/order_book" and market_id in self._awaiting_snapshot:
+            return
         order_book = message.get("order_book")
         try:
             if message_type == "subscribed/order_book":
                 state.apply_snapshot(order_book, received_at)
+                self._awaiting_snapshot.discard(market_id)
+                watchdog = self._snapshot_watchdogs.pop(market_id, None)
+                if watchdog is not None:
+                    watchdog.cancel()
             else:
                 state.apply_delta(order_book, received_at)
         except Exception as error:  # noqa: BLE001
@@ -343,6 +412,7 @@ class LighterOrderBookFeed:
             if self._on_invalidate is not None:
                 self._on_invalidate(market_id)
             report_collector_error(self._error_handler, self._venue, error)
+            await self._recover_book(websocket, market_id)
             return
 
     @staticmethod

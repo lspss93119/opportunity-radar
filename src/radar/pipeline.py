@@ -384,9 +384,13 @@ class MarketDataPipeline:
                 in included_keys
             )
         )
+        # Keep the strict 10k-depth gate for live monitoring, but archive every
+        # fresh, valid BBO even when only the smaller VWAP tiers are executable.
+        # Historical research must not lose $1k/$5k observations merely because
+        # the same book cannot fill $10k on both sides.
         self.state.apply_market_batch(batch)
         if self.storage is not None:
-            self.storage.append(batch)
+            self.storage.append(candidate_batch)
         return batch
 
     def _record_market_availability(
