@@ -34,6 +34,19 @@ class _SmallHistory(BboRollingHistory):
         )
 
 
+class _LegacySmallHistory(_SmallHistory):
+    def hydrate(self, points: list[tuple[datetime, float]]) -> None:
+        for name in self.windows_seconds:
+            self._points[name].clear()
+            self._sums[name] = 0.0
+        self._last_sample_time = None
+        values = {
+            timestamp: float(value) for timestamp, value in points
+        }
+        for timestamp in sorted(values):
+            self._append(timestamp, values[timestamp])
+
+
 @pytest.fixture
 def small_history(monkeypatch):
     monkeypatch.setattr(history_module, "BboRollingHistory", _SmallHistory)
@@ -145,6 +158,32 @@ def prime(monitor_instance: ManualOpportunityMonitor, key: SpreadPairKey = KEY) 
             )
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_bounded_hydration_preserves_lifecycle_events(monkeypatch):
+    points = {
+        KEY: tuple(
+            (START - timedelta(seconds=offset), 0.0)
+            for offset in range(1_000, 0, -10)
+        )
+    }
+    monkeypatch.setattr(history_module, "BboRollingHistory", _SmallHistory)
+    optimized = monitor()
+    optimized.hydrate_history(points)
+
+    monkeypatch.setattr(history_module, "BboRollingHistory", _LegacySmallHistory)
+    legacy = monitor()
+    legacy.hydrate_history(points)
+
+    for offset in range(0, 70, 10):
+        when = START + timedelta(seconds=offset)
+        expected = await legacy.evaluate(when, state_for(when))
+        actual = await optimized.evaluate(when, state_for(when))
+        assert [(alert.event_id, alert.payload) for alert in actual] == [
+            (alert.event_id, alert.payload) for alert in expected
+        ]
+        assert optimized.active_episodes == legacy.active_episodes
 
 
 @pytest.mark.asyncio
