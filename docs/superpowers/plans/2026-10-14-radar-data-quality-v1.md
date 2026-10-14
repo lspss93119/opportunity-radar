@@ -153,13 +153,13 @@ Preserve REST as the current Production path; do not modify `ArcusCollector` to 
 
 Use one enabled, liquid market and record command, start/end times, PID, output path, REST success rate, WS connection/subscription status, snapshots, parser errors, and timestamp provenance.
 
-- [ ] **Step 5: Run the 1-hour observation only if smoke is successful**
+- [ ] **Step 5: Run the bounded 15-minute observation requested by the user**
 
-Record REST/WS update intervals, request/receive latency, maximum no-update interval, valid BBO and `$1k`/`$5k`/`$10k` VWAP rates, errors/disconnects, and only time-comparable REST/WS price differences.
+After the local probe is stopped and analyzed, run the same read-only probe in a `trading-mini` isolated checkout for 15 minutes. Record REST/WS update intervals, request/receive latency, maximum no-update interval, valid BBO and `$1k`/`$5k`/`$10k` VWAP rates, errors/disconnects, and only time-comparable REST/WS price differences.
 
-- [ ] **Step 6: Start a detached 24-hour observation only if the 1-hour run is healthy**
+- [ ] **Step 6: Do not start a 24-hour observation in this narrowed scope**
 
-Record PID and durable output/log paths. Report it as running unless it has actually completed; stop it if it shows resource pressure or affects Production.
+Report that the bounded 15-minute result does not establish full-session or 24-hour behavior. Do not leave a long-running probe behind.
 
 ### Task 5: Timestamp semantics and deployment-safety checks
 
