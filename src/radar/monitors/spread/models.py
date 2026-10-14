@@ -9,6 +9,9 @@ from typing import Literal
 from radar.models import MarketSnapshot
 
 UTC = timezone.utc
+# Live monitor filters only; archival quote storage retains its normal policy.
+LIVE_QUOTE_MAX_AGE_SECONDS = 3.0
+LIVE_QUOTE_MAX_SKEW_SECONDS = 3.0
 VwapSide = Literal["buy", "sell"]
 
 _VWAP_FIELDS: dict[int, dict[VwapSide, str]] = {
@@ -104,6 +107,40 @@ def is_valid_market_snapshot(
     return 0 <= age_seconds <= stale_after_seconds
 
 
+def is_live_synchronized_pair(
+    long_snapshot: MarketSnapshot,
+    short_snapshot: MarketSnapshot,
+    now: datetime,
+    *,
+    max_age_seconds: float = LIVE_QUOTE_MAX_AGE_SECONDS,
+    max_skew_seconds: float = LIVE_QUOTE_MAX_SKEW_SECONDS,
+) -> bool:
+    """Require two near-contemporaneous local receipt timestamps.
+
+    observed_at does not guarantee exchange-source freshness for REST books.
+    """
+    if (
+        not math.isfinite(max_age_seconds)
+        or max_age_seconds <= 0
+        or not math.isfinite(max_skew_seconds)
+        or max_skew_seconds < 0
+    ):
+        raise ValueError("live quote age/skew limits must be finite and valid")
+    current_time = _as_utc(now, "now")
+    try:
+        long_at = _as_utc(long_snapshot.observed_at, "long_observed_at")
+        short_at = _as_utc(short_snapshot.observed_at, "short_observed_at")
+    except ValueError:
+        return False
+    long_age = (current_time - long_at).total_seconds()
+    short_age = (current_time - short_at).total_seconds()
+    return (
+        0 <= long_age <= max_age_seconds
+        and 0 <= short_age <= max_age_seconds
+        and abs((long_at - short_at).total_seconds()) <= max_skew_seconds
+    )
+
+
 def _fee_for(venue: str, fees_bps: Mapping[str, float]) -> float | None:
     for configured_venue, value in fees_bps.items():
         if not isinstance(configured_venue, str) or configured_venue.lower() != venue.lower():
@@ -127,6 +164,8 @@ def build_spread_candidates(
     fees_bps: Mapping[str, float],
     top_n: int | None = None,
     require_fees: bool = True,
+    live_quote_max_age_seconds: float | None = None,
+    live_quote_max_skew_seconds: float = LIVE_QUOTE_MAX_SKEW_SECONDS,
 ) -> tuple[SpreadCandidate, ...]:
     """Build every valid directional cross-venue pair.
 
@@ -138,6 +177,13 @@ def build_spread_candidates(
     current_time = _as_utc(now, "now")
     if stale_after_seconds <= 0:
         raise ValueError("stale_after_seconds must be positive")
+    if live_quote_max_age_seconds is not None and (
+        not math.isfinite(live_quote_max_age_seconds)
+        or live_quote_max_age_seconds <= 0
+        or not math.isfinite(live_quote_max_skew_seconds)
+        or live_quote_max_skew_seconds < 0
+    ):
+        raise ValueError("live quote age/skew limits must be finite and valid")
 
     grouped: dict[str, list[MarketSnapshot]] = {}
     for snapshot in snapshots:
@@ -180,6 +226,14 @@ def build_spread_candidates(
                 except ValueError:
                     continue
                 if long_sample_time != short_sample_time:
+                    continue
+                if live_quote_max_age_seconds is not None and not is_live_synchronized_pair(
+                    long_snapshot,
+                    short_snapshot,
+                    current_time,
+                    max_age_seconds=live_quote_max_age_seconds,
+                    max_skew_seconds=live_quote_max_skew_seconds,
+                ):
                     continue
                 short_fee = _fee_for(short_snapshot.venue, fees_bps)
                 if require_fees and short_fee is None:

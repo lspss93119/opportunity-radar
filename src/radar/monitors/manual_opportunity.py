@@ -12,7 +12,12 @@ from typing import Any
 from radar.config import ManualOpportunityConfig
 from radar.models import MarketSnapshot
 from radar.monitors.base import AlertRequest, JSONValue
-from radar.monitors.spread.models import SpreadPairKey
+from radar.monitors.spread.models import (
+    SpreadPairKey,
+    LIVE_QUOTE_MAX_AGE_SECONDS,
+    LIVE_QUOTE_MAX_SKEW_SECONDS,
+    is_live_synchronized_pair,
+)
 from radar.state import RadarState
 from radar.storage.sqlite import SQLiteRuntimeStore
 
@@ -1182,6 +1187,8 @@ class ManualOpportunityMonitor:
         runtime_store: SQLiteRuntimeStore | None = None,
         interval_seconds: int = 10,
         stale_after_seconds: int = DEFAULT_MANUAL_STALE_AFTER_SECONDS,
+        live_quote_max_age_seconds: float = LIVE_QUOTE_MAX_AGE_SECONDS,
+        live_quote_max_skew_seconds: float = LIVE_QUOTE_MAX_SKEW_SECONDS,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
@@ -1190,6 +1197,15 @@ class ManualOpportunityMonitor:
         self._fees_bps = dict(fees_bps)
         self._runtime_store = runtime_store
         self._stale_after_seconds = stale_after_seconds
+        if (
+            not math.isfinite(live_quote_max_age_seconds)
+            or live_quote_max_age_seconds <= 0
+            or not math.isfinite(live_quote_max_skew_seconds)
+            or live_quote_max_skew_seconds < 0
+        ):
+            raise ValueError("invalid live quote age/skew limits")
+        self._live_quote_max_age_seconds = live_quote_max_age_seconds
+        self._live_quote_max_skew_seconds = live_quote_max_skew_seconds
         self._histories: dict[SpreadPairKey, Any] = {}
         self._notification_gate = ManualOpportunityNotificationGate(
             config,
@@ -1270,6 +1286,14 @@ class ManualOpportunityMonitor:
                         ):
                             continue
                         if long_snapshot.sample_time != short_snapshot.sample_time:
+                            continue
+                        if not is_live_synchronized_pair(
+                            long_snapshot,
+                            short_snapshot,
+                            current_time,
+                            max_age_seconds=self._live_quote_max_age_seconds,
+                            max_skew_seconds=self._live_quote_max_skew_seconds,
+                        ):
                             continue
                         long_context = context_by_key.get(
                             (long_venue, long_symbol, canonical_symbol)
