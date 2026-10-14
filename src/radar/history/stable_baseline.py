@@ -285,23 +285,30 @@ def scan(factory: Callable[[], Iterator[Quote]], *,
     rows = []
     for pair in sorted(pairs):
         own = grouped[pair]
-        net = sum(x["net_usd"] for x in own)
+        # After a feed outage the first restored quote cannot prove that an
+        # earlier exit was executable. Keep it in the audit log, not PnL ranking.
+        scored = [x for x in own if x["exit_reason"] != "data_gap"]
+        net = sum(x["net_usd"] for x in scored)
         stable_days = len(eligible_days[pair])
         rows.append({**asdict(pair), "valid_sample_count": seen[pair],
                      "eligible_signal_days": stable_days, "complete_baseline_days": len(days.get(pair, {})),
-                     "closed_trades": len(own), "open_at_end": int(states[pair].position is not None),
+                     "closed_trades": len(own), "scored_trades": len(scored),
+                     "excluded_gap_exits": len(own) - len(scored),
+                     "open_at_end": int(states[pair].position is not None),
                      "converged_trades": sum(t["exit_reason"] == "converged" for t in own),
-                     "win_rate": sum(t["net_usd"] > 0 for t in own) / len(own) if own else None,
-                     "total_net_usd": net, "mean_net_bps": (sum(t["net_bps_per_leg_notional"] for t in own)/len(own) if own else None),
-                     "median_hold_seconds": median(t["duration_seconds"] for t in own) if own else None,
+                     "win_rate": sum(t["net_usd"] > 0 for t in scored) / len(scored) if scored else None,
+                     "total_net_usd": net, "mean_net_bps": (sum(t["net_bps_per_leg_notional"] for t in scored)/len(scored) if scored else None),
+                     "median_hold_seconds": median(t["duration_seconds"] for t in scored) if scored else None,
                      "status": ("insufficient_history" if not stable_days else
-                                "insufficient_trades" if len(own) < 5 else "research_only")})
+                                "open_at_end" if states[pair].position is not None else
+                                "insufficient_trades" if len(scored) < 5 else "research_only")})
     rows.sort(key=lambda row: (row["status"] != "research_only", -row["total_net_usd"], -row["closed_trades"], row["symbol"]))
     return {"parameters": asdict(params), "pairs": rows,
             "trades": sorted(trades, key=lambda t: (t["entry_utc"], t["symbol"], t["venue_a"])),
             "summary": {"configured_pairs": len(pairs), "observed_pairs": len(seen),
                         "pairs_with_eligible_days": sum(bool(eligible_days[p]) for p in pairs),
                         "closed_trades": len(trades),
+                        "excluded_gap_exits": sum(t["exit_reason"] == "data_gap" for t in trades),
                         "open_positions_at_end": sum(s.position is not None for s in states.values()),
                         "funding_included": False, "fees_are_configured_assumptions": True,
                         "execution_model": "next eligible sample, fixed per-leg VWAP, no partial fills"}}
