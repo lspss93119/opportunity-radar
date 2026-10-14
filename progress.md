@@ -8,3 +8,5 @@ Ruling: Data-quality pair aggregation now joins the exact configured-pair table 
 
 Ruling: The full-history DuckDB sort was replaced by a per-UTC-partition latest-row map for both the V2 valid timeline and quality grids. This preserves duplicate selection and exact sample-time grouping while bounding research memory to one partition; a one-day Production smoke read returned 177,814 pair points in 1.23 seconds with 370 MB peak RSS.
 
+Ruling: The first successful output exposed that total 10-second valid slots cannot be subtracted from 60-second valid slots because the grids have a 6x observation count. Sampling-loss attribution is corrected to compare only 10-second observations whose timestamps lie on the same 60-second grid; the full scan will be rerun so the delivered CSV does not overstate minute-sampling loss.
+

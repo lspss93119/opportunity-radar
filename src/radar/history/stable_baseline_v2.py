@@ -996,6 +996,7 @@ def _scan_quality_grid(
     sample_seconds: int,
     size_usd: int = 1000,
     max_quote_age_seconds: int = 12,
+    coarse_sample_seconds: int | None = None,
 ) -> tuple[
     dict[tuple[str, str, str], int],
     dict[tuple[str, str, str], dict[str, object]],
@@ -1023,6 +1024,8 @@ def _scan_quality_grid(
             "valid_sync_3": 0,
             "valid_sync_5": 0,
             "valid_sync_10": 0,
+            "common_coarse": 0,
+            "valid_sync_coarse": 0,
         }
         for pair in pairs
     }
@@ -1123,6 +1126,12 @@ def _scan_quality_grid(
                         continue
                     stats = pair_stats[pair]
                     stats["common_slots"] += 1
+                    on_coarse_grid = (
+                        coarse_sample_seconds is not None
+                        and int(timestamp.timestamp()) % coarse_sample_seconds == 0
+                    )
+                    if on_coarse_grid:
+                        stats["common_coarse"] += 1
                     valid_a = _quality_vwap_valid(a)
                     valid_b = _quality_vwap_valid(b)
                     if not valid_a or not valid_b:
@@ -1152,6 +1161,8 @@ def _scan_quality_grid(
                         stats["skew_3_slots"] += 1
                     if skew <= 3:
                         stats["valid_sync_3"] += 1
+                        if on_coarse_grid:
+                            stats["valid_sync_coarse"] += 1
                     if skew <= 5:
                         stats["valid_sync_5"] += 1
                     if skew <= 10:
@@ -1174,6 +1185,7 @@ def collect_data_quality(
     )
     raw_10, latest_10, pair_10 = _scan_quality_grid(
         files, configured, sample_seconds=params.raw_sample_seconds,
+        coarse_sample_seconds=params.sample_seconds,
     )
 
     pairs = configured_pairs(configured)
@@ -1211,10 +1223,12 @@ def collect_data_quality(
         union_slots = count_a + count_b - common
         valid_60 = int(stats.get("valid_sync_3", 0))
         valid_10 = int(stats10.get("valid_sync_3", 0))
+        valid_10_coarse = int(stats10.get("valid_sync_coarse", 0))
         pair_metrics[pair] = {
             "pair_id": _pair_id(pair),
             "valid_sync_samples": valid_60,
             "valid_sync_samples_10s": valid_10,
+            "valid_sync_samples_10s_on_60s_grid": valid_10_coarse,
             "sampling_loss_slots": max(valid_10 - valid_60, 0),
             "pair_union_slots": union_slots,
             "missing_leg_slots": max(union_slots - common, 0),
@@ -1236,7 +1250,8 @@ def collect_data_quality(
             ("valid_sync_slots_5s", int(stats.get("valid_sync_5", 0)), common, "sensitivity only; not used for canonical ranking"),
             ("valid_sync_slots_10s_skew", int(stats.get("valid_sync_10", 0)), common, "sensitivity only; not used for canonical ranking"),
             ("valid_sync_slots_10s_sample", valid_10, int(stats10.get("common_slots", 0)), "10s raw sample grid with canonical 3s skew"),
-            ("sampling_loss_slots_60s_vs_10s", max(valid_10 - valid_60, 0), valid_10, "valid 10s opportunities absent from 60s grid"),
+            ("valid_sync_slots_10s_on_60s_grid", valid_10_coarse, int(stats10.get("common_coarse", 0)), "10s read evaluated at the same 60s sample timestamps"),
+            ("sampling_loss_slots_60s_vs_10s", max(valid_10_coarse - valid_60, 0), valid_10_coarse, "valid 10s observations at 60s timestamps absent from the canonical 60s result"),
             ("sample_time_mismatch_slots", 0, common, "60s query is exact sample_time; no mismatch observed in aligned slot set"),
         )
         for metric, count, denominator, notes in metrics:
@@ -1257,8 +1272,9 @@ def collect_data_quality(
     system_totals["valid_sync_slots_5s"] = sum(int(stats.get("valid_sync_5", 0)) for stats in pair_60.values())
     system_totals["valid_sync_slots_10s_skew"] = sum(int(stats.get("valid_sync_10", 0)) for stats in pair_60.values())
     system_totals["valid_sync_slots_10s_sample"] = sum(int(stats.get("valid_sync_3", 0)) for stats in pair_10.values())
+    system_totals["valid_sync_slots_10s_on_60s_grid"] = sum(int(stats.get("valid_sync_coarse", 0)) for stats in pair_10.values())
     system_totals["sampling_loss_slots_60s_vs_10s"] = sum(
-        max(int(pair_10.get(pair, {}).get("valid_sync_3", 0))
+        max(int(pair_10.get(pair, {}).get("valid_sync_coarse", 0))
             - int(pair_60.get(pair, {}).get("valid_sync_3", 0)), 0)
         for pair in pairs
     )
