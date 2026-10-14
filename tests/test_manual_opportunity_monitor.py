@@ -735,3 +735,53 @@ async def test_manual_monitor_logs_cycle_timing(small_history, tmp_path, caplog)
         "alerts_emitted=",
     ):
         assert field in message
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("long_age", "short_age", "allowed"),
+    [
+        (0.0, 0.0, True),
+        (3.0, 0.0, True),
+        (3.001, 0.0, False),
+        (0.0, 3.001, False),
+        (-0.001, 0.0, False),
+    ],
+)
+async def test_manual_monitor_live_quote_age_boundary(
+    small_history, long_age, short_age, allowed
+):
+    del small_history
+    instance = monitor(confirmation_seconds=0)
+    prime(instance)
+    previous = instance._histories[KEY]._last_sample_time
+    state = state_for(
+        START,
+        long_observed_at=START - timedelta(seconds=long_age),
+        short_observed_at=START - timedelta(seconds=short_age),
+    )
+    await instance.evaluate(START, state)
+    if allowed:
+        assert instance.active_episodes
+        assert instance._histories[KEY]._last_sample_time == START
+    else:
+        assert instance.active_episodes == ()
+        assert instance._histories[KEY]._last_sample_time == previous
+
+
+@pytest.mark.asyncio
+async def test_manual_monitor_rejects_skew_below_individual_age_limit(small_history):
+    del small_history
+    instance = ManualOpportunityMonitor(
+        ManualOpportunityConfig(confirmation_seconds=0),
+        FEES,
+        live_quote_max_age_seconds=10.0,
+        live_quote_max_skew_seconds=3.0,
+    )
+    prime(instance)
+    assert await instance.evaluate(
+        START,
+        state_for(START, long_observed_at=START - timedelta(seconds=4)),
+    ) == []
+    assert instance.active_episodes == ()
