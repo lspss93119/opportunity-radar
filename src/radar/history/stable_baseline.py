@@ -316,7 +316,11 @@ def scan(factory: Callable[[], Iterator[Quote]], *,
 
 def _as_datetime(value: str | datetime) -> datetime:
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return (
+            value.astimezone(UTC)
+            if value.tzinfo is not None
+            else value.replace(tzinfo=UTC)
+        )
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
 
 

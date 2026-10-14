@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from radar.history.stable_baseline import Params, Quote, scan
+from radar.history.stable_baseline import Params, Quote, _as_datetime, scan
 
 FEES = {"a": 0.0, "b": 0.0}
 MARKETS = {("a", "ONE", "ONE"), ("b", "ONE", "ONE")}
@@ -32,6 +32,13 @@ def rows(*, anomaly=155.0, baseline=100.0, bad_skew=False):
 
 def run(data, params=PARAMS, fees=FEES):
     return scan(lambda: iter(data), configured=MARKETS, fees=fees, params=params)
+
+
+def test_datetime_inputs_are_normalized_to_utc():
+    local_time = datetime(2026, 10, 1, 5, 3, tzinfo=timezone(timedelta(hours=8)))
+
+    assert _as_datetime(local_time) == datetime(2026, 9, 30, 21, 3, tzinfo=UTC)
+    assert _as_datetime(local_time).tzinfo == UTC
 
 
 def test_prior_completed_days_only_and_next_tick_execution():
