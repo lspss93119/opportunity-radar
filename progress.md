@@ -6,3 +6,5 @@ Ruling: V2's valid timeline now reuses V1 `csv_or_parquet_quotes` and `_sample_p
 
 Ruling: Data-quality pair aggregation now joins the exact configured-pair table rather than every same-symbol venue combination. This preserves the full configured-pair funnel while avoiding the 10-second all-combination join that exhausted the isolated run's useful runtime. Cost if incorrect: a configured pair could be omitted from attribution; mitigation: the configured-pair table is generated from the same `configured_pairs()` function used for the funnel and the quality fixture regression remains green.
 
+Ruling: The full-history DuckDB sort was replaced by a per-UTC-partition latest-row map for both the V2 valid timeline and quality grids. This preserves duplicate selection and exact sample-time grouping while bounding research memory to one partition; a one-day Production smoke read returned 177,814 pair points in 1.23 seconds with 370 MB peak RSS.
+

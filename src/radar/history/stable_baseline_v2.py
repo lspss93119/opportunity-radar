@@ -15,7 +15,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from itertools import combinations, groupby
+from itertools import combinations
 from pathlib import Path
 from statistics import median
 from zoneinfo import ZoneInfo
@@ -23,10 +23,10 @@ from zoneinfo import ZoneInfo
 from radar.history.stable_baseline import (
     Pair,
     Params as V1Params,
+    Quote,
     _as_datetime,
     _quantile,
     _sample_pairs,
-    csv_or_parquet_quotes,
 )
 
 
@@ -66,6 +66,17 @@ class AnalysisParams:
 class MarketObservation:
     sample_time: datetime
     observed_at: datetime
+    venue: str
+    venue_symbol: str
+    symbol: str
+    buy: float | None
+    sell: float | None
+
+
+@dataclass(frozen=True)
+class QualityObservation:
+    sample_time: datetime
+    observed_at: datetime | None
     venue: str
     venue_symbol: str
     symbol: str
@@ -946,6 +957,210 @@ def _metric_row(
     }
 
 
+def _quality_vwap_valid(observation: QualityObservation) -> bool:
+    return (
+        observation.buy is not None
+        and observation.sell is not None
+        and math.isfinite(observation.buy)
+        and math.isfinite(observation.sell)
+        and observation.buy > 0
+        and observation.sell > 0
+        and observation.buy >= observation.sell
+    )
+
+
+def _quality_time_valid(
+    observation: QualityObservation,
+    *,
+    max_quote_age_seconds: int,
+) -> bool:
+    if observation.observed_at is None:
+        return False
+    age = (observation.sample_time - observation.observed_at).total_seconds()
+    return 0 <= age <= max_quote_age_seconds
+
+
+def _quality_partition_groups(files: list[str]) -> list[list[str]]:
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for file_path in files:
+        parent = Path(file_path).parent.name
+        day_key = parent.removeprefix("date=") if parent.startswith("date=") else parent
+        grouped[day_key].append(file_path)
+    return [sorted(grouped[key]) for key in sorted(grouped)]
+
+
+def _scan_quality_grid(
+    files: list[str],
+    configured: set[tuple[str, str, str]],
+    *,
+    sample_seconds: int,
+    size_usd: int = 1000,
+    max_quote_age_seconds: int = 12,
+) -> tuple[
+    dict[tuple[str, str, str], int],
+    dict[tuple[str, str, str], dict[str, object]],
+    dict[Pair, dict[str, int]],
+]:
+    """Attribute one sampling grid with bounded per-partition memory.
+
+    This is deliberately Python-side after a filtered, unordered Parquet read:
+    each day retains only the latest duplicate for each configured market and
+    sample slot, then derives pair causes from exact common timestamps.  It
+    avoids a full-history SQL window/self-join while preserving the same
+    latest-row and exact-slot semantics.
+    """
+
+    import duckdb  # type: ignore[import-untyped]
+
+    pairs = configured_pairs(configured)
+    pair_stats: dict[Pair, dict[str, int]] = {
+        pair: {
+            "common_slots": 0,
+            "invalid_vwap_slots": 0,
+            "after_sample_slots": 0,
+            "stale_slots": 0,
+            "skew_3_slots": 0,
+            "valid_sync_3": 0,
+            "valid_sync_5": 0,
+            "valid_sync_10": 0,
+        }
+        for pair in pairs
+    }
+    raw_counts: Counter[tuple[str, str, str]] = Counter()
+    market_stats: dict[tuple[str, str, str], dict[str, object]] = {
+        market: {
+            "sample_slots": 0,
+            "valid_vwap_slots": 0,
+            "after_sample_slots": 0,
+            "stale_slots": 0,
+            "first_utc": None,
+            "last_utc": None,
+        }
+        for market in configured
+    }
+    buy = f"buy_{size_usd // 1000}k_vwap"
+    sell = f"sell_{size_usd // 1000}k_vwap"
+    for partition_files in _quality_partition_groups(files):
+        connection = duckdb.connect()
+        connection.execute("PRAGMA threads=2")
+        connection.execute("PRAGMA enable_progress_bar=false")
+        try:
+            values = [value for row in sorted(configured) for value in row]
+            connection.execute(
+                "CREATE TEMP TABLE configured_markets "
+                "(venue VARCHAR, venue_symbol VARCHAR, canonical_symbol VARCHAR)"
+            )
+            if values:
+                placeholders = ", ".join("(?, ?, ?)" for _ in configured)
+                connection.execute(
+                    f"INSERT INTO configured_markets VALUES {placeholders}", values
+                )
+            cursor = connection.execute(
+                f"""
+                SELECT CAST(r.sample_time AS TIMESTAMPTZ),
+                       CAST(r.observed_at AS TIMESTAMPTZ),
+                       r.venue, r.venue_symbol, r.canonical_symbol,
+                       r.{buy}, r.{sell}
+                FROM read_parquet(?, union_by_name=true) AS r
+                INNER JOIN configured_markets AS c
+                    ON c.venue = r.venue
+                   AND c.venue_symbol = r.venue_symbol
+                   AND c.canonical_symbol = r.canonical_symbol
+                WHERE CAST(EXTRACT(EPOCH FROM CAST(r.sample_time AS TIMESTAMPTZ)) AS BIGINT) % ? = 0
+                """,
+                [partition_files, sample_seconds],
+            )
+            latest: dict[datetime, dict[tuple[str, str, str], QualityObservation]] = defaultdict(dict)
+            while chunk := cursor.fetchmany(8192):
+                for sample_time, observed_at, venue, venue_symbol, symbol, buy_price, sell_price in chunk:
+                    market = (str(venue), str(venue_symbol), str(symbol))
+                    raw_counts[market] += 1
+                    try:
+                        timestamp = _as_datetime(sample_time)
+                        observed = _as_datetime(observed_at) if observed_at is not None else None
+                        observation = QualityObservation(
+                            sample_time=timestamp,
+                            observed_at=observed,
+                            venue=market[0],
+                            venue_symbol=market[1],
+                            symbol=market[2],
+                            buy=float(buy_price) if buy_price is not None else None,
+                            sell=float(sell_price) if sell_price is not None else None,
+                        )
+                    except (ValueError, TypeError, OverflowError, AttributeError):
+                        continue
+                    previous = latest[timestamp].get(market)
+                    previous_key = (
+                        previous.observed_at if previous is not None else None
+                    )
+                    if previous is None or (
+                        observation.observed_at is not None
+                        and (previous_key is None or observation.observed_at > previous_key)
+                    ):
+                        latest[timestamp][market] = observation
+            for timestamp, observations in latest.items():
+                for market, observation in observations.items():
+                    stats = market_stats[market]
+                    stats["sample_slots"] = int(stats["sample_slots"]) + 1
+                    if _quality_vwap_valid(observation):
+                        stats["valid_vwap_slots"] = int(stats["valid_vwap_slots"]) + 1
+                    if observation.observed_at is not None and observation.observed_at > timestamp:
+                        stats["after_sample_slots"] = int(stats["after_sample_slots"]) + 1
+                    if (
+                        observation.observed_at is not None
+                        and observation.observed_at <= timestamp
+                        and (timestamp - observation.observed_at).total_seconds() > max_quote_age_seconds
+                    ):
+                        stats["stale_slots"] = int(stats["stale_slots"]) + 1
+                    first = stats["first_utc"]
+                    last = stats["last_utc"]
+                    stats["first_utc"] = timestamp if first is None or timestamp < first else first
+                    stats["last_utc"] = timestamp if last is None or timestamp > last else last
+                for pair in pairs:
+                    a = observations.get((pair.venue_a, pair.symbol_a, pair.symbol))
+                    b = observations.get((pair.venue_b, pair.symbol_b, pair.symbol))
+                    if a is None or b is None:
+                        continue
+                    stats = pair_stats[pair]
+                    stats["common_slots"] += 1
+                    valid_a = _quality_vwap_valid(a)
+                    valid_b = _quality_vwap_valid(b)
+                    if not valid_a or not valid_b:
+                        stats["invalid_vwap_slots"] += 1
+                    after_a = a.observed_at is not None and a.observed_at > timestamp
+                    after_b = b.observed_at is not None and b.observed_at > timestamp
+                    if after_a or after_b:
+                        stats["after_sample_slots"] += 1
+                    stale_a = (
+                        a.observed_at is not None and a.observed_at <= timestamp
+                        and (timestamp - a.observed_at).total_seconds() > max_quote_age_seconds
+                    )
+                    stale_b = (
+                        b.observed_at is not None and b.observed_at <= timestamp
+                        and (timestamp - b.observed_at).total_seconds() > max_quote_age_seconds
+                    )
+                    if stale_a or stale_b:
+                        stats["stale_slots"] += 1
+                    if not (
+                        valid_a and valid_b
+                        and _quality_time_valid(a, max_quote_age_seconds=max_quote_age_seconds)
+                        and _quality_time_valid(b, max_quote_age_seconds=max_quote_age_seconds)
+                    ):
+                        continue
+                    skew = abs((a.observed_at - b.observed_at).total_seconds())
+                    if skew > 3:
+                        stats["skew_3_slots"] += 1
+                    if skew <= 3:
+                        stats["valid_sync_3"] += 1
+                    if skew <= 5:
+                        stats["valid_sync_5"] += 1
+                    if skew <= 10:
+                        stats["valid_sync_10"] += 1
+        finally:
+            connection.close()
+    return raw_counts, market_stats, pair_stats
+
+
 def collect_data_quality(
     files: list[str],
     configured: set[tuple[str, str, str]],
@@ -954,30 +1169,12 @@ def collect_data_quality(
 ) -> tuple[list[dict[str, object]], dict[Pair, dict[str, object]]]:
     """Attribute 60s losses and compare valid 10s versus 60s pair slots."""
 
-    import duckdb  # type: ignore[import-untyped]
-
-    connection = duckdb.connect()
-    connection.execute("PRAGMA threads=2")
-    try:
-        _create_configured_table(connection, configured)
-        _create_configured_pairs_table(connection, configured)
-        raw_60 = _market_source_counts(connection, files, params.sample_seconds)
-        _create_latest_table(
-            connection, files, table_name="latest_60", configured=configured,
-            sample_seconds=params.sample_seconds,
-        )
-        latest_60 = _market_latest_stats(connection, "latest_60")
-        pair_60 = _pair_latest_stats(connection, "latest_60")
-        connection.execute("DROP TABLE latest_60")
-        raw_10 = _market_source_counts(connection, files, params.raw_sample_seconds)
-        _create_latest_table(
-            connection, files, table_name="latest_10", configured=configured,
-            sample_seconds=params.raw_sample_seconds,
-        )
-        latest_10 = _market_latest_stats(connection, "latest_10")
-        pair_10 = _pair_latest_stats(connection, "latest_10")
-    finally:
-        connection.close()
+    raw_60, latest_60, pair_60 = _scan_quality_grid(
+        files, configured, sample_seconds=params.sample_seconds,
+    )
+    raw_10, latest_10, pair_10 = _scan_quality_grid(
+        files, configured, sample_seconds=params.raw_sample_seconds,
+    )
 
     pairs = configured_pairs(configured)
     quality_rows: list[dict[str, object]] = []
@@ -1090,21 +1287,6 @@ def _is_us_equity_pair(pair: Pair) -> bool:
     return ".US_" in pair.symbol_a or ".US_" in pair.symbol_b
 
 
-def _iter_pair_groups(
-    files: list[str],
-    configured: set[tuple[str, str, str]],
-    *,
-    size_usd: int,
-    sample_seconds: int,
-) -> Iterator[tuple[Pair, list[PairPoint]]]:
-    stream = iter_pair_points(
-        files, configured=configured, size_usd=size_usd,
-        sample_seconds=sample_seconds,
-    )
-    for pair, group in groupby(stream, key=lambda point: point.pair):
-        yield pair, list(group)
-
-
 def _episode_row(episode: AnomalyEpisode, *, size_usd: int, record_type: str = "episode") -> dict[str, object]:
     return {
         "record_type": record_type,
@@ -1176,15 +1358,39 @@ def _collect_size_analysis(
     histories: dict[Pair, dict[str, dict[date, DailySeries]]] = {
         pair: {"all": {}} for pair in pairs
     }
-    for pair, points in _iter_pair_groups(
-        files, configured, size_usd=size_usd, sample_seconds=params.sample_seconds
+    values_by_pair: dict[Pair, dict[str, dict[date, dict[str, list[float]]]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
+    for point in iter_pair_points(
+        files, configured=configured, size_usd=size_usd,
+        sample_seconds=params.sample_seconds,
     ):
-        histories[pair]["all"] = build_daily_series(iter(points), params=params)
-        if _is_us_equity_pair(pair):
-            for regime in ("us_regular", "us_extended", "us_closed"):
-                histories[pair][regime] = build_daily_series(
-                    iter(points), params=params, regime=regime
+        if not _attribute_pair_slot(point, params).valid_sync:
+            continue
+        regimes = ["all"]
+        if _is_us_equity_pair(point.pair):
+            regimes.extend(("us_regular", "us_extended", "us_closed"))
+        basis_values = _basis_values(point)
+        for regime in regimes:
+            if regime != "all" and us_session_regime(point.sample_time) != regime:
+                continue
+            day_values = values_by_pair[point.pair][regime].setdefault(
+                point.sample_time.date(), {basis: [] for basis in BASIS_TYPES}
+            )
+            for basis, value in basis_values.items():
+                day_values[basis].append(value)
+    for pair in pairs:
+        for regime, values_by_day in values_by_pair[pair].items():
+            expected = 86400 / params.sample_seconds
+            histories[pair][regime] = {
+                day: DailySeries(
+                    day=day,
+                    values={basis: tuple(day_values[basis]) for basis in BASIS_TYPES},
+                    sample_count=len(day_values["mid"]),
+                    coverage=len(day_values["mid"]) / expected,
                 )
+                for day, day_values in values_by_day.items()
+            }
     baseline_rows: list[dict[str, object]] = []
     for pair in pairs:
         for regime, history in histories[pair].items():
@@ -1211,22 +1417,157 @@ def _collect_size_analysis(
         }
 
     episodes: list[AnomalyEpisode] = []
-    summary_rows: list[dict[str, object]] = []
-    for pair, points in _iter_pair_groups(
-        files, configured, size_usd=size_usd, sample_seconds=params.sample_seconds
+    detector_states: dict[tuple[Pair, str, float, int], dict[str, object]] = {}
+
+    def finish(
+        state: dict[str, object], *, basis_type: str, threshold: float,
+        direction: int, status: str, end: datetime, gap_seconds: float = 0.0,
+    ) -> None:
+        active = state["active"]
+        if active is None:
+            return
+        active = dict(active)
+        start = active["start"]
+        convergence_time = active["convergence_time"]
+        duration_seconds = (end - start).total_seconds()
+        convergence_seconds = (
+            (convergence_time - start).total_seconds()
+            if convergence_time is not None else None
+        )
+        censored = status.startswith("censored")
+        episodes.append(AnomalyEpisode(
+            pair=active["pair"], basis_type=basis_type,
+            threshold_bps=threshold, direction=direction,
+            start=start, end=end, baseline_bps=active["baseline_bps"],
+            peak_deviation_bps=active["peak_deviation_bps"],
+            sample_count=active["sample_count"], confirmed=active["confirmed"],
+            status=status, convergence_seconds=convergence_seconds,
+            converged_15m=_convergence_flag(
+                convergence_seconds=convergence_seconds,
+                duration_seconds=duration_seconds, window_seconds=900,
+                censored=censored,
+            ),
+            converged_1h=_convergence_flag(
+                convergence_seconds=convergence_seconds,
+                duration_seconds=duration_seconds, window_seconds=3600,
+                censored=censored,
+            ),
+            converged_4h=_convergence_flag(
+                convergence_seconds=convergence_seconds,
+                duration_seconds=duration_seconds, window_seconds=14400,
+                censored=censored,
+            ),
+            gap_seconds=gap_seconds,
+            max_adverse_deviation_bps=active["peak_deviation_bps"],
+            regime="all",
+        ))
+        state["active"] = None
+
+    for point in iter_pair_points(
+        files, configured=configured, size_usd=size_usd,
+        sample_seconds=params.sample_seconds,
     ):
+        references = baseline_by_pair.get(point.pair, {})
+        if not references:
+            continue
+        assessment = _attribute_pair_slot(point, params)
+        if not assessment.valid_sync:
+            continue
+        timestamp = point.sample_time
+        reference = references.get(timestamp.date())
+        basis_values = _basis_values(point)
+        for basis_type in BASIS_TYPES:
+            value = basis_values[basis_type]
+            for direction in (1, -1):
+                for threshold in thresholds:
+                    key = (point.pair, basis_type, threshold, direction)
+                    state = detector_states.setdefault(
+                        key, {"active": None, "last_valid_time": None}
+                    )
+                    last_valid_time = state["last_valid_time"]
+                    if last_valid_time is not None:
+                        gap_seconds = (timestamp - last_valid_time).total_seconds()
+                        if gap_seconds > params.max_gap_seconds and state["active"] is not None:
+                            finish(
+                                state, basis_type=basis_type, threshold=threshold,
+                                direction=direction, status="censored_data_gap",
+                                end=last_valid_time, gap_seconds=gap_seconds,
+                            )
+                    state["last_valid_time"] = timestamp
+                    if reference is None or not reference.stable:
+                        if state["active"] is not None:
+                            finish(
+                                state, basis_type=basis_type, threshold=threshold,
+                                direction=direction, status="censored_baseline",
+                                end=timestamp,
+                            )
+                        continue
+                    directed_deviation = direction * (value - reference.baseline_bps)
+                    active = state["active"]
+                    if active is not None:
+                        active["peak_deviation_bps"] = max(
+                            active["peak_deviation_bps"], directed_deviation
+                        )
+                        active["sample_count"] += 1
+                        previous_event_time = active["last_event_time"]
+                        if ((timestamp - previous_event_time).total_seconds()
+                                <= params.sample_seconds):
+                            active["confirmation_count"] += 1
+                        else:
+                            active["confirmation_count"] = 1
+                        active["last_event_time"] = timestamp
+                        active["confirmed"] = active["confirmation_count"] >= 2
+                        if abs(value - reference.baseline_bps) <= params.return_band_bps:
+                            active["convergence_time"] = timestamp
+                            finish(
+                                state, basis_type=basis_type, threshold=threshold,
+                                direction=direction, status="converged", end=timestamp,
+                            )
+                        elif directed_deviation < threshold:
+                            finish(
+                                state, basis_type=basis_type, threshold=threshold,
+                                direction=direction, status="no_convergence", end=timestamp,
+                            )
+                        continue
+                    if directed_deviation >= threshold:
+                        state["active"] = {
+                            "pair": point.pair,
+                            "start": timestamp,
+                            "baseline_bps": reference.baseline_bps,
+                            "peak_deviation_bps": directed_deviation,
+                            "sample_count": 1,
+                            "confirmation_count": 1,
+                            "confirmed": False,
+                            "last_event_time": timestamp,
+                            "convergence_time": None,
+                        }
+    for (pair, basis_type, threshold, direction), state in detector_states.items():
+        if state["active"] is not None and state["last_valid_time"] is not None:
+            finish(
+                state, basis_type=basis_type, threshold=threshold,
+                direction=direction, status="censored_end",
+                end=state["last_valid_time"],
+            )
+
+    episodes.sort(key=lambda episode: (
+        episode.pair, episode.start, episode.basis_type,
+        episode.threshold_bps, episode.direction,
+    ))
+    summary_rows: list[dict[str, object]] = []
+    for pair in pairs:
         references = baseline_by_pair.get(pair, {})
         if not references:
             continue
         for basis_type in BASIS_TYPES:
             for direction in (1, -1):
                 for threshold in thresholds:
-                    current = detect_episodes(
-                        iter(points), baseline_by_day=references,
-                        basis_type=basis_type, threshold_bps=threshold,
-                        direction=direction, params=params,
-                    )
-                    episodes.extend(current)
+                    current = [
+                        episode for episode in episodes
+                        if episode.pair == pair
+                        and episode.basis_type == basis_type
+                        and episode.threshold_bps == threshold
+                        and episode.direction == direction
+                    ]
                     summary_rows.append(_summary_row(
                         pair, basis_type=basis_type, threshold_bps=threshold,
                         direction=direction, size_usd=size_usd,
@@ -1533,6 +1874,84 @@ def _append_candidate_quality_rows(
             ))
 
 
+def _partition_quotes(
+    files: list[str],
+    *,
+    configured: set[tuple[str, str, str]],
+    size_usd: int,
+    sample_seconds: int,
+) -> Iterator[Quote]:
+    """Read one UTC partition without a global DuckDB sort.
+
+    A partition is small enough to materialize only its latest duplicate per
+    market/sample slot in Python.  This keeps the V1 ordering contract for
+    ``_sample_pairs`` while bounding DuckDB's sort memory to one partition.
+    """
+
+    import duckdb  # type: ignore[import-untyped]
+
+    buy = f"buy_{size_usd // 1000}k_vwap"
+    sell = f"sell_{size_usd // 1000}k_vwap"
+    connection = duckdb.connect()
+    connection.execute("PRAGMA enable_progress_bar=false")
+    try:
+        placeholders = ", ".join("(?, ?, ?)" for _ in configured)
+        values = [value for row in sorted(configured) for value in row]
+        connection.execute(
+            "CREATE TEMP TABLE configured_markets "
+            "(venue VARCHAR, venue_symbol VARCHAR, canonical_symbol VARCHAR)"
+        )
+        if values:
+            connection.execute(
+                f"INSERT INTO configured_markets VALUES {placeholders}", values
+            )
+        cursor = connection.execute(
+            f"""
+            SELECT CAST(r.sample_time AS TIMESTAMPTZ),
+                   CAST(r.observed_at AS TIMESTAMPTZ),
+                   r.venue, r.venue_symbol, r.canonical_symbol,
+                   r.{buy}, r.{sell}
+            FROM read_parquet(?, union_by_name=true) AS r
+            INNER JOIN configured_markets AS c
+                ON c.venue = r.venue
+               AND c.venue_symbol = r.venue_symbol
+               AND c.canonical_symbol = r.canonical_symbol
+            WHERE CAST(EXTRACT(EPOCH FROM CAST(r.sample_time AS TIMESTAMPTZ)) AS BIGINT) % ? = 0
+            """,
+            [files, sample_seconds],
+        )
+        latest: dict[datetime, dict[tuple[str, str, str], Quote]] = defaultdict(dict)
+        while chunk := cursor.fetchmany(8192):
+            for sample_time, observed_at, venue, venue_symbol, symbol, buy_price, sell_price in chunk:
+                try:
+                    timestamp = _as_datetime(sample_time)
+                    observed = _as_datetime(observed_at)
+                    quote = Quote(
+                        sample_time=timestamp,
+                        observed_at=observed,
+                        venue=str(venue),
+                        venue_symbol=str(venue_symbol),
+                        symbol=str(symbol),
+                        buy=float(buy_price),
+                        sell=float(sell_price),
+                    )
+                except (ValueError, TypeError, OverflowError, AttributeError):
+                    continue
+                market = (quote.venue, quote.venue_symbol, quote.symbol)
+                previous = latest[timestamp].get(market)
+                if previous is None or previous.observed_at < quote.observed_at:
+                    latest[timestamp][market] = quote
+        for timestamp in sorted(latest):
+            yield from sorted(
+                latest[timestamp].values(),
+                key=lambda quote: (
+                    quote.symbol, quote.venue, quote.venue_symbol, quote.observed_at,
+                ),
+            )
+    finally:
+        connection.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     from radar.config import load_config
 
@@ -1609,10 +2028,6 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 def iter_pair_points(
     files: list[str],
     *,
@@ -1645,30 +2060,44 @@ def iter_pair_points(
         max_skew_seconds=3,
         max_gap_seconds=120,
     )
-    for timestamp, pair, quote_a, quote_b in _sample_pairs(
-        csv_or_parquet_quotes(files, size_usd=size_usd, sample_seconds=sample_seconds),
-        v1_params,
-        configured,
-    ):
-        yield PairPoint(
-            sample_time=_as_datetime(timestamp),
-            pair=pair,
-            a=MarketObservation(
-                sample_time=_as_datetime(quote_a.sample_time),
-                observed_at=_as_datetime(quote_a.observed_at),
-                venue=quote_a.venue,
-                venue_symbol=quote_a.venue_symbol,
-                symbol=quote_a.symbol,
-                buy=quote_a.buy,
-                sell=quote_a.sell,
+    files_by_day: dict[str, list[str]] = defaultdict(list)
+    for file_path in files:
+        parent = Path(file_path).parent.name
+        day_key = parent.removeprefix("date=") if parent.startswith("date=") else parent
+        files_by_day[day_key].append(file_path)
+    for day_key in sorted(files_by_day):
+        day_files = sorted(files_by_day[day_key])
+        for timestamp, pair, quote_a, quote_b in _sample_pairs(
+            _partition_quotes(
+                day_files, configured=configured, size_usd=size_usd,
+                sample_seconds=sample_seconds,
             ),
-            b=MarketObservation(
-                sample_time=_as_datetime(quote_b.sample_time),
-                observed_at=_as_datetime(quote_b.observed_at),
-                venue=quote_b.venue,
-                venue_symbol=quote_b.venue_symbol,
-                symbol=quote_b.symbol,
-                buy=quote_b.buy,
-                sell=quote_b.sell,
-            ),
-        )
+            v1_params,
+            configured,
+        ):
+            yield PairPoint(
+                sample_time=_as_datetime(timestamp),
+                pair=pair,
+                a=MarketObservation(
+                    sample_time=_as_datetime(quote_a.sample_time),
+                    observed_at=_as_datetime(quote_a.observed_at),
+                    venue=quote_a.venue,
+                    venue_symbol=quote_a.venue_symbol,
+                    symbol=quote_a.symbol,
+                    buy=quote_a.buy,
+                    sell=quote_a.sell,
+                ),
+                b=MarketObservation(
+                    sample_time=_as_datetime(quote_b.sample_time),
+                    observed_at=_as_datetime(quote_b.observed_at),
+                    venue=quote_b.venue,
+                    venue_symbol=quote_b.venue_symbol,
+                    symbol=quote_b.symbol,
+                    buy=quote_b.buy,
+                    sell=quote_b.sell,
+                ),
+            )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
