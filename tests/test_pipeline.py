@@ -1171,6 +1171,32 @@ async def test_pipeline_hands_collected_batch_to_optional_storage(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_archive_keeps_smaller_vwap_tiers_without_weakening_live_gate(tmp_path):
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="BTC",
+        bids=(BookLevel(price=99.0, base_size=50.0),),
+        asks=(BookLevel(price=101.0, base_size=50.0),),
+        observed_at=NOW,
+    )
+    storage = ParquetStorage(tmp_path / "data")
+    pipeline = MarketDataPipeline(
+        [],
+        RadarState(),
+        markets=(MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),),
+        latest_market_data=latest,
+        storage=storage,
+    )
+
+    live_batch = await pipeline.collect_once(now=NOW)
+
+    assert live_batch.market_snapshots == ()
+    assert storage.pending_count == 1
+    assert pipeline.flush_storage(now=NOW) == 1
+
+
+@pytest.mark.asyncio
 async def test_pipeline_delays_hourly_context_until_after_grace_and_repeats_per_hour():
     collector = CadenceCollector()
     pipeline = MarketDataPipeline([collector], RadarState(), sampling_seconds=10)
