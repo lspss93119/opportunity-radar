@@ -66,11 +66,27 @@ def make_state(
     return state
 
 
+def state_at(state: RadarState, when: datetime) -> RadarState:
+    """Advance a replay fixture to the live sample boundary being evaluated."""
+    return make_state(
+        *(
+            snapshot.model_copy(
+                update={"sample_time": when, "observed_at": when}
+            )
+            for snapshot in state.markets
+        ),
+        funding=tuple(
+            funding_snapshot.model_copy(update={"observed_at": when})
+            for funding_snapshot in state.funding
+        ),
+    )
+
+
 def make_monitor(
     *,
     runtime_store: SQLiteRuntimeStore | None = None,
     fees_bps: dict[str, float] | None = None,
-    live_quote_max_age_seconds: float = 300.0,
+    live_quote_max_age_seconds: float = 3.0,
     live_quote_max_skew_seconds: float = 3.0,
     **overrides: object,
 ) -> SpreadMonitor:
@@ -92,7 +108,6 @@ def make_monitor(
         basis_window_seconds=12_000,
         basis_min_observations=4,
         basis_expected_interval_seconds=10,
-        # Legacy episode tests deliberately reuse frozen observations over time.
         live_quote_max_age_seconds=live_quote_max_age_seconds,
         live_quote_max_skew_seconds=live_quote_max_skew_seconds,
     )
@@ -263,7 +278,9 @@ async def test_persistence_failure_removes_new_basis_routes_and_restores_existin
         fail_next_persistence(monkeypatch, store)
 
         with pytest.raises(RuntimeError, match="injected persistence failure"):
-            await monitor.evaluate(NOW + timedelta(seconds=10), expanded_state)
+            await monitor.evaluate(
+                NOW + timedelta(seconds=10), state_at(expanded_state, NOW + timedelta(seconds=10))
+            )
 
         assert set(monitor._basis_by_key) == existing_keys
         for key, expected in existing_state.items():
@@ -276,7 +293,9 @@ async def test_persistence_failure_removes_new_basis_routes_and_restores_existin
                 basis._last_sample_time,
             ) == expected
 
-        await monitor.evaluate(NOW + timedelta(seconds=10), expanded_state)
+        await monitor.evaluate(
+            NOW + timedelta(seconds=10), state_at(expanded_state, NOW + timedelta(seconds=10))
+        )
         assert set(monitor._basis_by_key) == {
             candidate.key
             for candidate in build_spread_candidates(
@@ -712,7 +731,9 @@ async def test_active_episode_restores_from_sqlite_within_continuity_gap(tmp_pat
         )
         prime_triggering_monitor(monitor, state)
         await monitor.evaluate(NOW, state)
-        await monitor.evaluate(NOW + timedelta(seconds=10), state)
+        await monitor.evaluate(
+            NOW + timedelta(seconds=10), state_at(state, NOW + timedelta(seconds=10))
+        )
         episode_id = monitor.active_episodes[0].episode_id
 
     with SQLiteRuntimeStore(database) as reopened_store:
@@ -723,7 +744,9 @@ async def test_active_episode_restores_from_sqlite_within_continuity_gap(tmp_pat
         )
         prime_triggering_monitor(reopened, state)
         assert reopened.active_episodes[0].episode_id == episode_id
-        await reopened.evaluate(NOW + timedelta(seconds=20), state)
+        await reopened.evaluate(
+            NOW + timedelta(seconds=20), state_at(state, NOW + timedelta(seconds=20))
+        )
         assert reopened.active_episodes[0].candidate_confirmed is False
 
 
@@ -792,8 +815,10 @@ async def test_already_alerted_episode_restores_without_duplicate_alert(tmp_path
         )
         prime_triggering_monitor(monitor, state)
         for offset in range(0, 60, 10):
-            assert await monitor.evaluate(NOW + timedelta(seconds=offset), state) == []
-        assert len(await monitor.evaluate(NOW + timedelta(seconds=60), state)) == 1
+            when = NOW + timedelta(seconds=offset)
+            assert await monitor.evaluate(when, state_at(state, when)) == []
+        when = NOW + timedelta(seconds=60)
+        assert len(await monitor.evaluate(when, state_at(state, when))) == 1
 
     with SQLiteRuntimeStore(database) as reopened_store:
         reopened = make_monitor(
@@ -803,7 +828,8 @@ async def test_already_alerted_episode_restores_without_duplicate_alert(tmp_path
             stale_after_seconds=60,
         )
         prime_triggering_monitor(reopened, state)
-        assert await reopened.evaluate(NOW + timedelta(seconds=10), state) == []
+        when = NOW + timedelta(seconds=10)
+        assert await reopened.evaluate(when, state_at(state, when)) == []
         assert reopened.active_episodes[0].alerted is True
 
 
@@ -827,14 +853,16 @@ async def test_alert_persistence_failure_restores_unalerted_episode_for_retry(
         prime_triggering_monitor(monitor, state)
         assert await monitor.evaluate(NOW, state) == []
         for offset in range(10, 60, 10):
-            await monitor.evaluate(NOW + timedelta(seconds=offset), state)
+            when = NOW + timedelta(seconds=offset)
+            await monitor.evaluate(when, state_at(state, when))
         episode_id = monitor.active_episodes[0].episode_id
         episodes_before_failure = deepcopy(monitor.active_episodes)
         persisted_before_failure = store.get_monitor_state("spread", "episodes")
         fail_next_persistence(monkeypatch, store)
 
         with pytest.raises(RuntimeError, match="injected persistence failure"):
-            await monitor.evaluate(NOW + timedelta(seconds=60), state)
+            when = NOW + timedelta(seconds=60)
+            await monitor.evaluate(when, state_at(state, when))
 
         episode = monitor.active_episodes[0]
         assert monitor.active_episodes == episodes_before_failure
@@ -846,7 +874,8 @@ async def test_alert_persistence_failure_restores_unalerted_episode_for_retry(
             "candidate_confirmed"
         ]
 
-        alerts = await monitor.evaluate(NOW + timedelta(seconds=60), state)
+        when = NOW + timedelta(seconds=60)
+        alerts = await monitor.evaluate(when, state_at(state, when))
 
         assert len(alerts) == 1
         assert monitor.active_episodes[0].alerted is True
@@ -879,7 +908,8 @@ async def test_candidate_confirmation_persistence_failure_restores_unconfirmed_e
         fail_next_persistence(monkeypatch, store)
 
         with pytest.raises(RuntimeError, match="injected persistence failure"):
-            await monitor.evaluate(NOW + timedelta(seconds=10), state)
+            when = NOW + timedelta(seconds=10)
+            await monitor.evaluate(when, state_at(state, when))
 
         episode = monitor.active_episodes[0]
         assert monitor.active_episodes == episodes_before_failure
@@ -890,7 +920,8 @@ async def test_candidate_confirmation_persistence_failure_restores_unconfirmed_e
         assert store.get_monitor_state("spread", "episodes") == persisted_before_failure
         assert store.list_opportunities(monitor_name="spread") == []
 
-        assert await monitor.evaluate(NOW + timedelta(seconds=10), state) == []
+        when = NOW + timedelta(seconds=10)
+        assert await monitor.evaluate(when, state_at(state, when)) == []
 
         episode = monitor.active_episodes[0]
         assert episode.candidate_confirmed is True
@@ -932,7 +963,8 @@ async def test_resolution_persistence_failure_restores_active_episode_for_retry(
         fail_next_persistence(monkeypatch, store)
 
         with pytest.raises(RuntimeError, match="injected persistence failure"):
-            await monitor.evaluate(NOW + timedelta(seconds=10), missing_short_state)
+            when = NOW + timedelta(seconds=10)
+            await monitor.evaluate(when, state_at(missing_short_state, when))
 
         episode = monitor.active_episodes[0]
         assert monitor.active_episodes == episodes_before_failure
@@ -944,7 +976,8 @@ async def test_resolution_persistence_failure_restores_active_episode_for_retry(
             "candidate_confirmed"
         ]
 
-        assert await monitor.evaluate(NOW + timedelta(seconds=10), missing_short_state) == []
+        when = NOW + timedelta(seconds=10)
+        assert await monitor.evaluate(when, state_at(missing_short_state, when)) == []
 
         assert monitor.active_episodes == ()
         assert store.get_monitor_state("spread", "episodes") == {}
@@ -976,10 +1009,13 @@ async def test_lifecycle_logs_meaningful_events_with_distinct_ids(tmp_path):
         )
         prime_triggering_monitor(monitor, state)
         await monitor.evaluate(NOW, state)
-        await monitor.evaluate(NOW + timedelta(seconds=10), state)
+        when = NOW + timedelta(seconds=10)
+        await monitor.evaluate(when, state_at(state, when))
         for offset in range(20, 70, 10):
-            await monitor.evaluate(NOW + timedelta(seconds=offset), state)
-        await monitor.evaluate(NOW + timedelta(seconds=70), below_state)
+            when = NOW + timedelta(seconds=offset)
+            await monitor.evaluate(when, state_at(state, when))
+        when = NOW + timedelta(seconds=70)
+        await monitor.evaluate(when, state_at(below_state, when))
 
         events = store.list_opportunities(monitor_name="spread")
 
@@ -1006,7 +1042,8 @@ async def test_provisional_episode_that_disappears_is_not_logged(tmp_path):
         monitor = make_monitor(runtime_store=store, candidate_duration_seconds=30)
         prime_triggering_monitor(monitor, state)
         await monitor.evaluate(NOW, state)
-        await monitor.evaluate(NOW + timedelta(seconds=10), below_state)
+        when = NOW + timedelta(seconds=10)
+        await monitor.evaluate(when, state_at(below_state, when))
         assert store.list_opportunities(monitor_name="spread") == []
 
 
@@ -1037,20 +1074,22 @@ async def test_alert_payload_contains_spread_and_available_funding_context():
     prime_triggering_monitor(monitor, state)
 
     for offset in range(0, 60, 10):
-        await monitor.evaluate(NOW + timedelta(seconds=offset), state)
-    alerts = await monitor.evaluate(NOW + timedelta(seconds=60), state)
+        when = NOW + timedelta(seconds=offset)
+        await monitor.evaluate(when, state_at(state, when))
+    when = NOW + timedelta(seconds=60)
+    alerts = await monitor.evaluate(when, state_at(state, when))
 
     assert len(alerts) == 1
     payload = alerts[0].payload
     assert payload["raw_spread_bps"] == pytest.approx(100.0)
     assert payload["net_spread_bps"] == pytest.approx(92.0)
-    assert payload["rolling_mean_bps"] == pytest.approx(80.0)
-    assert payload["rolling_std_bps"] == pytest.approx(0.0)
-    assert payload["deviation_bps"] == pytest.approx(20.0)
+    assert payload["rolling_mean_bps"] == pytest.approx(80.1)
+    assert payload["rolling_std_bps"] == pytest.approx(1.41067, rel=1e-4)
+    assert payload["deviation_bps"] == pytest.approx(19.9)
     assert payload["signal_duration_seconds"] == 60
     assert payload["round_trip_fee_bps"] == pytest.approx(16.0)
-    assert payload["theoretical_edge_bps"] == pytest.approx(4.0)
-    assert payload["sample_time"] == NOW.isoformat()
+    assert payload["theoretical_edge_bps"] == pytest.approx(3.9)
+    assert payload["sample_time"] == (NOW + timedelta(seconds=60)).isoformat()
     assert payload["episode_started_at"] == NOW.isoformat()
     assert payload["candidate_confirmed_at"] == NOW.isoformat()
     assert payload["alert_condition_started_at"] == NOW.isoformat()
@@ -1069,8 +1108,10 @@ async def test_missing_funding_context_does_not_suppress_valid_alert():
     prime_triggering_monitor(monitor, state)
 
     for offset in range(0, 60, 10):
-        await monitor.evaluate(NOW + timedelta(seconds=offset), state)
-    alerts = await monitor.evaluate(NOW + timedelta(seconds=60), state)
+        when = NOW + timedelta(seconds=offset)
+        await monitor.evaluate(when, state_at(state, when))
+    when = NOW + timedelta(seconds=60)
+    alerts = await monitor.evaluate(when, state_at(state, when))
 
     assert len(alerts) == 1
     assert alerts[0].payload["funding_context"] == {"long": None, "short": None}
@@ -1097,8 +1138,10 @@ async def test_funding_context_matches_canonical_symbol_as_well_as_venue_symbol(
     prime_triggering_monitor(monitor, state)
 
     for offset in range(0, 60, 10):
-        await monitor.evaluate(NOW + timedelta(seconds=offset), state)
-    alerts = await monitor.evaluate(NOW + timedelta(seconds=60), state)
+        when = NOW + timedelta(seconds=offset)
+        await monitor.evaluate(when, state_at(state, when))
+    when = NOW + timedelta(seconds=60)
+    alerts = await monitor.evaluate(when, state_at(state, when))
 
     assert len(alerts) == 1
     assert alerts[0].payload["funding_context"] == {"long": None, "short": None}
@@ -1129,7 +1172,8 @@ async def test_disappeared_pair_resolves_and_clears_persisted_active_state(tmp_p
         )
         prime_triggering_monitor(monitor, state)
         await monitor.evaluate(NOW, state)
-        await monitor.evaluate(NOW + timedelta(seconds=10), missing_short_state)
+        when = NOW + timedelta(seconds=10)
+        await monitor.evaluate(when, state_at(missing_short_state, when))
 
         assert monitor.active_episodes == ()
         assert store.get_monitor_state("spread", "episodes") == {}
@@ -1149,10 +1193,12 @@ async def test_candidate_is_confirmed_only_after_continuous_candidate_duration()
     prime_triggering_monitor(monitor, state)
 
     for seconds in (0, 10, 20):
-        assert await monitor.evaluate(NOW + timedelta(seconds=seconds), state) == []
+        when = NOW + timedelta(seconds=seconds)
+        assert await monitor.evaluate(when, state_at(state, when)) == []
         assert monitor.active_episodes[0].candidate_confirmed is False
 
-    assert await monitor.evaluate(NOW + timedelta(seconds=30), state) == []
+    when = NOW + timedelta(seconds=30)
+    assert await monitor.evaluate(when, state_at(state, when)) == []
     assert monitor.active_episodes[0].candidate_confirmed is True
     assert monitor.active_episodes[0].candidate_confirmed_at == NOW + timedelta(seconds=30)
 
@@ -1181,7 +1227,8 @@ async def test_below_candidate_resolves_episode_and_reentry_starts_a_new_one():
     target_key = SpreadPairKey("BTC", "long", "BTC", "short", "BTC")
     assert all(episode.key != target_key for episode in monitor.active_episodes)
 
-    await monitor.evaluate(NOW + timedelta(seconds=20), qualifying_state)
+    when = NOW + timedelta(seconds=20)
+    await monitor.evaluate(when, state_at(qualifying_state, when))
     assert monitor.active_episodes[0].episode_id != first_episode_id
 
 
@@ -1194,8 +1241,10 @@ async def test_high_std_after_alert_does_not_rearm_episode():
     )
     prime_triggering_monitor(monitor, high_state)
     for offset in range(0, 60, 10):
-        assert await monitor.evaluate(NOW + timedelta(seconds=offset), high_state) == []
-    alerts = await monitor.evaluate(NOW + timedelta(seconds=60), high_state)
+        when = NOW + timedelta(seconds=offset)
+        assert await monitor.evaluate(when, state_at(high_state, when)) == []
+    when = NOW + timedelta(seconds=60)
+    alerts = await monitor.evaluate(when, state_at(high_state, when))
     assert len(alerts) == 1
     assert monitor.active_episodes[0].alerted is True
 
@@ -1208,9 +1257,11 @@ async def test_high_std_after_alert_does_not_rearm_episode():
             observed_at=NOW + timedelta(seconds=70),
         ),
     )
-    await monitor.evaluate(NOW + timedelta(seconds=70), noisy_state)
+    when = NOW + timedelta(seconds=70)
+    await monitor.evaluate(when, state_at(noisy_state, when))
     assert monitor.active_episodes[0].alerted is True
-    assert await monitor.evaluate(NOW + timedelta(seconds=80), high_state) == []
+    when = NOW + timedelta(seconds=80)
+    assert await monitor.evaluate(when, state_at(high_state, when)) == []
 
 
 @pytest.mark.asyncio
@@ -1223,10 +1274,13 @@ async def test_one_alert_per_episode_and_reentry_can_alert_again():
     prime_triggering_monitor(monitor, qualifying_state)
 
     for offset in range(0, 60, 10):
-        assert await monitor.evaluate(NOW + timedelta(seconds=offset), qualifying_state) == []
-    first_alerts = await monitor.evaluate(NOW + timedelta(seconds=60), qualifying_state)
+        when = NOW + timedelta(seconds=offset)
+        assert await monitor.evaluate(when, state_at(qualifying_state, when)) == []
+    when = NOW + timedelta(seconds=60)
+    first_alerts = await monitor.evaluate(when, state_at(qualifying_state, when))
     assert len(first_alerts) == 1
-    assert await monitor.evaluate(NOW + timedelta(seconds=70), qualifying_state) == []
+    when = NOW + timedelta(seconds=70)
+    assert await monitor.evaluate(when, state_at(qualifying_state, when)) == []
 
     below_state = make_state(
         make_market(
@@ -1238,14 +1292,17 @@ async def test_one_alert_per_episode_and_reentry_can_alert_again():
         make_market(
             "short",
             buy_10k_vwap=102.0,
-            sell_10k_vwap=100.0,
+            sell_10k_vwap=100.8,
             observed_at=NOW + timedelta(seconds=20),
         ),
     )
-    await monitor.evaluate(NOW + timedelta(seconds=80), below_state)
+    when = NOW + timedelta(seconds=80)
+    await monitor.evaluate(when, state_at(below_state, when))
     for offset in range(90, 150, 10):
-        assert await monitor.evaluate(NOW + timedelta(seconds=offset), qualifying_state) == []
-    second_alerts = await monitor.evaluate(NOW + timedelta(seconds=150), qualifying_state)
+        when = NOW + timedelta(seconds=offset)
+        assert await monitor.evaluate(when, state_at(qualifying_state, when)) == []
+    when = NOW + timedelta(seconds=150)
+    second_alerts = await monitor.evaluate(when, state_at(qualifying_state, when))
     assert len(second_alerts) == 1
     assert second_alerts[0].event_id != first_alerts[0].event_id
 
@@ -1279,6 +1336,25 @@ def test_live_pair_alignment_fails_closed_on_age_and_skew(
         live_quote_max_skew_seconds=3.0,
     )
     assert bool(candidates) is expected
+
+
+@pytest.mark.parametrize("field_name", ["sample_time", "observed_at"])
+def test_live_pair_alignment_rejects_naive_datetime(field_name):
+    naive = NOW.replace(tzinfo=None)
+    updates = {field_name: naive}
+    candidates = build_spread_candidates(
+        (
+            make_market("long").model_copy(update=updates),
+            make_market("short"),
+        ),
+        NOW,
+        primary_size_usd=10_000,
+        stale_after_seconds=30,
+        fees_bps={"long": 0.0, "short": 0.0},
+        live_quote_max_age_seconds=3.0,
+        live_quote_max_skew_seconds=3.0,
+    )
+    assert candidates == ()
 
 
 @pytest.mark.asyncio
