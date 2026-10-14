@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 
+import pytest
+
 from radar.history.stable_baseline import Pair
 from radar.history.stable_baseline_v2 import (
     AnalysisParams,
+    AnomalyEpisode,
+    BaselineReference,
     DailySeries,
     MarketObservation,
     PairPoint,
@@ -15,6 +19,8 @@ from radar.history.stable_baseline_v2 import (
     build_daily_series,
     iter_pair_points,
     _sampling_loss_count,
+    detect_episodes,
+    summarize_episodes,
     us_session_regime,
 )
 
@@ -208,3 +214,151 @@ def test_us_session_regime_handles_regular_extended_and_closed_hours():
     assert us_session_regime(datetime(2026, 10, 1, 14, tzinfo=UTC)) == "us_regular"
     assert us_session_regime(datetime(2026, 10, 1, 12, tzinfo=UTC)) == "us_extended"
     assert us_session_regime(datetime(2026, 10, 3, 14, tzinfo=UTC)) == "us_closed"
+
+
+def baseline_reference(value: float = 100.0) -> BaselineReference:
+    return BaselineReference(
+        baseline_bps=value,
+        q90_q10_bps=2.0,
+        days_used=7,
+        stable=True,
+        drift_bps_per_day=0.0,
+        days=tuple(date(2026, 9, day) for day in range(20, 27)),
+    )
+
+
+def pair_point(ts: datetime, basis_bps: float) -> PairPoint:
+    a = observation(sample_time=ts, observed_at=ts, buy=101.0, sell=99.0)
+    b_mid = 100.0 * (1.0 + basis_bps / 10000.0)
+    b = observation(
+        venue="venue_b",
+        sample_time=ts,
+        observed_at=ts,
+        buy=b_mid + 1.0,
+        sell=b_mid - 1.0,
+    )
+    return PairPoint(sample_time=ts, pair=PAIR, a=a, b=b)
+
+
+def test_sustained_anomaly_is_one_episode_and_records_convergence_windows():
+    start = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    points = [
+        pair_point(start + timedelta(minutes=offset), 123.0)
+        for offset in range(10)
+    ]
+    points += [
+        pair_point(start + timedelta(minutes=10), 100.0),
+    ]
+
+    episodes = detect_episodes(
+        points,
+        baseline_by_day={start.date(): baseline_reference()},
+        basis_type="mid",
+        threshold_bps=20.0,
+        direction=1,
+        params=PARAMS,
+    )
+
+    assert len(episodes) == 1
+    episode = episodes[0]
+    assert episode.confirmed is True
+    assert episode.status == "converged"
+    assert episode.converged_15m is True
+    assert episode.converged_1h is True
+    assert episode.converged_4h is True
+    assert episode.peak_deviation_bps == pytest.approx(23.0, abs=0.1)
+
+
+def test_anomaly_rearms_only_after_the_prior_episode_is_no_longer_active():
+    start = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    points = [
+        pair_point(start, 121.0),
+        pair_point(start + timedelta(minutes=1), 122.0),
+        pair_point(start + timedelta(minutes=2), 108.0),
+        pair_point(start + timedelta(minutes=3), 125.0),
+        pair_point(start + timedelta(minutes=4), 126.0),
+        pair_point(start + timedelta(minutes=5), 100.0),
+    ]
+
+    episodes = detect_episodes(
+        points,
+        baseline_by_day={start.date(): baseline_reference()},
+        basis_type="mid",
+        threshold_bps=20.0,
+        direction=1,
+        params=PARAMS,
+    )
+
+    assert [episode.status for episode in episodes] == ["no_convergence", "converged"]
+    assert [episode.confirmed for episode in episodes] == [True, True]
+
+
+def test_data_gap_censors_episode_and_restored_quote_is_not_convergence():
+    start = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    points = [
+        pair_point(start, 121.0),
+        pair_point(start + timedelta(minutes=1), 122.0),
+        pair_point(start + timedelta(minutes=4), 100.0),
+    ]
+
+    episodes = detect_episodes(
+        points,
+        baseline_by_day={start.date(): baseline_reference()},
+        basis_type="mid",
+        threshold_bps=20.0,
+        direction=1,
+        params=PARAMS,
+    )
+
+    assert len(episodes) == 1
+    assert episodes[0].status == "censored_data_gap"
+    assert episodes[0].converged_15m is None
+
+
+def test_episode_summary_keeps_unknown_convergence_out_of_success_denominator():
+    start = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    episodes = [
+        AnomalyEpisode(
+            pair=PAIR,
+            basis_type="mid",
+            threshold_bps=20.0,
+            direction=1,
+            start=start,
+            end=start + timedelta(minutes=1),
+            baseline_bps=100.0,
+            peak_deviation_bps=25.0,
+            sample_count=2,
+            confirmed=True,
+            status="censored_data_gap",
+            convergence_seconds=None,
+            converged_15m=None,
+            converged_1h=None,
+            converged_4h=None,
+            gap_seconds=180.0,
+        ),
+        AnomalyEpisode(
+            pair=PAIR,
+            basis_type="mid",
+            threshold_bps=20.0,
+            direction=1,
+            start=start + timedelta(hours=1),
+            end=start + timedelta(hours=1, minutes=5),
+            baseline_bps=100.0,
+            peak_deviation_bps=25.0,
+            sample_count=2,
+            confirmed=True,
+            status="converged",
+            convergence_seconds=300.0,
+            converged_15m=True,
+            converged_1h=True,
+            converged_4h=True,
+            gap_seconds=0.0,
+        ),
+    ]
+
+    summary = summarize_episodes(episodes)
+
+    assert summary["anomaly_episodes"] == 2
+    assert summary["converged_15m_known"] == 1
+    assert summary["converged_15m_count"] == 1
+    assert summary["converged_15m_rate"] == 1.0

@@ -26,6 +26,7 @@ class AnalysisParams:
     raw_sample_seconds: int = 10
     max_quote_age_seconds: int = 12
     max_skew_seconds: int = 3
+    max_gap_seconds: int = 120
     min_daily_coverage: float = 0.60
     min_baseline_days: int = 5
     stable_range_bps: float = 12.0
@@ -36,6 +37,8 @@ class AnalysisParams:
             raise ValueError("sampling intervals must be positive")
         if self.max_quote_age_seconds < 0 or self.max_skew_seconds < 0:
             raise ValueError("quote age and skew limits must be non-negative")
+        if self.max_gap_seconds < self.sample_seconds:
+            raise ValueError("max_gap_seconds must cover one sampled slot")
         if not 0 < self.min_daily_coverage <= 1:
             raise ValueError("min_daily_coverage must be in (0, 1]")
         if self.min_baseline_days < 1:
@@ -94,6 +97,28 @@ class BaselineReference:
     stable: bool
     drift_bps_per_day: float
     days: tuple[date, ...]
+
+
+@dataclass(frozen=True)
+class AnomalyEpisode:
+    pair: Pair
+    basis_type: str
+    threshold_bps: float
+    direction: int
+    start: datetime
+    end: datetime
+    baseline_bps: float
+    peak_deviation_bps: float
+    sample_count: int
+    confirmed: bool
+    status: str
+    convergence_seconds: float | None
+    converged_15m: bool | None
+    converged_1h: bool | None
+    converged_4h: bool | None
+    gap_seconds: float
+    max_adverse_deviation_bps: float | None = None
+    regime: str = "all"
 
 
 def _classify_observation(
@@ -336,6 +361,180 @@ def build_baseline_rows(
                 "status": status,
             })
     return rows
+
+
+def _convergence_flag(
+    *,
+    convergence_seconds: float | None,
+    duration_seconds: float,
+    window_seconds: int,
+    censored: bool,
+) -> bool | None:
+    if convergence_seconds is not None:
+        return convergence_seconds <= window_seconds
+    if duration_seconds >= window_seconds and not censored:
+        return False
+    return None
+
+
+def detect_episodes(
+    points: Iterator[PairPoint],
+    *,
+    baseline_by_day: dict[date, BaselineReference],
+    basis_type: str,
+    threshold_bps: float,
+    direction: int,
+    params: AnalysisParams = AnalysisParams(),
+    regime: str = "all",
+) -> list[AnomalyEpisode]:
+    """Detect independent causal deviation episodes for one directed basis."""
+
+    if basis_type not in BASIS_TYPES:
+        raise ValueError(f"unknown basis_type: {basis_type}")
+    if direction not in (-1, 1) or threshold_bps < 0:
+        raise ValueError("direction must be -1 or 1 and threshold nonnegative")
+
+    episodes: list[AnomalyEpisode] = []
+    active: dict[str, object] | None = None
+    last_valid_time: datetime | None = None
+
+    def finish(status: str, end: datetime, gap_seconds: float = 0.0) -> None:
+        nonlocal active
+        if active is None:
+            return
+        start = active["start"]
+        convergence_time = active["convergence_time"]
+        duration_seconds = (end - start).total_seconds()
+        convergence_seconds = (
+            (convergence_time - start).total_seconds()
+            if convergence_time is not None else None
+        )
+        censored = status.startswith("censored")
+        episodes.append(AnomalyEpisode(
+            pair=active["pair"],
+            basis_type=basis_type,
+            threshold_bps=threshold_bps,
+            direction=direction,
+            start=start,
+            end=end,
+            baseline_bps=active["baseline_bps"],
+            peak_deviation_bps=active["peak_deviation_bps"],
+            sample_count=active["sample_count"],
+            confirmed=active["confirmed"],
+            status=status,
+            convergence_seconds=convergence_seconds,
+            converged_15m=_convergence_flag(
+                convergence_seconds=convergence_seconds,
+                duration_seconds=duration_seconds,
+                window_seconds=900,
+                censored=censored,
+            ),
+            converged_1h=_convergence_flag(
+                convergence_seconds=convergence_seconds,
+                duration_seconds=duration_seconds,
+                window_seconds=3600,
+                censored=censored,
+            ),
+            converged_4h=_convergence_flag(
+                convergence_seconds=convergence_seconds,
+                duration_seconds=duration_seconds,
+                window_seconds=14400,
+                censored=censored,
+            ),
+            gap_seconds=gap_seconds,
+            max_adverse_deviation_bps=active["peak_deviation_bps"],
+            regime=regime,
+        ))
+        active = None
+
+    for point in points:
+        if not _attribute_pair_slot(point, params).valid_sync:
+            continue
+        timestamp = point.sample_time
+        if last_valid_time is not None:
+            gap_seconds = (timestamp - last_valid_time).total_seconds()
+            if gap_seconds > params.max_gap_seconds and active is not None:
+                finish("censored_data_gap", last_valid_time, gap_seconds)
+        last_valid_time = timestamp
+        reference = baseline_by_day.get(timestamp.date())
+        if reference is None or not reference.stable:
+            if active is not None:
+                finish("censored_baseline", timestamp)
+            continue
+        value = _basis_values(point)[basis_type]
+        directed_deviation = direction * (value - reference.baseline_bps)
+        if active is not None:
+            active["peak_deviation_bps"] = max(
+                active["peak_deviation_bps"], directed_deviation
+            )
+            active["sample_count"] += 1
+            previous_event_time = active["last_event_time"]
+            if ((timestamp - previous_event_time).total_seconds()
+                    <= params.sample_seconds):
+                active["confirmation_count"] += 1
+            else:
+                active["confirmation_count"] = 1
+            active["last_event_time"] = timestamp
+            active["confirmed"] = active["confirmation_count"] >= 2
+            if abs(value - reference.baseline_bps) <= params.return_band_bps:
+                active["convergence_time"] = timestamp
+                finish("converged", timestamp)
+            elif directed_deviation < threshold_bps:
+                finish("no_convergence", timestamp)
+            continue
+        if directed_deviation >= threshold_bps:
+            active = {
+                "pair": point.pair,
+                "start": timestamp,
+                "baseline_bps": reference.baseline_bps,
+                "peak_deviation_bps": directed_deviation,
+                "sample_count": 1,
+                "confirmation_count": 1,
+                "confirmed": False,
+                "last_event_time": timestamp,
+                "convergence_time": None,
+            }
+    if active is not None and last_valid_time is not None:
+        finish("censored_end", last_valid_time)
+    return episodes
+
+
+def summarize_episodes(episodes: list[AnomalyEpisode]) -> dict[str, object]:
+    """Aggregate an episode group without treating unknowns as failures."""
+
+    def convergence_metrics(name: str) -> dict[str, object]:
+        values = [getattr(episode, name) for episode in episodes]
+        known = [value for value in values if value is not None]
+        count = sum(value is True for value in known)
+        return {
+            f"{name}_known": len(known),
+            f"{name}_count": count,
+            f"{name}_rate": count / len(known) if known else None,
+        }
+
+    result: dict[str, object] = {
+        "anomaly_episodes": len(episodes),
+        "confirmed_anomalies": sum(episode.confirmed for episode in episodes),
+        "converged_episodes": sum(episode.status == "converged" for episode in episodes),
+        "censored_episodes": sum(episode.status.startswith("censored") for episode in episodes),
+        "average_duration_seconds": (
+            sum((episode.end - episode.start).total_seconds() for episode in episodes)
+            / len(episodes) if episodes else None
+        ),
+        "average_convergence_seconds": (
+            sum(episode.convergence_seconds for episode in episodes
+                if episode.convergence_seconds is not None)
+            / sum(episode.convergence_seconds is not None for episode in episodes)
+            if any(episode.convergence_seconds is not None for episode in episodes) else None
+        ),
+        "max_adverse_deviation_bps": (
+            max(episode.peak_deviation_bps for episode in episodes)
+            if episodes else None
+        ),
+    }
+    for name in ("converged_15m", "converged_1h", "converged_4h"):
+        result.update(convergence_metrics(name))
+    return result
 
 
 def iter_pair_points(
