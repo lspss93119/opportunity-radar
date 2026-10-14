@@ -749,6 +749,21 @@ def _create_configured_table(connection, configured: set[tuple[str, str, str]]) 
         connection.execute(f"INSERT INTO configured_markets VALUES {placeholders}", values)
 
 
+def _create_configured_pairs_table(connection, configured: set[tuple[str, str, str]]) -> None:
+    pairs = configured_pairs(configured)
+    connection.execute(
+        "CREATE TEMP TABLE configured_pairs "
+        "(symbol VARCHAR, venue_a VARCHAR, symbol_a VARCHAR, "
+        "venue_b VARCHAR, symbol_b VARCHAR)"
+    )
+    values = [value for pair in pairs for value in (
+        pair.symbol, pair.venue_a, pair.symbol_a, pair.venue_b, pair.symbol_b,
+    )]
+    if values:
+        placeholders = ", ".join("(?, ?, ?, ?, ?)" for _ in pairs)
+        connection.execute(f"INSERT INTO configured_pairs VALUES {placeholders}", values)
+
+
 def _create_latest_table(
     connection,
     files: list[str],
@@ -850,17 +865,21 @@ def _pair_latest_stats(connection, table_name: str) -> dict[Pair, dict[str, int]
         f"""
         WITH pair_slots AS (
             SELECT a.sample_time,
-                   a.venue AS venue_a, a.venue_symbol AS symbol_a,
-                   b.venue AS venue_b, b.venue_symbol AS symbol_b,
-                   a.canonical_symbol AS symbol,
+                   c.venue_a, c.symbol_a, c.venue_b, c.symbol_b,
+                   c.symbol,
                    a.observed_at AS observed_a, b.observed_at AS observed_b,
                    a.buy_price AS buy_a, a.sell_price AS sell_a,
                    b.buy_price AS buy_b, b.sell_price AS sell_b
-            FROM {table_name} AS a
+            FROM configured_pairs AS c
+            INNER JOIN {table_name} AS a
+                ON a.venue = c.venue_a
+               AND a.venue_symbol = c.symbol_a
+               AND a.canonical_symbol = c.symbol
             INNER JOIN {table_name} AS b
                 ON b.sample_time = a.sample_time
-               AND b.canonical_symbol = a.canonical_symbol
-               AND a.venue < b.venue
+               AND b.venue = c.venue_b
+               AND b.venue_symbol = c.symbol_b
+               AND b.canonical_symbol = c.symbol
         )
         SELECT symbol, venue_a, symbol_a, venue_b, symbol_b,
                COUNT(*) AS common_slots,
@@ -941,6 +960,7 @@ def collect_data_quality(
     connection.execute("PRAGMA threads=2")
     try:
         _create_configured_table(connection, configured)
+        _create_configured_pairs_table(connection, configured)
         raw_60 = _market_source_counts(connection, files, params.sample_seconds)
         _create_latest_table(
             connection, files, table_name="latest_60", configured=configured,

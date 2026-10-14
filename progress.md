@@ -4,3 +4,5 @@ Pre-flight: existing isolated clone at `/private/tmp/opportunity-radar-validatio
 
 Ruling: V2's valid timeline now reuses V1 `csv_or_parquet_quotes` and `_sample_pairs`, preserving the canonical latest-duplicate, quote-age, and 3-second observed-at skew semantics while avoiding a second full-history pair self-join and global sort. Quality attribution remains SQL-based, so missing-leg, invalid-VWAP, stale, and skew losses are still measured separately. Cost if incorrect: timeline and quality counts could diverge; mitigation: focused duplicate/latest and quality regression tests pass locally and on the isolated `trading-mini` checkout.
 
+Ruling: Data-quality pair aggregation now joins the exact configured-pair table rather than every same-symbol venue combination. This preserves the full configured-pair funnel while avoiding the 10-second all-combination join that exhausted the isolated run's useful runtime. Cost if incorrect: a configured pair could be omitted from attribution; mitigation: the configured-pair table is generated from the same `configured_pairs()` function used for the funnel and the quality fixture regression remains green.
+
