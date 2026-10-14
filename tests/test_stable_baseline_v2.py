@@ -1,16 +1,21 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from radar.history.stable_baseline import Pair
 from radar.history.stable_baseline_v2 import (
     AnalysisParams,
+    DailySeries,
     MarketObservation,
     PairPoint,
     _attribute_pair_slot,
+    build_baseline_rows,
+    causal_baseline,
     _classify_observation,
+    build_daily_series,
     iter_pair_points,
     _sampling_loss_count,
+    us_session_regime,
 )
 
 
@@ -135,3 +140,71 @@ def test_iter_pair_points_keeps_latest_duplicate_observation(tmp_path):
     assert points[0].a is not None
     assert points[0].a.observed_at == NOW
     assert points[0].a.buy == 102.0
+
+
+def daily(day: date, values: list[float], coverage: float = 1.0) -> DailySeries:
+    return DailySeries(
+        day=day,
+        values={
+            "mid": tuple(values),
+            "exec_buy_a_sell_b": tuple(values),
+            "exec_buy_b_sell_a": tuple(values),
+        },
+        sample_count=1440,
+        coverage=coverage,
+    )
+
+
+def test_causal_baseline_uses_only_completed_days_before_today():
+    history = {
+        date(2026, 10, 1): daily(date(2026, 10, 1), [100.0]),
+        date(2026, 10, 2): daily(date(2026, 10, 2), [102.0]),
+        date(2026, 10, 3): daily(date(2026, 10, 3), [1000.0]),
+    }
+
+    reference = causal_baseline(
+        history,
+        today=date(2026, 10, 3),
+        basis_type="mid",
+        lookback_days=7,
+        min_days=2,
+        use_daily_medians=True,
+        stable_range_bps=12.0,
+    )
+
+    assert reference is not None
+    assert reference.baseline_bps == 101.0
+    assert reference.days_used == 2
+    assert reference.stable is True
+
+
+def test_build_baseline_rows_reports_drift_and_insufficient_regime_history():
+    history = {
+        date(2026, 10, 1): daily(date(2026, 10, 1), [100.0]),
+        date(2026, 10, 2): daily(date(2026, 10, 2), [101.0]),
+        date(2026, 10, 3): daily(date(2026, 10, 3), [102.0]),
+        date(2026, 10, 4): daily(date(2026, 10, 4), [103.0]),
+        date(2026, 10, 5): daily(date(2026, 10, 5), [104.0]),
+        date(2026, 10, 6): daily(date(2026, 10, 6), [105.0]),
+    }
+
+    rows = build_baseline_rows(PAIR, history, params=PARAMS, regime="us_regular")
+    seven_day = next(row for row in rows if row["window"] == "7d" and row["basis_type"] == "mid")
+
+    assert seven_day["status"] == "stable"
+    assert seven_day["eligible_windows"] == 1
+    assert seven_day["median_drift_bps_per_day"] > 0
+
+    insufficient = build_baseline_rows(
+        PAIR,
+        {date(2026, 10, 1): daily(date(2026, 10, 1), [100.0])},
+        params=PARAMS,
+        regime="us_closed",
+    )
+    assert {row["status"] for row in insufficient} == {"insufficient_data"}
+
+
+def test_us_session_regime_handles_regular_extended_and_closed_hours():
+    assert us_session_regime(datetime(2026, 10, 1, 14, tzinfo=UTC)) == "us_regular"
+    assert us_session_regime(datetime(2026, 10, 1, 12, tzinfo=UTC)) == "us_extended"
+    assert us_session_regime(datetime(2026, 10, 3, 14, tzinfo=UTC)) == "us_closed"
