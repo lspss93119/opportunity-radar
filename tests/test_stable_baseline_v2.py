@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -19,8 +20,12 @@ from radar.history.stable_baseline_v2 import (
     build_daily_series,
     iter_pair_points,
     _sampling_loss_count,
+    build_funnel_rows,
+    classify_candidate,
     detect_episodes,
+    estimate_cost_scenarios,
     summarize_episodes,
+    write_v2_outputs,
     us_session_regime,
 )
 
@@ -362,3 +367,126 @@ def test_episode_summary_keeps_unknown_convergence_out_of_success_denominator():
     assert summary["converged_15m_known"] == 1
     assert summary["converged_15m_count"] == 1
     assert summary["converged_15m_rate"] == 1.0
+
+
+def test_cost_scenarios_use_four_fills_and_do_not_treat_funding_as_zero_cost():
+    scenarios = estimate_cost_scenarios(
+        entry_edge_bps=30.0,
+        exit_edge_bps=5.0,
+        venue_a="venue_a",
+        venue_b="venue_b",
+        fees={"venue_a": 1.0, "venue_b": 2.0},
+        notionals=(1000.0, 5000.0),
+        extra_slippage_bps=(0.0, 2.0),
+    )
+
+    no_slip_1k = next(
+        row for row in scenarios
+        if row["notional_per_leg"] == 1000.0 and row["extra_slippage_bps"] == 0.0
+    )
+    slip_5k = next(
+        row for row in scenarios
+        if row["notional_per_leg"] == 5000.0 and row["extra_slippage_bps"] == 2.0
+    )
+    assert no_slip_1k["gross_bps"] == 25.0
+    assert no_slip_1k["fee_bps"] == 6.0
+    assert no_slip_1k["slippage_bps"] == 0.0
+    assert no_slip_1k["net_bps"] == 19.0
+    assert slip_5k["slippage_bps"] == 8.0
+    assert slip_5k["funding_included"] is False
+
+
+def test_candidate_classification_prioritizes_evidence_over_total_pnl():
+    assert classify_candidate({
+        "valid_sync_samples": 1000,
+        "coverage_eligible": True,
+        "stable_baseline": True,
+        "confirmed_anomalies": 4,
+        "observed_convergence": 3,
+        "executable_convergence": 2,
+        "economically_viable_1000_2bps": 1,
+    })["classification"] == "A"
+    assert classify_candidate({
+        "valid_sync_samples": 1000,
+        "coverage_eligible": True,
+        "stable_baseline": True,
+        "confirmed_anomalies": 1,
+        "observed_convergence": 0,
+        "executable_convergence": 0,
+        "economically_viable_1000_2bps": 0,
+    })["classification"] == "B"
+    assert classify_candidate({
+        "valid_sync_samples": 0,
+        "coverage_eligible": False,
+        "stable_baseline": False,
+        "confirmed_anomalies": 100,
+        "observed_convergence": 100,
+        "executable_convergence": 100,
+        "economically_viable_1000_2bps": 100,
+    })["classification"] == "C"
+    assert classify_candidate({
+        "valid_sync_samples": 1000,
+        "coverage_eligible": True,
+        "stable_baseline": False,
+        "confirmed_anomalies": 10,
+        "observed_convergence": 10,
+        "executable_convergence": 10,
+        "economically_viable_1000_2bps": 10,
+    })["classification"] == "D"
+
+
+def test_funnel_reports_global_stage_counts_and_exclusion_reasons():
+    rows = build_funnel_rows([
+        {
+            "pair_id": "one",
+            "configured": True,
+            "valid_sync": True,
+            "coverage_eligible": True,
+            "stable_baseline": True,
+            "anomaly_episodes": 2,
+            "confirmed_anomalies": 1,
+            "observed_convergence": 1,
+            "executable_convergence": 1,
+            "economically_viable": 0,
+            "exclusion_reason": "cost_gate",
+        },
+        {
+            "pair_id": "two",
+            "configured": True,
+            "valid_sync": False,
+            "coverage_eligible": False,
+            "stable_baseline": False,
+            "anomaly_episodes": 0,
+            "confirmed_anomalies": 0,
+            "observed_convergence": 0,
+            "executable_convergence": 0,
+            "economically_viable": 0,
+            "exclusion_reason": "skew",
+        },
+    ])
+
+    valid_row = next(row for row in rows if row["scope"] == "global" and row["stage"] == "valid_synchronized_pairs")
+    cost_row = next(row for row in rows if row["scope"] == "global" and row["stage"] == "economically_viable_candidates")
+    assert valid_row["candidate_count"] == 1
+    assert cost_row["candidate_count"] == 0
+    assert cost_row["excluded_count"] == 2
+    assert "cost_gate" in cost_row["exclusion_reasons"]
+
+
+def test_v2_writer_emits_requested_files_with_stable_headers(tmp_path: Path):
+    write_v2_outputs(
+        tmp_path,
+        quality_rows=[{"record_type": "system", "metric": "raw_rows", "count": 1}],
+        baseline_rows=[{"window": "7d", "basis_type": "mid", "status": "stable"}],
+        episode_rows=[{"record_type": "summary", "threshold_bps": 20.0}],
+        funnel_rows=[{"scope": "global", "stage": "configured_pairs", "candidate_count": 1}],
+        ranking_rows=[{"classification": "B", "symbol": "TEST"}],
+    )
+
+    assert {
+        "data_quality_report.csv",
+        "baseline_stability.csv",
+        "anomaly_convergence.csv",
+        "opportunity_funnel.csv",
+        "candidate_ranking.csv",
+    } <= {path.name for path in tmp_path.iterdir()}
