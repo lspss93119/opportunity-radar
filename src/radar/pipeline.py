@@ -223,6 +223,7 @@ class MarketDataPipeline:
                     config.markets,
                     clock=clock,
                     error_handler=collector_error_handler,
+                    source=config.arcus.source,
                     **collector_kwargs,
                 )
             )
@@ -369,7 +370,7 @@ class MarketDataPipeline:
                 diagnostic.canonical_symbol,
             )
             for diagnostic in diagnostics
-            if diagnostic.reason == "included"
+            if diagnostic.reason == "included" and diagnostic.live_signal_eligible
         }
         self._record_market_availability(diagnostics)
         batch = CollectorBatch(

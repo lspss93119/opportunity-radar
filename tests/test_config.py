@@ -501,3 +501,21 @@ def test_enabled_lighter_robinhood_accepts_explicit_zero_fee():
     )
 
     assert config.fees_bps == {"lighter_robinhood": 0.0}
+
+
+def test_arcus_source_defaults_to_rest_and_accepts_ws():
+    rest_config = RadarConfig()
+    assert rest_config.arcus.source == "rest"
+
+    ws_config = RadarConfig(
+        fees_bps={"arcus": 2.25},
+        markets=[
+            MarketConfig(
+                venue="arcus",
+                venue_symbol="SNDK-USD",
+                canonical_symbol="SNDK",
+            )
+        ],
+        arcus={"source": "ws"},
+    )
+    assert ws_config.arcus.source == "ws"

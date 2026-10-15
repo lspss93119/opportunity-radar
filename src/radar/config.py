@@ -12,6 +12,19 @@ EXPLICIT_FEE_VENUES = frozenset(
 )
 
 
+class ArcusConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["rest", "ws"] = "rest"
+    ws_url: str = "wss://api.arcus.xyz/v1/ws"
+    ws_levels: int = Field(default=20, ge=1, le=100)
+    ws_silence_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    ws_reconnect_delay_seconds: float = Field(
+        default=1.0, gt=0, allow_inf_nan=False
+    )
+    rest_fallback: bool = True
+
+
 class MarketConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -83,6 +96,7 @@ class RadarConfig(BaseModel):
     maker_fees_bps: dict[str, float] = Field(default_factory=dict)
     markets: list[MarketConfig] = Field(default_factory=list)
     quoted_markets: list[MarketConfig] = Field(default_factory=list)
+    arcus: ArcusConfig = Field(default_factory=ArcusConfig)
     monitors: MonitorConfig = Field(default_factory=MonitorConfig)
     manual_opportunity: ManualOpportunityConfig = Field(
         default_factory=ManualOpportunityConfig

@@ -166,15 +166,19 @@ class ArcusCollector:
         error_handler: CollectorErrorHandler | None = None,
         latest_market_data: LatestMarketData | None = None,
         refresh_interval_seconds: float = REFRESH_INTERVAL_SECONDS,
+        source: str = "rest",
     ) -> None:
         if refresh_interval_seconds < 0:
             raise ValueError("refresh_interval_seconds must be non-negative")
+        if source not in {"rest", "ws"}:
+            raise ValueError("source must be rest or ws")
         self._markets = markets_for_venue(markets, self.venue)
         self._request_json = request_json
         self._clock = clock
         self._error_handler = error_handler
         self._latest_market_data = latest_market_data
         self._refresh_interval_seconds = refresh_interval_seconds
+        self.source = source
         self._details: dict[str, ArcusMarketDetail] = {}
         self._metadata_observed_at: datetime | None = None
         self._refresh_lock = asyncio.Lock()
