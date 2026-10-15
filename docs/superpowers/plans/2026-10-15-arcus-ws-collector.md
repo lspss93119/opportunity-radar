@@ -41,11 +41,11 @@
 - `MarketAvailabilityDiagnostic.live_signal_eligible: bool` lets the pipeline keep fresh fallback rows for storage while excluding them from live state.
 - `RadarConfig.arcus.source` is `Literal["rest", "ws"]` with default `"rest"` and `ArcusCollector` receives the config.
 
-- [ ] Write failing tests for an ineligible fresh book being returned in the archival candidate batch but excluded from `RadarState`, and for REST-default config/pipeline wiring.
-- [ ] Run the focused tests and observe the expected missing-field/behavior failures.
-- [ ] Implement the smallest cache/config/pipeline changes; do not change `MarketSnapshot` or storage schema.
-- [ ] Run focused tests and verify they pass.
-- [ ] Commit `feat: add Arcus source selection and live eligibility gate`.
+- [x] Write failing tests for an ineligible fresh book being returned in the archival candidate batch but excluded from `RadarState`, and for REST-default config/pipeline wiring.
+- [x] Run the focused tests and observe the expected missing-field/behavior failures.
+- [x] Implement the smallest cache/config/pipeline changes; do not change `MarketSnapshot` or storage schema.
+- [x] Run focused tests and verify they pass.
+- [x] Commit `feat: add Arcus source selection and live eligibility gate`.
 
 ### Task 2: Arcus WebSocket protocol and feed lifecycle
 
@@ -58,11 +58,11 @@
 - `ArcusWebSocketFeed(...).start()`/`stop()` manage one reconnecting socket; callbacks receive a validated snapshot or invalidation.
 - `ArcusWsSnapshot` carries market, normalized levels, local `observed_at`, optional raw venue timestamp, and optional sequence IDs.
 
-- [ ] Write failing parser/feed tests for subscription payload, valid full snapshot/VWAP, invalid/empty/crossed book, old sequence, degraded/silence, disconnect, reconnect/resubscribe, and clean stop.
-- [ ] Run only the new tests and observe failures because the feed/parser do not exist.
-- [ ] Implement parser, monotonic guards, socket loop, bounded reconnect delay, silence invalidation, and task/socket cleanup using the existing `websockets` dependency.
-- [ ] Run the new tests, then the Arcus collector tests, and verify all pass.
-- [ ] Commit `feat: add Arcus l2Orderbook websocket feed`.
+- [x] Write failing parser/feed tests for subscription payload, valid full snapshot/VWAP, invalid/empty/crossed book, old sequence, degraded/silence, disconnect, reconnect/resubscribe, and clean stop.
+- [x] Run only the new tests and observe failures because the feed/parser do not exist.
+- [x] Implement parser, monotonic guards, socket loop, bounded reconnect delay, silence invalidation, and task/socket cleanup using the existing `websockets` dependency.
+- [x] Run the new tests, then the Arcus collector tests, and verify all pass.
+- [x] Commit `feat: add Arcus l2Orderbook websocket feed`.
 
 ### Task 3: Arcus collector integration and fallback
 
@@ -75,11 +75,11 @@
 - `ArcusCollector` keeps constructor compatibility, adds `source="rest"|"ws"`, and in WS mode starts the feed plus existing metadata/funding refresh.
 - WS books update the shared cache as eligible; REST fallback updates it as ineligible only after the WS book is absent/stale.
 
-- [ ] Write failing integration tests for WS mode startup, cache updates, REST fallback archival-only behavior, WS recovery restoring eligibility, and unchanged REST mode request behavior.
-- [ ] Run the focused tests and observe failures.
-- [ ] Implement collector lifecycle and callback wiring without changing low-frequency context or storage schemas.
-- [ ] Run Arcus/pipeline/market-data focused suites and verify all pass.
-- [ ] Commit `feat: integrate selectable Arcus websocket source`.
+- [x] Write failing integration tests for WS mode startup, cache updates, REST fallback archival-only behavior, WS recovery restoring eligibility, and unchanged REST mode request behavior.
+- [x] Run the focused tests and observe failures.
+- [x] Implement collector lifecycle and callback wiring without changing low-frequency context or storage schemas.
+- [x] Run Arcus/pipeline/market-data focused suites and verify all pass.
+- [x] Commit `feat: integrate selectable Arcus websocket source`.
 
 ### Task 4: Canary harness, documentation, and verification
 
@@ -90,10 +90,10 @@
 **Interfaces:**
 - The canary uses the formal WS collector/parser and existing REST probe semantics; it never receives a Production storage path or Telegram transport.
 
-- [ ] Run focused tests for all modified components.
+- [x] Run focused tests for all modified components.
 - [ ] Run `uv run pytest -m "not live"`, `uv run python -m compileall -q src tests`, and `git diff --check` with a writable task-local `UV_CACHE_DIR`.
-- [ ] Run a bounded real-feed canary for selected Arcus symbols when permitted by the current market/session; record REST/WS counts, interval percentiles, freshness, sequence/order errors, reconnects, depth/VWAP availability, CPU/RSS, and output paths. Do not start a Production writer.
-- [ ] Update the operations note with the selectable config and fail-closed fallback semantics, then rerun the full suite.
+- [x] Run a bounded real-feed canary for selected Arcus symbols when permitted by the current market/session; record REST/WS counts, interval percentiles, freshness, sequence/order errors, reconnects, depth/VWAP availability, CPU/RSS, and output paths. Do not start a Production writer.
+- [x] Update the operations note with the selectable config and fail-closed fallback semantics, then rerun the full suite.
 - [ ] Commit `docs: document Arcus websocket canary and source selection`.
 - [ ] Push the feature branch and verify the remote SHA and clean worktree.
 
