@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -463,6 +464,12 @@ class ArcusCollector:
         latest_market_data: LatestMarketData | None = None,
         refresh_interval_seconds: float = REFRESH_INTERVAL_SECONDS,
         source: str = "rest",
+        ws_url: str = ARCUS_WS_URL,
+        ws_levels: int = ARCUS_WS_DEFAULT_LEVELS,
+        ws_silence_seconds: float = ARCUS_WS_DEFAULT_SILENCE_SECONDS,
+        ws_reconnect_delay_seconds: float = ARCUS_WS_DEFAULT_RECONNECT_DELAY_SECONDS,
+        rest_fallback: bool = True,
+        ws_connect: Callable[..., Any] = websockets.connect,
     ) -> None:
         if refresh_interval_seconds < 0:
             raise ValueError("refresh_interval_seconds must be non-negative")
@@ -475,16 +482,38 @@ class ArcusCollector:
         self._latest_market_data = latest_market_data
         self._refresh_interval_seconds = refresh_interval_seconds
         self.source = source
+        self.ws_url = ws_url
+        self.ws_levels = ws_levels
+        self.ws_silence_seconds = ws_silence_seconds
+        self.ws_reconnect_delay_seconds = ws_reconnect_delay_seconds
+        self.rest_fallback = rest_fallback
+        self._ws_connect = ws_connect
         self._details: dict[str, ArcusMarketDetail] = {}
         self._metadata_observed_at: datetime | None = None
         self._refresh_lock = asyncio.Lock()
         self._refresh_task: asyncio.Task[None] | None = None
+        self._ws_feed: ArcusWebSocketFeed | None = None
+        self._ws_last_updates: dict[str, datetime] = {}
         self._started = False
 
     async def start(self) -> None:
         if self._refresh_task is not None and not self._refresh_task.done():
             return
         self._started = True
+        if self.source == "ws":
+            self._ws_feed = ArcusWebSocketFeed(
+                self.ws_url,
+                [market.venue_symbol for market in self._markets],
+                n_levels=self.ws_levels,
+                connect=self._ws_connect,
+                clock=self._clock,
+                on_book=self._on_ws_book,
+                on_invalidate=self._on_ws_invalidate,
+                error_handler=self._error_handler,
+                silence_timeout_seconds=self.ws_silence_seconds,
+                reconnect_delay_seconds=self.ws_reconnect_delay_seconds,
+            )
+            await self._ws_feed.start()
         self._refresh_task = asyncio.create_task(
             self._run_refresh(),
             name=f"{self.venue}-market-refresh",
@@ -492,11 +521,51 @@ class ArcusCollector:
 
     async def stop(self) -> None:
         self._started = False
+        ws_feed = self._ws_feed
+        self._ws_feed = None
+        if ws_feed is not None:
+            await ws_feed.stop()
+        self._ws_last_updates.clear()
         refresh_task = self._refresh_task
         if refresh_task is not None:
             refresh_task.cancel()
             await asyncio.gather(refresh_task, return_exceptions=True)
         self._refresh_task = None
+
+    def _on_ws_book(self, venue_symbol: str, snapshot: ArcusWsSnapshot) -> None:
+        self._ws_last_updates[venue_symbol] = snapshot.observed_at
+        if self._latest_market_data is None:
+            return
+        try:
+            self._latest_market_data.update_book(
+                venue=self.venue,
+                venue_symbol=venue_symbol,
+                bids=snapshot.bids,
+                asks=snapshot.asks,
+                observed_at=snapshot.observed_at,
+                live_signal_eligible=True,
+            )
+        except Exception as error:  # noqa: BLE001
+            report_collector_error(self._error_handler, self.venue, error)
+
+    def _on_ws_invalidate(self, venue_symbol: str) -> None:
+        self._ws_last_updates.pop(venue_symbol, None)
+        if self._latest_market_data is None:
+            return
+        try:
+            self._latest_market_data.invalidate(
+                venue=self.venue,
+                venue_symbol=venue_symbol,
+            )
+        except Exception as error:  # noqa: BLE001
+            report_collector_error(self._error_handler, self.venue, error)
+
+    def _ws_book_is_fresh(self, venue_symbol: str) -> bool:
+        observed_at = self._ws_last_updates.get(venue_symbol)
+        if observed_at is None:
+            return False
+        age_seconds = (self._clock() - observed_at).total_seconds()
+        return 0 <= age_seconds <= self.ws_silence_seconds
 
     async def refresh_once(self) -> None:
         async with self._refresh_lock:
@@ -562,6 +631,11 @@ class ArcusCollector:
     ) -> None:
         if market.venue_symbol not in details:
             return
+        if self.source == "ws":
+            if self._ws_book_is_fresh(market.venue_symbol):
+                return
+            if not self.rest_fallback:
+                return
         try:
             async with l2_semaphore:
                 payload = await self._request_json(
@@ -577,6 +651,7 @@ class ArcusCollector:
                     bids=bids,
                     asks=asks,
                     observed_at=observed_at,
+                    live_signal_eligible=self.source == "rest",
                 )
         except asyncio.CancelledError:
             raise
@@ -608,12 +683,17 @@ class ArcusCollector:
         self._metadata_observed_at = metadata_observed_at
         self._refresh_cache_metadata(details)
 
-        market_snapshots = await asyncio.gather(
-            *(
-                self._collect_market(market, details, sample_time)
-                for market in self._markets
+        if self.source == "ws":
+            market_snapshots = self._collect_ws_market_snapshots(
+                sample_time=sample_time,
             )
-        )
+        else:
+            market_snapshots = await asyncio.gather(
+                *(
+                    self._collect_market(market, details, sample_time)
+                    for market in self._markets
+                )
+            )
         configured_details = tuple(
             (market, details[market.venue_symbol])
             for market in self._markets
@@ -636,6 +716,33 @@ class ArcusCollector:
             ),
             funding_snapshots=hourly_batch.funding_snapshots,
             hourly_contexts=hourly_batch.hourly_contexts,
+        )
+
+    def _collect_ws_market_snapshots(
+        self, *, sample_time: datetime
+    ) -> tuple[MarketSnapshot, ...]:
+        if self._latest_market_data is None:
+            return ()
+        batch, diagnostics = self._latest_market_data.build_batch_with_diagnostics(
+            self._markets,
+            sample_time=sample_time,
+            now=self._clock(),
+            stale_after_seconds=math.ceil(self.ws_silence_seconds),
+        )
+        eligible_keys = {
+            (diagnostic.venue, diagnostic.venue_symbol, diagnostic.canonical_symbol)
+            for diagnostic in diagnostics
+            if diagnostic.live_signal_eligible
+        }
+        return tuple(
+            snapshot
+            for snapshot in batch.market_snapshots
+            if (
+                snapshot.venue,
+                snapshot.venue_symbol,
+                snapshot.canonical_symbol,
+            )
+            in eligible_keys
         )
 
     async def collect_hourly(self, *, sample_time: datetime) -> CollectorBatch:

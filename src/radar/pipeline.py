@@ -224,6 +224,11 @@ class MarketDataPipeline:
                     clock=clock,
                     error_handler=collector_error_handler,
                     source=config.arcus.source,
+                    ws_url=config.arcus.ws_url,
+                    ws_levels=config.arcus.ws_levels,
+                    ws_silence_seconds=config.arcus.ws_silence_seconds,
+                    ws_reconnect_delay_seconds=config.arcus.ws_reconnect_delay_seconds,
+                    rest_fallback=config.arcus.rest_fallback,
                     **collector_kwargs,
                 )
             )
