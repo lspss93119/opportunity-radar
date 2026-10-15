@@ -251,6 +251,8 @@ class ArcusWebSocketFeed:
         self._started = False
         self.reconnect_count = 0
         self.ignored_sequence_count = 0
+        self.message_count = 0
+        self.accepted_snapshot_count = 0
         self.last_published_snapshot: ArcusWsSnapshot | None = None
 
     def snapshot(self, market: str) -> ArcusWsSnapshot | None:
@@ -330,6 +332,7 @@ class ArcusWebSocketFeed:
                 continue
             except asyncio.CancelledError:
                 raise
+            self.message_count += 1
             payload = json.loads(raw_message)
             self._handle_message(payload)
 
@@ -363,6 +366,7 @@ class ArcusWebSocketFeed:
             snapshot.last_sequence_id,
             snapshot.global_sequence_id,
         )
+        self.accepted_snapshot_count += 1
         self.last_published_snapshot = snapshot
         if self._on_book is not None:
             self._on_book(snapshot.market, snapshot)

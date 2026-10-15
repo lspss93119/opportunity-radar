@@ -229,6 +229,39 @@ async def test_arcus_feed_ignores_duplicate_and_out_of_order_sequences():
 
 
 @pytest.mark.asyncio
+async def test_arcus_feed_counts_raw_messages_and_accepted_snapshots():
+    websocket = FixtureWebSocket(
+        [
+            {"type": "subscribed", "channel": "l2Orderbook", "id": "SNDK-USD"},
+            ws_snapshot("SNDK-USD"),
+            ws_snapshot("SNDK-USD"),
+            ws_snapshot("SNDK-USD", last_sequence_id=11, global_sequence_id=21),
+        ]
+    )
+    feed = ArcusWebSocketFeed(
+        "wss://test.invalid/v1/ws",
+        ["SNDK-USD"],
+        connect=lambda _url, **_kwargs: websocket,
+        clock=lambda: OBSERVED_AT,
+    )
+
+    await feed.start()
+    try:
+        await wait_until(
+            lambda: (
+                feed.snapshot("SNDK-USD") is not None
+                and feed.snapshot("SNDK-USD").last_sequence_id == 11
+            )
+        )
+    finally:
+        await feed.stop()
+
+    assert feed.message_count == 4
+    assert feed.accepted_snapshot_count == 2
+    assert feed.ignored_sequence_count == 1
+
+
+@pytest.mark.asyncio
 async def test_arcus_feed_degraded_notice_and_silence_invalidate_book():
     websocket = FixtureWebSocket([ws_snapshot("SNDK-USD")])
     invalidated: list[str] = []
