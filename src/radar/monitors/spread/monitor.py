@@ -344,7 +344,7 @@ class SpreadMonitor:
 
             lifecycle_ms = _elapsed_ms(lifecycle_started)
             persistence_started = time.perf_counter()
-            self._persist_episodes(current_time, events)
+            self._persist_episodes(current_time, events, notifications=alerts)
             sqlite_persistence_ms = _elapsed_ms(persistence_started)
             self._log_cycle_timing(
                 candidate_build_ms=candidate_build_ms,
@@ -412,7 +412,13 @@ class SpreadMonitor:
             )
             lifecycle_ms = _elapsed_ms(lifecycle_started)
             persistence_started = time.perf_counter()
-            self._persist_anomaly_v2(current_time, result.events)
+            self._persist_anomaly_v2(
+                current_time,
+                result.events,
+                notifications=(
+                    result.alerts if self.config.anomaly_v2.telegram_enabled else ()
+                ),
+            )
             sqlite_persistence_ms = _elapsed_ms(persistence_started)
             alert_count = len(result.alerts) if self.config.anomaly_v2.telegram_enabled else 0
             self._log_cycle_timing(
@@ -638,6 +644,8 @@ class SpreadMonitor:
         self,
         now: datetime,
         events: list[OpportunityEvent],
+        *,
+        notifications: Sequence[AlertRequest] = (),
     ) -> None:
         if self._runtime_store is None:
             return
@@ -650,12 +658,15 @@ class SpreadMonitor:
             },
             updated_at=now,
             opportunities=events,
+            notifications=notifications,
         )
 
     def _persist_anomaly_v2(
         self,
         now: datetime,
         events: tuple[OpportunityEvent, ...],
+        *,
+        notifications: Sequence[AlertRequest] = (),
     ) -> None:
         if self._runtime_store is None or self._anomaly_v2 is None:
             return
@@ -665,6 +676,7 @@ class SpreadMonitor:
             self._anomaly_v2.snapshot(),
             updated_at=now,
             opportunities=events,
+            notifications=notifications,
         )
 
     @staticmethod
