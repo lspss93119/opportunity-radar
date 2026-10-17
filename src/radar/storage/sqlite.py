@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from radar.monitors.base import AlertRequest
 
 UTC = timezone.utc
 
@@ -32,6 +35,19 @@ def _json_text(payload: object) -> str:
         )
     except (TypeError, ValueError) as exc:
         raise ValueError("payload must be JSON-compatible") from exc
+
+
+@dataclass(frozen=True)
+class NotificationOutboxEntry:
+    """Durable notification state used by the single alert worker."""
+
+    alert: AlertRequest
+    status: str
+    attempt_count: int
+    available_at: datetime
+    last_error: str | None
+    created_at: datetime
+    sent_at: datetime | None
 
 
 class SQLiteRuntimeStore:
@@ -63,6 +79,22 @@ class SQLiteRuntimeStore:
                 occurred_at TEXT NOT NULL,
                 PRIMARY KEY (monitor_name, event_id)
             );
+
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                monitor_name TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                alert_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'failed')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                available_at TEXT NOT NULL,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                sent_at TEXT,
+                PRIMARY KEY (monitor_name, event_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_notification_outbox_due
+            ON notification_outbox (status, available_at);
             """
         )
         self._connection.commit()
@@ -98,12 +130,14 @@ class SQLiteRuntimeStore:
         updated_at: datetime | None = None,
         opportunities: Sequence[tuple[str, str, object, datetime | None]] = (),
         additional_states: Sequence[tuple[str, str, object, datetime | None]] = (),
+        notifications: Sequence[AlertRequest] = (),
     ) -> None:
         """Commit one runtime-state update and its events as one transaction."""
         self.set_monitor_states_and_append_opportunities(
             ((monitor_name, state_key, state, updated_at), *additional_states),
             opportunity_monitor_name=monitor_name,
             opportunities=opportunities,
+            notifications=notifications,
         )
 
     def set_monitor_states_and_append_opportunities(
@@ -112,6 +146,7 @@ class SQLiteRuntimeStore:
         *,
         opportunity_monitor_name: str | None = None,
         opportunities: Sequence[tuple[str, str, object, datetime | None]] = (),
+        notifications: Sequence[AlertRequest] = (),
     ) -> None:
         """Commit multiple runtime states and their events atomically."""
         if not states:
@@ -138,6 +173,7 @@ class SQLiteRuntimeStore:
             )
             for event_id, event_type, event, occurred_at in opportunities
         ]
+        notification_rows = [self._notification_row(alert) for alert in notifications]
         with self._connection:
             self._connection.executemany(
                 """
@@ -160,6 +196,174 @@ class SQLiteRuntimeStore:
                     for event_id, event_type, event_json, occurred_at in event_rows
                 ],
             )
+            self._connection.executemany(
+                """
+                INSERT INTO notification_outbox
+                    (monitor_name, event_id, alert_json, status, attempt_count,
+                     available_at, last_error, created_at, sent_at)
+                VALUES (?, ?, ?, 'pending', 0, ?, NULL, ?, NULL)
+                ON CONFLICT (monitor_name, event_id) DO NOTHING
+                """,
+                notification_rows,
+            )
+
+    @staticmethod
+    def _notification_row(alert: AlertRequest) -> tuple[str, str, str, str, str]:
+        if not isinstance(alert, AlertRequest):
+            raise TypeError("notifications must contain AlertRequest values")
+        created_at = _utc_iso(alert.created_at, "alert.created_at")
+        return (
+            alert.monitor,
+            alert.event_id,
+            _json_text(
+                {
+                    "monitor": alert.monitor,
+                    "event_id": alert.event_id,
+                    "created_at": created_at,
+                    "payload": alert.payload,
+                }
+            ),
+            created_at,
+            created_at,
+        )
+
+    @staticmethod
+    def _notification_from_row(row: sqlite3.Row) -> NotificationOutboxEntry:
+        alert_json = json.loads(row["alert_json"])
+        alert = AlertRequest(
+            monitor=alert_json["monitor"],
+            event_id=alert_json["event_id"],
+            created_at=datetime.fromisoformat(alert_json["created_at"]).astimezone(UTC),
+            payload=alert_json["payload"],
+        )
+        available_at = datetime.fromisoformat(row["available_at"]).astimezone(UTC)
+        created_at = datetime.fromisoformat(row["created_at"]).astimezone(UTC)
+        sent_at = (
+            None
+            if row["sent_at"] is None
+            else datetime.fromisoformat(row["sent_at"]).astimezone(UTC)
+        )
+        return NotificationOutboxEntry(
+            alert=alert,
+            status=row["status"],
+            attempt_count=int(row["attempt_count"]),
+            available_at=available_at,
+            last_error=row["last_error"],
+            created_at=created_at,
+            sent_at=sent_at,
+        )
+
+    def get_notification_outbox(
+        self, monitor_name: str, event_id: str
+    ) -> NotificationOutboxEntry | None:
+        row = self._connection.execute(
+            """
+            SELECT monitor_name, event_id, alert_json, status, attempt_count,
+                   available_at, last_error, created_at, sent_at
+            FROM notification_outbox
+            WHERE monitor_name = ? AND event_id = ?
+            """,
+            (
+                _require_text(monitor_name, "monitor_name"),
+                _require_text(event_id, "event_id"),
+            ),
+        ).fetchone()
+        return None if row is None else self._notification_from_row(row)
+
+    def list_notification_outbox(
+        self, *, now: datetime | None = None
+    ) -> list[NotificationOutboxEntry]:
+        now_iso = _utc_iso(now, "now")
+        rows = self._connection.execute(
+            """
+            SELECT monitor_name, event_id, alert_json, status, attempt_count,
+                   available_at, last_error, created_at, sent_at
+            FROM notification_outbox
+            WHERE status = 'pending' AND available_at <= ?
+            ORDER BY available_at, created_at, monitor_name, event_id
+            """,
+            (now_iso,),
+        ).fetchall()
+        return [self._notification_from_row(row) for row in rows]
+
+    def record_notification_attempt(self, monitor_name: str, event_id: str) -> int:
+        cursor = self._connection.execute(
+            """
+            UPDATE notification_outbox
+            SET attempt_count = attempt_count + 1
+            WHERE monitor_name = ? AND event_id = ? AND status = 'pending'
+            """,
+            (
+                _require_text(monitor_name, "monitor_name"),
+                _require_text(event_id, "event_id"),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"pending notification not found: {monitor_name}/{event_id}")
+        self._connection.commit()
+        row = self._connection.execute(
+            """
+            SELECT attempt_count
+            FROM notification_outbox
+            WHERE monitor_name = ? AND event_id = ?
+            """,
+            (monitor_name, event_id),
+        ).fetchone()
+        assert row is not None
+        return int(row["attempt_count"])
+
+    def record_notification_failure(
+        self,
+        monitor_name: str,
+        event_id: str,
+        *,
+        error_summary: str,
+        next_attempt_at: datetime,
+        terminal: bool,
+    ) -> None:
+        status = "failed" if terminal else "pending"
+        cursor = self._connection.execute(
+            """
+            UPDATE notification_outbox
+            SET status = ?, available_at = ?, last_error = ?
+            WHERE monitor_name = ? AND event_id = ? AND status = 'pending'
+            """,
+            (
+                status,
+                _utc_iso(next_attempt_at, "next_attempt_at"),
+                _require_text(error_summary, "error_summary"),
+                _require_text(monitor_name, "monitor_name"),
+                _require_text(event_id, "event_id"),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"pending notification not found: {monitor_name}/{event_id}")
+        self._connection.commit()
+
+    def mark_notification_sent(
+        self,
+        monitor_name: str,
+        event_id: str,
+        *,
+        sent_at: datetime | None = None,
+    ) -> None:
+        sent_iso = _utc_iso(sent_at, "sent_at")
+        cursor = self._connection.execute(
+            """
+            UPDATE notification_outbox
+            SET status = 'sent', sent_at = ?, available_at = ?, last_error = NULL
+            WHERE monitor_name = ? AND event_id = ? AND status = 'pending'
+            """,
+            (
+                sent_iso,
+                sent_iso,
+                _require_text(monitor_name, "monitor_name"),
+                _require_text(event_id, "event_id"),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"pending notification not found: {monitor_name}/{event_id}")
+        self._connection.commit()
 
     def get_monitor_state(self, monitor_name: str, state_key: str) -> object | None:
         row = self._connection.execute(

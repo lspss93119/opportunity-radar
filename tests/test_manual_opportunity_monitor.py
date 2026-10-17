@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 import logging
 
@@ -565,6 +566,63 @@ async def test_stale_bbo_does_not_advance_notification_quiet_timer(
 
 
 @pytest.mark.asyncio
+async def test_manual_outbox_retry_and_gate_state_remain_coherent(
+    small_history, tmp_path
+):
+    del small_history
+
+    class FlakyTelegram:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def send_text(self, _text: str) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("temporary Telegram failure")
+
+    from radar.alerts.worker import AlertWorker
+
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        instance = monitor(store=store, confirmation_seconds=0)
+        prime(instance)
+        alerts = await instance.evaluate(START, state_for(START))
+        assert [alert.payload["event_kind"] for alert in alerts] == ["manual_initial"]
+
+        telegram = FlakyTelegram()
+        processor = ManualOpportunityAlertProcessor(
+            telegram,
+            notification_gate=instance.notification_gate,
+        )  # type: ignore[arg-type]
+        worker = AlertWorker(
+            asyncio.Queue(),
+            processor,
+            runtime_store=store,
+            retry_delays_seconds=(0.0,),
+            poll_interval_seconds=0.01,
+        )
+        task = asyncio.create_task(worker.run_forever())
+        for _ in range(200):
+            row = store.get_notification_outbox(
+                "manual_opportunity", alerts[0].event_id
+            )
+            if telegram.attempts >= 2 and row is not None and row.status == "sent":
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("manual notification was not retried")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        row = store.get_notification_outbox("manual_opportunity", alerts[0].event_id)
+        assert row is not None
+        assert row.status == "sent"
+        assert row.attempt_count == 2
+        assert not instance.notification_gate.is_armed(KEY)
+
+
+@pytest.mark.asyncio
 async def test_runtime_store_batch_preserves_strategy_outputs(small_history, tmp_path):
     del small_history
     memory_monitor = monitor()
@@ -573,11 +631,13 @@ async def test_runtime_store_batch_preserves_strategy_outputs(small_history, tmp
         persisted_monitor = monitor(store=store)
         prime(memory_monitor)
         prime(persisted_monitor)
+        persisted_alerts_seen = []
 
         for offset in range(0, 80, 10):
             when = START + timedelta(seconds=offset)
             memory_alerts = await memory_monitor.evaluate(when, state_for(when))
             persisted_alerts = await persisted_monitor.evaluate(when, state_for(when))
+            persisted_alerts_seen.extend(persisted_alerts)
 
             assert [
                 (alert.event_id, alert.payload) for alert in persisted_alerts
@@ -588,6 +648,9 @@ async def test_runtime_store_batch_preserves_strategy_outputs(small_history, tmp
                 persisted_monitor._lifecycle._serialize_state()
                 == memory_monitor._lifecycle._serialize_state()
             )
+
+        outbox = store.list_notification_outbox()
+        assert [entry.alert for entry in outbox] == persisted_alerts_seen
 
 
 @pytest.mark.asyncio
