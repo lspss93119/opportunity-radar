@@ -114,6 +114,8 @@ class AlertWorker:
     async def _process_outbox_entry(self, entry: NotificationOutboxEntry) -> None:
         if entry.status != "pending":
             return
+        if entry.available_at > datetime.now(UTC):
+            return
         alert = entry.alert
         try:
             attempt = self._runtime_store.record_notification_attempt(
