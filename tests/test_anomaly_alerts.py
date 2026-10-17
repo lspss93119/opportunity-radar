@@ -304,6 +304,65 @@ async def test_transport_failure_does_not_mark_initial_sent(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_transport_failure_then_retry_success_audits_each_attempt(tmp_path):
+    class FailOnceTelegram:
+        def __init__(self) -> None:
+            self.attempts = 0
+            self.texts: list[str] = []
+
+        async def send_text(self, message: str) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("first transport failure")
+            self.texts.append(message)
+
+        async def send_chart(self, _chart: bytes, _caption: str) -> None:
+            raise AssertionError("the test should use text delivery")
+
+    telegram = FailOnceTelegram()
+    request = alert()
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite3") as store:
+        processor = SpreadAlertProcessor(
+            FakeHistory(context(10.0, 10.0, 10.0)),
+            telegram,
+            runtime_store=store,
+            chart_renderer=lambda _details, _history: None,
+        )
+        with pytest.raises(RuntimeError, match="first transport failure"):
+            await processor.process(request)
+        await processor.process(request)
+
+        events = store.list_opportunities(monitor_name="spread")
+        assert [event["event_type"] for event in events] == [
+            "anomaly_delivery_attempt",
+            "anomaly_delivery_result",
+            "anomaly_delivery_attempt",
+            "anomaly_delivery_result",
+        ]
+        event_ids = [event["event_id"] for event in events]
+        assert len(event_ids) == len(set(event_ids))
+        assert all(
+            event["event"]["source_event_id"] == request.event_id
+            for event in events
+        )
+        attempts = [
+            event for event in events if event["event_type"] == "anomaly_delivery_attempt"
+        ]
+        results = [
+            event for event in events if event["event_type"] == "anomaly_delivery_result"
+        ]
+        assert [result["event"]["outcome"] for result in results] == [
+            "transport_error",
+            "success",
+        ]
+        assert [result["event"]["attempt_event_id"] for result in results] == [
+            attempt["event_id"] for attempt in attempts
+        ]
+        assert telegram.attempts == 2
+        assert len(telegram.texts) == 1
+
+
+@pytest.mark.asyncio
 async def test_same_symbol_initial_is_suppressed_and_audit_is_persisted(tmp_path):
     telegram = FakeTelegram()
     clock = MutableClock(NOW)
