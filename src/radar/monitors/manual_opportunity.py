@@ -635,11 +635,17 @@ class ManualOpportunityLifecycle:
         updated_at: datetime,
         *,
         additional_states: Sequence[tuple[str, str, object, datetime | None]] = (),
+        notifications: Sequence[AlertRequest] = (),
     ) -> None:
         if self._cycle_originals is None or self._cycle_events is None:
             raise RuntimeError("manual opportunity cycle is not active")
         try:
-            self._persist(updated_at, self._cycle_events, additional_states)
+            self._persist(
+                updated_at,
+                self._cycle_events,
+                additional_states,
+                notifications,
+            )
         except Exception:
             self.rollback_cycle()
             raise
@@ -675,7 +681,7 @@ class ManualOpportunityLifecycle:
                 raise RuntimeError("manual opportunity cycle events are unavailable")
             self._cycle_events.extend(events)
             if owns_cycle:
-                self.flush_cycle(evaluation_time)
+                self.flush_cycle(evaluation_time, notifications=alerts)
             return alerts
         except Exception:
             if owns_cycle:
@@ -1001,6 +1007,7 @@ class ManualOpportunityLifecycle:
         updated_at: datetime,
         events: list[tuple[str, str, object, datetime | None]],
         additional_states: Sequence[tuple[str, str, object, datetime | None]] = (),
+        notifications: Sequence[AlertRequest] = (),
     ) -> None:
         if self._runtime_store is None:
             return
@@ -1011,6 +1018,7 @@ class ManualOpportunityLifecycle:
             updated_at=updated_at,
             opportunities=events,
             additional_states=additional_states,
+            notifications=notifications,
         )
 
     def _serialize_state(self) -> dict[str, JSONValue]:
@@ -1384,6 +1392,7 @@ class ManualOpportunityMonitor:
                             current_time,
                         ),
                     ),
+                    notifications=alerts,
                 )
                 self._notification_gate.commit_cycle(current_time, persist=False)
             finally:
