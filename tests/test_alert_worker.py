@@ -391,6 +391,39 @@ async def test_durable_worker_deduplicates_already_sent_queue_item(tmp_path):
         assert queue.empty()
 
 
+@pytest.mark.asyncio
+async def test_duplicate_queue_item_respects_retry_backoff(tmp_path):
+    from radar.alerts.worker import AlertWorker
+
+    alert = make_alert("duplicate-backoff")
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite3") as store:
+        seed_outbox(store, alert)
+        processor = FlakyProcessor(failures=1)
+        queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+        queue.put_nowait(alert)
+        queue.put_nowait(alert)
+        worker = AlertWorker(
+            queue,
+            processor,  # type: ignore[arg-type]
+            runtime_store=store,
+            retry_delays_seconds=(3600.0,),
+        )
+
+        await worker.run_once()
+        first = store.get_notification_outbox("spread", alert.event_id)
+        assert first is not None
+        assert first.status == "pending"
+        assert first.attempt_count == 1
+
+        await worker.run_once()
+        second = store.get_notification_outbox("spread", alert.event_id)
+        assert second is not None
+        assert second.status == "pending"
+        assert second.attempt_count == 1
+        assert len(processor.processed) == 1
+        assert queue.empty()
+
+
 async def _wait_until(predicate, interval: float = 0.005) -> None:
     for _ in range(200):
         if predicate():
