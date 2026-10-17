@@ -286,19 +286,46 @@ class SQLiteRuntimeStore:
         ).fetchall()
         return [self._notification_from_row(row) for row in rows]
 
-    def record_notification_attempt(self, monitor_name: str, event_id: str) -> int:
+    def record_notification_attempt(
+        self,
+        monitor_name: str,
+        event_id: str,
+        *,
+        max_attempts: int | None = None,
+    ) -> int | None:
+        if max_attempts is not None and max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        monitor_name = _require_text(monitor_name, "monitor_name")
+        event_id = _require_text(event_id, "event_id")
+        where = "monitor_name = ? AND event_id = ? AND status = 'pending'"
+        parameters: tuple[object, ...] = (monitor_name, event_id)
+        if max_attempts is not None:
+            where += " AND attempt_count < ?"
+            parameters += (max_attempts,)
         cursor = self._connection.execute(
-            """
+            f"""
             UPDATE notification_outbox
             SET attempt_count = attempt_count + 1
-            WHERE monitor_name = ? AND event_id = ? AND status = 'pending'
+            WHERE {where}
             """,
-            (
-                _require_text(monitor_name, "monitor_name"),
-                _require_text(event_id, "event_id"),
-            ),
+            parameters,
         )
         if cursor.rowcount != 1:
+            row = self._connection.execute(
+                """
+                SELECT status, attempt_count
+                FROM notification_outbox
+                WHERE monitor_name = ? AND event_id = ?
+                """,
+                (monitor_name, event_id),
+            ).fetchone()
+            if (
+                row is not None
+                and row["status"] == "pending"
+                and max_attempts is not None
+                and int(row["attempt_count"]) >= max_attempts
+            ):
+                return None
             raise KeyError(f"pending notification not found: {monitor_name}/{event_id}")
         self._connection.commit()
         row = self._connection.execute(

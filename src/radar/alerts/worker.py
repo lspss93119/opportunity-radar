@@ -117,13 +117,31 @@ class AlertWorker:
         alert = entry.alert
         try:
             attempt = self._runtime_store.record_notification_attempt(
-                alert.monitor, alert.event_id
+                alert.monitor,
+                alert.event_id,
+                max_attempts=self._max_attempts,
             )
         except Exception:  # noqa: BLE001
             LOGGER.exception(
                 "notification outbox attempt could not be recorded event_id=%s",
                 alert.event_id,
             )
+            return
+        if attempt is None:
+            try:
+                self._runtime_store.record_notification_failure(
+                    alert.monitor,
+                    alert.event_id,
+                    error_summary="max_attempts_exhausted",
+                    next_attempt_at=datetime.now(UTC),
+                    terminal=True,
+                )
+            except Exception:  # noqa: BLE001
+                LOGGER.exception(
+                    "notification outbox max-attempt terminal state could not be recorded "
+                    "event_id=%s",
+                    alert.event_id,
+                )
             return
         try:
             await self._processor.process(alert)

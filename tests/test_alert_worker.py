@@ -261,6 +261,78 @@ async def test_durable_worker_retries_transient_failure_and_records_attempts(tmp
 
 
 @pytest.mark.asyncio
+async def test_restart_does_not_bypass_max_attempts_after_inflight_cancellation(tmp_path):
+    from radar.alerts.worker import AlertWorker
+
+    class BlockingProcessor:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.processed: list[AlertRequest] = []
+
+        async def process(self, alert: AlertRequest) -> None:
+            self.processed.append(alert)
+            self.started.set()
+            await self.release.wait()
+
+    database = tmp_path / "runtime.sqlite3"
+    alert = make_alert("cancelled-in-flight")
+    with SQLiteRuntimeStore(database) as store:
+        seed_outbox(store, alert)
+        first_processor = BlockingProcessor()
+        first_worker = AlertWorker(
+            asyncio.Queue(),
+            first_processor,  # type: ignore[arg-type]
+            runtime_store=store,
+            max_attempts=1,
+            poll_interval_seconds=0.01,
+        )
+        first_task = asyncio.create_task(first_worker.run_forever())
+        await asyncio.wait_for(first_processor.started.wait(), timeout=1)
+        first_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_task
+
+        pending = store.get_notification_outbox("spread", alert.event_id)
+        assert pending is not None
+        assert pending.status == "pending"
+        assert pending.attempt_count == 1
+
+    with SQLiteRuntimeStore(database) as restarted_store:
+        second_processor = FlakyProcessor()
+        restarted_worker = AlertWorker(
+            asyncio.Queue(),
+            second_processor,  # type: ignore[arg-type]
+            runtime_store=restarted_store,
+            max_attempts=1,
+            poll_interval_seconds=0.01,
+        )
+        restarted_task = asyncio.create_task(restarted_worker.run_forever())
+        await asyncio.wait_for(
+            _wait_until(
+                lambda: (
+                    (row := restarted_store.get_notification_outbox(
+                        "spread", alert.event_id
+                    ))
+                    is not None
+                    and row.status in {"failed", "sent"}
+                )
+            ),
+            timeout=1,
+        )
+        restarted_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await restarted_task
+
+        terminal = restarted_store.get_notification_outbox("spread", alert.event_id)
+        assert terminal is not None
+        assert terminal.status == "failed"
+        assert terminal.attempt_count == 1
+        assert terminal.last_error == "max_attempts_exhausted"
+        assert second_processor.processed == []
+
+
+@pytest.mark.asyncio
 async def test_durable_worker_marks_permanent_failure_without_requeue(tmp_path):
     from radar.alerts.worker import AlertWorker
 
