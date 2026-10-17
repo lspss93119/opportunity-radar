@@ -788,7 +788,10 @@ async def test_already_alerted_episode_restores_without_duplicate_alert(tmp_path
         prime_triggering_monitor(monitor, state)
         for offset in range(0, 60, 10):
             assert await monitor.evaluate(NOW + timedelta(seconds=offset), state) == []
-        assert len(await monitor.evaluate(NOW + timedelta(seconds=60), state)) == 1
+        alerts = await monitor.evaluate(NOW + timedelta(seconds=60), state)
+        assert len(alerts) == 1
+        pending = store.list_notification_outbox()
+        assert [entry.alert for entry in pending] == alerts
 
     with SQLiteRuntimeStore(database) as reopened_store:
         reopened = make_monitor(
