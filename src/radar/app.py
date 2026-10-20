@@ -905,6 +905,7 @@ def build_application(
     alert_worker = AlertWorker(
         queue,
         processor,
+        runtime_store=runtime_store,
         error_handler=alert_error_handler,
     )
     return RadarApplication(
