@@ -36,4 +36,3 @@ jobs:
           git worktree add --detach /tmp/radar-base origin/feature/radar-v1
           cd /tmp/radar-base
           uv run --project . --group dev python -m pytest -q 'tests/test_dashboard.py::test_pair_ui_summary_chart_and_range_state' 'tests/test_dashboard.py::test_pair_downsampling_preserves_unavailable_mean_break[svg]' 'tests/test_hyperliquid_websocket.py::test_hyperliquid_non_l2_messages_do_not_reset_silence_watchdog' -m 'not live'
-
