@@ -8,7 +8,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 EXPLICIT_FEE_VENUES = frozenset(
-    {"trade_xyz", "entropy", "arcus", "backpack", "lighter_robinhood"}
+    {"trade_xyz", "entropy", "arcus", "backpack", "lighter_robinhood", "ondo"}
 )
 
 
