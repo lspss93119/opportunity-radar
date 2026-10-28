@@ -21,6 +21,7 @@ MONITOR_FACTORIES: dict[str, MonitorFactory] = {
         runtime_store=runtime_store,
         interval_seconds=config.sampling_seconds,
         stale_after_seconds=config.monitors.spread.stale_after_seconds,
+        market_identities=config.monitor_market_identities(),
     ),
 }
 

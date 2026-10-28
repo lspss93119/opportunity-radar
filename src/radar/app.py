@@ -843,11 +843,7 @@ def build_application(
     if manual_monitors:
         hydration_started = time.perf_counter()
         peak_rss_before = _max_rss_bytes()
-        allowed_feeds = {
-            (market.venue, market.venue_symbol, market.canonical_symbol)
-            for market in config.markets
-            if market.enabled
-        }
+        allowed_feeds = config.monitor_market_identities()
         manual_history = load_recent_bbo_history(
             Path(data_root),
             allowed_feeds=allowed_feeds,
