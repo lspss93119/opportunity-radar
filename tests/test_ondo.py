@@ -103,3 +103,30 @@ def test_pipeline_only_registers_ondo_when_enabled():
     config = RadarConfig(markets=[MARKET], fees_bps={"ondo": 3.0})
     pipeline = MarketDataPipeline.from_config(config)
     assert sum(c.venue == "ondo" for c in pipeline.collectors) == 1
+
+
+@pytest.mark.asyncio
+async def test_ondo_contracts_failure_invalidates_cached_book():
+    from radar.market_data import LatestMarketData
+    from radar.vwap import BookLevel
+
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="ondo", venue_symbol="BTC-USD.P",
+        bids=[BookLevel(price=69999, base_size=1)],
+        asks=[BookLevel(price=70001, base_size=1)],
+        observed_at=NOW,
+    )
+
+    async def failing_request(url, *, method="GET", params=None):
+        raise RuntimeError("contract endpoint unavailable")
+
+    collector = OndoCollector(
+        [MARKET], latest_market_data=latest, request_json=failing_request,
+        clock=lambda: NOW, error_handler=lambda venue, error: None,
+    )
+    batch = await collector.collect(sample_time=NOW, include_hourly_context=False)
+    assert not batch.market_snapshots
+    assert latest.ready_venues(
+        markets=[MARKET], canonical_symbol="BTC", now=NOW, stale_after_seconds=30,
+    ) == set()
