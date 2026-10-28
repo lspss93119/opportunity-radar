@@ -129,6 +129,8 @@ class OndoCollector:
         async def market_snapshot(market: MarketConfig) -> MarketSnapshot | None:
             contract = contracts.get(market.venue_symbol)
             if contract is None:
+                if self._latest_market_data is not None:
+                    self._latest_market_data.invalidate(venue=self.venue, venue_symbol=market.venue_symbol)
                 return None
             try:
                 raw = await self._request_json(self.DEPTH_URL, method="GET", params={
@@ -142,7 +144,7 @@ class OndoCollector:
                     canonical_symbol=market.canonical_symbol,
                     best_bid=bids[0].price, best_bid_size=bids[0].base_size,
                     best_ask=asks[0].price, best_ask_size=asks[0].base_size,
-                    mark_price=_optional_positive(contract.get("lastPrice")),
+                    mark_price=None,  # lastPrice is a trade price, not markPrice
                     index_price=_optional_positive(contract.get("indexPrice")),
                     buy_1k_vwap=buy_vwap(asks, 1000), sell_1k_vwap=sell_vwap(bids, 1000),
                     buy_5k_vwap=buy_vwap(asks, 5000), sell_5k_vwap=sell_vwap(bids, 5000),
@@ -205,7 +207,9 @@ class OndoCollector:
                 if not isinstance(point, dict) or point.get("market") != market.venue_symbol:
                     raise ValueError("Ondo funding market mismatch")
                 rate = finite_float(point.get("rate"), "funding rate")
-                effective = _time(point["intervalEnds"]) if point.get("intervalEnds") else now
+                if not point.get("intervalEnds"):
+                    raise ValueError("Ondo funding interval end missing")
+                effective = _time(point["intervalEnds"])
                 funding.append(FundingSnapshot(
                     effective_time=effective, observed_at=self._clock(), venue=self.venue,
                     venue_symbol=market.venue_symbol, canonical_symbol=market.canonical_symbol,
