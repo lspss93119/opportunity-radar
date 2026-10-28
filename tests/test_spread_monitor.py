@@ -70,6 +70,8 @@ def make_monitor(
     *,
     runtime_store: SQLiteRuntimeStore | None = None,
     fees_bps: dict[str, float] | None = None,
+    live_quote_max_age_seconds: float = 300.0,
+    live_quote_max_skew_seconds: float = 3.0,
     **overrides: object,
 ) -> SpreadMonitor:
     values = {
@@ -90,6 +92,9 @@ def make_monitor(
         basis_window_seconds=12_000,
         basis_min_observations=4,
         basis_expected_interval_seconds=10,
+        # Legacy episode tests deliberately reuse frozen observations over time.
+        live_quote_max_age_seconds=live_quote_max_age_seconds,
+        live_quote_max_skew_seconds=live_quote_max_skew_seconds,
     )
 
 
@@ -788,7 +793,10 @@ async def test_already_alerted_episode_restores_without_duplicate_alert(tmp_path
         prime_triggering_monitor(monitor, state)
         for offset in range(0, 60, 10):
             assert await monitor.evaluate(NOW + timedelta(seconds=offset), state) == []
-        assert len(await monitor.evaluate(NOW + timedelta(seconds=60), state)) == 1
+        alerts = await monitor.evaluate(NOW + timedelta(seconds=60), state)
+        assert len(alerts) == 1
+        pending = store.list_notification_outbox()
+        assert [entry.alert for entry in pending] == alerts
 
     with SQLiteRuntimeStore(database) as reopened_store:
         reopened = make_monitor(
@@ -1243,3 +1251,45 @@ async def test_one_alert_per_episode_and_reentry_can_alert_again():
     second_alerts = await monitor.evaluate(NOW + timedelta(seconds=150), qualifying_state)
     assert len(second_alerts) == 1
     assert second_alerts[0].event_id != first_alerts[0].event_id
+
+
+
+@pytest.mark.parametrize(
+    ("long_age", "short_age", "max_age", "expected"),
+    [
+        (0.0, 0.0, 3.0, True),
+        (3.0, 0.0, 3.0, True),
+        (3.001, 0.0, 3.0, False),
+        (0.0, 3.001, 3.0, False),
+        (4.0, 0.0, 10.0, False),  # Each leg fresh, pair skew > 3s.
+        (3.0, 1.0, 3.0, True),
+        (-0.001, 0.0, 3.0, False),
+    ],
+)
+def test_live_pair_alignment_fails_closed_on_age_and_skew(
+    long_age, short_age, max_age, expected
+):
+    candidates = build_spread_candidates(
+        (
+            make_market("long", observed_at=NOW - timedelta(seconds=long_age)),
+            make_market("short", observed_at=NOW - timedelta(seconds=short_age)),
+        ),
+        NOW,
+        primary_size_usd=10_000,
+        stale_after_seconds=30,
+        fees_bps={"long": 0.0, "short": 0.0},
+        live_quote_max_age_seconds=max_age,
+        live_quote_max_skew_seconds=3.0,
+    )
+    assert bool(candidates) is expected
+
+
+@pytest.mark.asyncio
+async def test_live_spread_monitor_filters_old_quotes_before_basis_update():
+    instance = make_monitor(live_quote_max_age_seconds=3.0)
+    state = make_state(
+        make_market("long", observed_at=NOW - timedelta(seconds=4)),
+        make_market("short", observed_at=NOW),
+    )
+    assert await instance.evaluate(NOW, state) == []
+    assert instance._basis_by_key == {}

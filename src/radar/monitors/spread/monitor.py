@@ -27,6 +27,8 @@ from radar.monitors.spread.models import (
     SpreadCandidate,
     SpreadPairKey,
     build_spread_candidates,
+    LIVE_QUOTE_MAX_AGE_SECONDS,
+    LIVE_QUOTE_MAX_SKEW_SECONDS,
 )
 
 UTC = timezone.utc
@@ -93,6 +95,8 @@ class SpreadMonitor:
         basis_window_seconds: int = ROLLING_WINDOW_SECONDS,
         basis_min_observations: int = MIN_HISTORY_OBSERVATIONS,
         basis_expected_interval_seconds: int = EXPECTED_INTERVAL_SECONDS,
+        live_quote_max_age_seconds: float = LIVE_QUOTE_MAX_AGE_SECONDS,
+        live_quote_max_skew_seconds: float = LIVE_QUOTE_MAX_SKEW_SECONDS,
     ) -> None:
         self.interval_seconds = config.interval_seconds
         self.config = config
@@ -101,6 +105,15 @@ class SpreadMonitor:
         self._basis_window_seconds = basis_window_seconds
         self._basis_min_observations = basis_min_observations
         self._basis_expected_interval_seconds = basis_expected_interval_seconds
+        if (
+            not math.isfinite(live_quote_max_age_seconds)
+            or live_quote_max_age_seconds <= 0
+            or not math.isfinite(live_quote_max_skew_seconds)
+            or live_quote_max_skew_seconds < 0
+        ):
+            raise ValueError("invalid live quote age/skew limits")
+        self._live_quote_max_age_seconds = live_quote_max_age_seconds
+        self._live_quote_max_skew_seconds = live_quote_max_skew_seconds
         self._episodes: dict[SpreadPairKey, SpreadEpisode] = {}
         self._basis_by_key: dict[SpreadPairKey, RollingBasis] = {}
         self._anomaly_v2 = (
@@ -209,6 +222,8 @@ class SpreadMonitor:
             stale_after_seconds=self.config.stale_after_seconds,
             fees_bps=self._fees_bps,
             require_fees=False,
+            live_quote_max_age_seconds=self._live_quote_max_age_seconds,
+            live_quote_max_skew_seconds=self._live_quote_max_skew_seconds,
         )
         candidate_build_ms = _elapsed_ms(candidate_build_started)
         previous_episodes = (
@@ -344,7 +359,7 @@ class SpreadMonitor:
 
             lifecycle_ms = _elapsed_ms(lifecycle_started)
             persistence_started = time.perf_counter()
-            self._persist_episodes(current_time, events)
+            self._persist_episodes(current_time, events, notifications=alerts)
             sqlite_persistence_ms = _elapsed_ms(persistence_started)
             self._log_cycle_timing(
                 candidate_build_ms=candidate_build_ms,
@@ -377,6 +392,8 @@ class SpreadMonitor:
             stale_after_seconds=self.config.stale_after_seconds,
             fees_bps=self._fees_bps,
             require_fees=False,
+            live_quote_max_age_seconds=self._live_quote_max_age_seconds,
+            live_quote_max_skew_seconds=self._live_quote_max_skew_seconds,
         )
         candidate_build_ms = _elapsed_ms(candidate_build_started)
         candidate_by_key = {candidate.key: candidate for candidate in candidates}
@@ -412,7 +429,13 @@ class SpreadMonitor:
             )
             lifecycle_ms = _elapsed_ms(lifecycle_started)
             persistence_started = time.perf_counter()
-            self._persist_anomaly_v2(current_time, result.events)
+            self._persist_anomaly_v2(
+                current_time,
+                result.events,
+                notifications=(
+                    result.alerts if self.config.anomaly_v2.telegram_enabled else ()
+                ),
+            )
             sqlite_persistence_ms = _elapsed_ms(persistence_started)
             alert_count = len(result.alerts) if self.config.anomaly_v2.telegram_enabled else 0
             self._log_cycle_timing(
@@ -638,6 +661,8 @@ class SpreadMonitor:
         self,
         now: datetime,
         events: list[OpportunityEvent],
+        *,
+        notifications: Sequence[AlertRequest] = (),
     ) -> None:
         if self._runtime_store is None:
             return
@@ -650,12 +675,15 @@ class SpreadMonitor:
             },
             updated_at=now,
             opportunities=events,
+            notifications=notifications,
         )
 
     def _persist_anomaly_v2(
         self,
         now: datetime,
         events: tuple[OpportunityEvent, ...],
+        *,
+        notifications: Sequence[AlertRequest] = (),
     ) -> None:
         if self._runtime_store is None or self._anomaly_v2 is None:
             return
@@ -665,6 +693,7 @@ class SpreadMonitor:
             self._anomaly_v2.snapshot(),
             updated_at=now,
             opportunities=events,
+            notifications=notifications,
         )
 
     @staticmethod

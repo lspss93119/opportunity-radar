@@ -183,11 +183,14 @@ async def test_v2_restart_restores_active_episode_and_deduplicates_confirmation(
         monitor = make_monitor(store=store)
         prime(monitor)
         await monitor.evaluate(START, state_at(START))
+        confirmed_alerts = []
         for seconds in range(10, 61, 10):
-            await monitor.evaluate(
+            confirmed_alerts = await monitor.evaluate(
                 START + timedelta(seconds=seconds),
                 state_at(START + timedelta(seconds=seconds)),
             )
+        pending = store.list_notification_outbox()
+        assert [entry.alert for entry in pending] == confirmed_alerts
         assert monitor._anomaly_v2 is not None
         persisted_v2 = monitor._anomaly_v2.snapshot()
 
@@ -428,3 +431,27 @@ async def test_v2_snapshot_rejects_active_tracker_without_state():
 def test_anomaly_v2_disabled_keeps_legacy_mode():
     monitor = make_monitor(enabled=False)
     assert monitor._anomaly_v2 is None
+
+
+
+@pytest.mark.asyncio
+async def test_anomaly_v2_filters_stale_leg_before_lifecycle_and_basis_update():
+    instance = make_monitor()
+    prime(instance)
+    state = RadarState()
+    old_leg = market("arcus", START, long_side=True).model_copy(
+        update={"observed_at": START - timedelta(seconds=4)}
+    )
+    state.apply_market_batch(
+        CollectorBatch(
+            market_snapshots=(
+                old_leg,
+                market("lighter_robinhood", START, long_side=False),
+            )
+        )
+    )
+    key = SpreadPairKey("QQQ", "arcus", "QQQ-USD", "lighter_robinhood", "QQQ")
+    before_count = instance._basis_by_key[key].sample_count
+    assert await instance.evaluate(START, state) == []
+    assert instance.active_anomaly_episodes == ()
+    assert instance._basis_by_key[key].sample_count == before_count

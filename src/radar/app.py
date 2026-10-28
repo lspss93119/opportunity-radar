@@ -857,12 +857,17 @@ def build_application(
             hydrate_history = getattr(monitor, "hydrate_history", None)
             if callable(hydrate_history):
                 hydrate_history(manual_history)
+        manual_history_routes = len(manual_history)
+        manual_history_observations = sum(
+            len(points) for points in manual_history.values()
+        )
+        del manual_history
         LOGGER.info(
             "manual opportunity history hydrated routes=%d observations=%d "
             "duration_ms=%.3f peak_rss_before=%d peak_rss_after=%d "
             "current_rss_after=%s",
-            len(manual_history),
-            sum(len(points) for points in manual_history.values()),
+            manual_history_routes,
+            manual_history_observations,
             _elapsed_ms(hydration_started),
             peak_rss_before,
             _max_rss_bytes(),
@@ -905,6 +910,7 @@ def build_application(
     alert_worker = AlertWorker(
         queue,
         processor,
+        runtime_store=runtime_store,
         error_handler=alert_error_handler,
     )
     return RadarApplication(

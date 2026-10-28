@@ -12,7 +12,12 @@ from typing import Any
 from radar.config import ManualOpportunityConfig
 from radar.models import MarketSnapshot
 from radar.monitors.base import AlertRequest, JSONValue
-from radar.monitors.spread.models import SpreadPairKey
+from radar.monitors.spread.models import (
+    SpreadPairKey,
+    LIVE_QUOTE_MAX_AGE_SECONDS,
+    LIVE_QUOTE_MAX_SKEW_SECONDS,
+    is_live_synchronized_pair,
+)
 from radar.state import RadarState
 from radar.storage.sqlite import SQLiteRuntimeStore
 
@@ -635,11 +640,17 @@ class ManualOpportunityLifecycle:
         updated_at: datetime,
         *,
         additional_states: Sequence[tuple[str, str, object, datetime | None]] = (),
+        notifications: Sequence[AlertRequest] = (),
     ) -> None:
         if self._cycle_originals is None or self._cycle_events is None:
             raise RuntimeError("manual opportunity cycle is not active")
         try:
-            self._persist(updated_at, self._cycle_events, additional_states)
+            self._persist(
+                updated_at,
+                self._cycle_events,
+                additional_states,
+                notifications,
+            )
         except Exception:
             self.rollback_cycle()
             raise
@@ -675,7 +686,7 @@ class ManualOpportunityLifecycle:
                 raise RuntimeError("manual opportunity cycle events are unavailable")
             self._cycle_events.extend(events)
             if owns_cycle:
-                self.flush_cycle(evaluation_time)
+                self.flush_cycle(evaluation_time, notifications=alerts)
             return alerts
         except Exception:
             if owns_cycle:
@@ -1001,6 +1012,7 @@ class ManualOpportunityLifecycle:
         updated_at: datetime,
         events: list[tuple[str, str, object, datetime | None]],
         additional_states: Sequence[tuple[str, str, object, datetime | None]] = (),
+        notifications: Sequence[AlertRequest] = (),
     ) -> None:
         if self._runtime_store is None:
             return
@@ -1011,6 +1023,7 @@ class ManualOpportunityLifecycle:
             updated_at=updated_at,
             opportunities=events,
             additional_states=additional_states,
+            notifications=notifications,
         )
 
     def _serialize_state(self) -> dict[str, JSONValue]:
@@ -1182,6 +1195,8 @@ class ManualOpportunityMonitor:
         runtime_store: SQLiteRuntimeStore | None = None,
         interval_seconds: int = 10,
         stale_after_seconds: int = DEFAULT_MANUAL_STALE_AFTER_SECONDS,
+        live_quote_max_age_seconds: float = LIVE_QUOTE_MAX_AGE_SECONDS,
+        live_quote_max_skew_seconds: float = LIVE_QUOTE_MAX_SKEW_SECONDS,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
@@ -1190,6 +1205,15 @@ class ManualOpportunityMonitor:
         self._fees_bps = dict(fees_bps)
         self._runtime_store = runtime_store
         self._stale_after_seconds = stale_after_seconds
+        if (
+            not math.isfinite(live_quote_max_age_seconds)
+            or live_quote_max_age_seconds <= 0
+            or not math.isfinite(live_quote_max_skew_seconds)
+            or live_quote_max_skew_seconds < 0
+        ):
+            raise ValueError("invalid live quote age/skew limits")
+        self._live_quote_max_age_seconds = live_quote_max_age_seconds
+        self._live_quote_max_skew_seconds = live_quote_max_skew_seconds
         self._histories: dict[SpreadPairKey, Any] = {}
         self._notification_gate = ManualOpportunityNotificationGate(
             config,
@@ -1270,6 +1294,14 @@ class ManualOpportunityMonitor:
                         ):
                             continue
                         if long_snapshot.sample_time != short_snapshot.sample_time:
+                            continue
+                        if not is_live_synchronized_pair(
+                            long_snapshot,
+                            short_snapshot,
+                            current_time,
+                            max_age_seconds=self._live_quote_max_age_seconds,
+                            max_skew_seconds=self._live_quote_max_skew_seconds,
+                        ):
                             continue
                         long_context = context_by_key.get(
                             (long_venue, long_symbol, canonical_symbol)
@@ -1384,6 +1416,7 @@ class ManualOpportunityMonitor:
                             current_time,
                         ),
                     ),
+                    notifications=alerts,
                 )
                 self._notification_gate.commit_cycle(current_time, persist=False)
             finally:

@@ -223,6 +223,12 @@ class MarketDataPipeline:
                     config.markets,
                     clock=clock,
                     error_handler=collector_error_handler,
+                    source=config.arcus.source,
+                    ws_url=config.arcus.ws_url,
+                    ws_levels=config.arcus.ws_levels,
+                    ws_silence_seconds=config.arcus.ws_silence_seconds,
+                    ws_reconnect_delay_seconds=config.arcus.ws_reconnect_delay_seconds,
+                    rest_fallback=config.arcus.rest_fallback,
                     **collector_kwargs,
                 )
             )
@@ -369,7 +375,7 @@ class MarketDataPipeline:
                 diagnostic.canonical_symbol,
             )
             for diagnostic in diagnostics
-            if diagnostic.reason == "included"
+            if diagnostic.reason == "included" and diagnostic.live_signal_eligible
         }
         self._record_market_availability(diagnostics)
         batch = CollectorBatch(
@@ -384,9 +390,13 @@ class MarketDataPipeline:
                 in included_keys
             )
         )
+        # Keep the strict 10k-depth gate for live monitoring, but archive every
+        # fresh, valid BBO even when only the smaller VWAP tiers are executable.
+        # Historical research must not lose $1k/$5k observations merely because
+        # the same book cannot fill $10k on both sides.
         self.state.apply_market_batch(batch)
         if self.storage is not None:
-            self.storage.append(batch)
+            self.storage.append(candidate_batch)
         return batch
 
     def _record_market_availability(

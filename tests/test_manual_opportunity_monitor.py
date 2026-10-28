@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 import logging
 
@@ -32,6 +33,19 @@ class _SmallHistory(BboRollingHistory):
             expected_interval_seconds=10,
             minimum_coverage=0.0,
         )
+
+
+class _LegacySmallHistory(_SmallHistory):
+    def hydrate(self, points: list[tuple[datetime, float]]) -> None:
+        for name in self.windows_seconds:
+            self._points[name].clear()
+            self._sums[name] = 0.0
+        self._last_sample_time = None
+        values = {
+            timestamp: float(value) for timestamp, value in points
+        }
+        for timestamp in sorted(values):
+            self._append(timestamp, values[timestamp])
 
 
 @pytest.fixture
@@ -145,6 +159,32 @@ def prime(monitor_instance: ManualOpportunityMonitor, key: SpreadPairKey = KEY) 
             )
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_bounded_hydration_preserves_lifecycle_events(monkeypatch):
+    points = {
+        KEY: tuple(
+            (START - timedelta(seconds=offset), 0.0)
+            for offset in range(1_000, 0, -10)
+        )
+    }
+    monkeypatch.setattr(history_module, "BboRollingHistory", _SmallHistory)
+    optimized = monitor()
+    optimized.hydrate_history(points)
+
+    monkeypatch.setattr(history_module, "BboRollingHistory", _LegacySmallHistory)
+    legacy = monitor()
+    legacy.hydrate_history(points)
+
+    for offset in range(0, 70, 10):
+        when = START + timedelta(seconds=offset)
+        expected = await legacy.evaluate(when, state_for(when))
+        actual = await optimized.evaluate(when, state_for(when))
+        assert [(alert.event_id, alert.payload) for alert in actual] == [
+            (alert.event_id, alert.payload) for alert in expected
+        ]
+        assert optimized.active_episodes == legacy.active_episodes
 
 
 @pytest.mark.asyncio
@@ -526,6 +566,63 @@ async def test_stale_bbo_does_not_advance_notification_quiet_timer(
 
 
 @pytest.mark.asyncio
+async def test_manual_outbox_retry_and_gate_state_remain_coherent(
+    small_history, tmp_path
+):
+    del small_history
+
+    class FlakyTelegram:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def send_text(self, _text: str) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("temporary Telegram failure")
+
+    from radar.alerts.worker import AlertWorker
+
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        instance = monitor(store=store, confirmation_seconds=0)
+        prime(instance)
+        alerts = await instance.evaluate(START, state_for(START))
+        assert [alert.payload["event_kind"] for alert in alerts] == ["manual_initial"]
+
+        telegram = FlakyTelegram()
+        processor = ManualOpportunityAlertProcessor(
+            telegram,
+            notification_gate=instance.notification_gate,
+        )  # type: ignore[arg-type]
+        worker = AlertWorker(
+            asyncio.Queue(),
+            processor,
+            runtime_store=store,
+            retry_delays_seconds=(0.0,),
+            poll_interval_seconds=0.01,
+        )
+        task = asyncio.create_task(worker.run_forever())
+        for _ in range(200):
+            row = store.get_notification_outbox(
+                "manual_opportunity", alerts[0].event_id
+            )
+            if telegram.attempts >= 2 and row is not None and row.status == "sent":
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("manual notification was not retried")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        row = store.get_notification_outbox("manual_opportunity", alerts[0].event_id)
+        assert row is not None
+        assert row.status == "sent"
+        assert row.attempt_count == 2
+        assert not instance.notification_gate.is_armed(KEY)
+
+
+@pytest.mark.asyncio
 async def test_runtime_store_batch_preserves_strategy_outputs(small_history, tmp_path):
     del small_history
     memory_monitor = monitor()
@@ -534,11 +631,13 @@ async def test_runtime_store_batch_preserves_strategy_outputs(small_history, tmp
         persisted_monitor = monitor(store=store)
         prime(memory_monitor)
         prime(persisted_monitor)
+        persisted_alerts_seen = []
 
         for offset in range(0, 80, 10):
             when = START + timedelta(seconds=offset)
             memory_alerts = await memory_monitor.evaluate(when, state_for(when))
             persisted_alerts = await persisted_monitor.evaluate(when, state_for(when))
+            persisted_alerts_seen.extend(persisted_alerts)
 
             assert [
                 (alert.event_id, alert.payload) for alert in persisted_alerts
@@ -549,6 +648,9 @@ async def test_runtime_store_batch_preserves_strategy_outputs(small_history, tmp
                 persisted_monitor._lifecycle._serialize_state()
                 == memory_monitor._lifecycle._serialize_state()
             )
+
+        outbox = store.list_notification_outbox()
+        assert [entry.alert for entry in outbox] == persisted_alerts_seen
 
 
 @pytest.mark.asyncio
@@ -696,3 +798,53 @@ async def test_manual_monitor_logs_cycle_timing(small_history, tmp_path, caplog)
         "alerts_emitted=",
     ):
         assert field in message
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("long_age", "short_age", "allowed"),
+    [
+        (0.0, 0.0, True),
+        (3.0, 0.0, True),
+        (3.001, 0.0, False),
+        (0.0, 3.001, False),
+        (-0.001, 0.0, False),
+    ],
+)
+async def test_manual_monitor_live_quote_age_boundary(
+    small_history, long_age, short_age, allowed
+):
+    del small_history
+    instance = monitor(confirmation_seconds=0)
+    prime(instance)
+    previous = instance._histories[KEY]._last_sample_time
+    state = state_for(
+        START,
+        long_observed_at=START - timedelta(seconds=long_age),
+        short_observed_at=START - timedelta(seconds=short_age),
+    )
+    await instance.evaluate(START, state)
+    if allowed:
+        assert instance.active_episodes
+        assert instance._histories[KEY]._last_sample_time == START
+    else:
+        assert instance.active_episodes == ()
+        assert instance._histories[KEY]._last_sample_time == previous
+
+
+@pytest.mark.asyncio
+async def test_manual_monitor_rejects_skew_below_individual_age_limit(small_history):
+    del small_history
+    instance = ManualOpportunityMonitor(
+        ManualOpportunityConfig(confirmation_seconds=0),
+        FEES,
+        live_quote_max_age_seconds=10.0,
+        live_quote_max_skew_seconds=3.0,
+    )
+    prime(instance)
+    assert await instance.evaluate(
+        START,
+        state_for(START, long_observed_at=START - timedelta(seconds=4)),
+    ) == []
+    assert instance.active_episodes == ()

@@ -59,6 +59,7 @@ class LatestMarketView:
     asks: tuple[BookLevel, ...]
     observed_at: datetime
     ready: bool
+    live_signal_eligible: bool = True
     mark_price: float | None = None
     index_price: float | None = None
 
@@ -81,6 +82,7 @@ class MarketAvailabilityDiagnostic:
     venue_symbol: str
     canonical_symbol: str
     reason: str
+    live_signal_eligible: bool = False
 
 
 class LatestMarketData:
@@ -97,10 +99,13 @@ class LatestMarketData:
         bids: Sequence[BookLevel],
         asks: Sequence[BookLevel],
         observed_at: datetime,
+        live_signal_eligible: bool = True,
     ) -> None:
         venue = _require_non_empty_identity(venue, "venue")
         venue_symbol = _require_non_empty_identity(venue_symbol, "venue_symbol")
         observed_at = _require_utc(observed_at, "observed_at")
+        if not isinstance(live_signal_eligible, bool):
+            raise ValueError("live_signal_eligible must be a boolean")
         bid_levels = tuple(bids)
         ask_levels = tuple(asks)
         if not bid_levels or not ask_levels:
@@ -126,6 +131,7 @@ class LatestMarketData:
             asks=sorted_asks,
             observed_at=observed_at,
             ready=True,
+            live_signal_eligible=live_signal_eligible,
             mark_price=None if previous is None else previous.mark_price,
             index_price=None if previous is None else previous.index_price,
         )
@@ -144,6 +150,7 @@ class LatestMarketData:
                 _EMPTY_OBSERVATION if previous is None else previous.observed_at
             ),
             ready=False,
+            live_signal_eligible=False,
             mark_price=None if previous is None else previous.mark_price,
             index_price=None if previous is None else previous.index_price,
         )
@@ -171,6 +178,9 @@ class LatestMarketData:
                 _EMPTY_OBSERVATION if previous is None else previous.observed_at
             ),
             ready=False if previous is None else previous.ready,
+            live_signal_eligible=(
+                False if previous is None else previous.live_signal_eligible
+            ),
             mark_price=mark_price,
             index_price=index_price,
         )
@@ -216,6 +226,7 @@ class LatestMarketData:
                         venue_symbol=market.venue_symbol,
                         canonical_symbol=market.canonical_symbol,
                         reason="missing_view",
+                        live_signal_eligible=False,
                     )
                 )
                 continue
@@ -233,6 +244,7 @@ class LatestMarketData:
                     venue_symbol=market.venue_symbol,
                     canonical_symbol=market.canonical_symbol,
                     reason=reason,
+                    live_signal_eligible=view.live_signal_eligible,
                 )
             )
             if snapshot is not None:
@@ -330,6 +342,8 @@ class LatestMarketData:
         stale_after_seconds: int,
     ) -> bool:
         if not view.ready or not view.bids or not view.asks:
+            return False
+        if not view.live_signal_eligible:
             return False
         age_seconds = (now - view.observed_at).total_seconds()
         return 0 <= age_seconds <= stale_after_seconds
