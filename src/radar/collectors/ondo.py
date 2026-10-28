@@ -125,6 +125,11 @@ class OndoCollector:
             contracts = await self._contracts()
         except Exception as error:
             report_collector_error(self._error_handler, self.venue, error)
+            if self._latest_market_data is not None:
+                for market in self._markets:
+                    self._latest_market_data.invalidate(
+                        venue=self.venue, venue_symbol=market.venue_symbol,
+                    )
             return CollectorBatch()
         async def market_snapshot(market: MarketConfig) -> MarketSnapshot | None:
             contract = contracts.get(market.venue_symbol)
