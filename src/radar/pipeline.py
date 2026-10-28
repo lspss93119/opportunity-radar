@@ -157,6 +157,7 @@ class MarketDataPipeline:
         from radar.collectors.arcus import ArcusCollector
         from radar.collectors.backpack import BackpackCollector
         from radar.collectors.hyperliquid import HyperliquidCollector
+        from radar.collectors.ondo import OndoCollector
         from radar.collectors.lighter import (
             LIGHTER_ROBINHOOD_BASE_URL,
             LighterCollector,
@@ -229,6 +230,15 @@ class MarketDataPipeline:
         if markets_for_venue(config.markets, "backpack"):
             collectors.append(
                 BackpackCollector(
+                    config.markets,
+                    clock=clock,
+                    error_handler=collector_error_handler,
+                    **collector_kwargs,
+                )
+            )
+        if markets_for_venue(config.markets, "ondo"):
+            collectors.append(
+                OndoCollector(
                     config.markets,
                     clock=clock,
                     error_handler=collector_error_handler,
