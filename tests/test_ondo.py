@@ -50,6 +50,42 @@ def test_ondo_parsers_reject_bad_envelopes_and_crossed_books():
         parse_ondo_book(crossed, symbol="BTC-USD.P")
 
 
+def test_ondo_contracts_skip_disabled_and_closed_markets():
+    payload = {
+        "success": True,
+        "result": [
+            {"market": "BTC-USD.P", "disabled": False, "isClosed": False},
+            {"market": "ETH-USD.P", "disabled": True, "isClosed": False},
+            {"market": "SOL-USD.P", "disabled": False, "isClosed": True},
+        ],
+    }
+
+    assert set(parse_ondo_contracts(payload)) == {"BTC-USD.P"}
+
+
+@pytest.mark.parametrize(
+    "side",
+    [
+        [["bad-price", "1"]],
+        [["70000", "bad-size"]],
+        [["70000"]],
+        [],
+    ],
+)
+def test_ondo_parser_rejects_malformed_depth_levels(side):
+    payload = {
+        "success": True,
+        "result": {
+            "market": "BTC-USD.P",
+            "bids": side,
+            "asks": [["70001", "1"]],
+        },
+    }
+
+    with pytest.raises(ValueError):
+        parse_ondo_book(payload, symbol="BTC-USD.P")
+
+
 @pytest.mark.asyncio
 async def test_ondo_collects_radar_snapshots_with_injected_public_rest():
     called = []
@@ -78,6 +114,12 @@ async def test_ondo_collects_radar_snapshots_with_injected_public_rest():
     assert row.sell_10k_vwap is not None
     assert len(batch.funding_snapshots) == 1
     assert batch.funding_snapshots[0].funding_rate == 0.0001
+    assert batch.funding_snapshots[0].effective_time == datetime(
+        2026, 10, 28, 9, 0, tzinfo=timezone.utc
+    )
+    assert batch.funding_snapshots[0].next_funding_time == datetime(
+        2026, 10, 28, 9, 0, tzinfo=timezone.utc
+    )
     assert len(batch.hourly_contexts) == 1
     assert all(url.startswith("https://api.ondoperps.xyz/v1/perps/") for url, _ in called)
 
@@ -129,4 +171,32 @@ async def test_ondo_contracts_failure_invalidates_cached_book():
     assert not batch.market_snapshots
     assert latest.ready_venues(
         markets=[MARKET], canonical_symbol="BTC", now=NOW, stale_after_seconds=30,
+    ) == set()
+
+
+@pytest.mark.asyncio
+async def test_ondo_missing_market_invalidates_cached_book():
+    from radar.market_data import LatestMarketData
+    from radar.vwap import BookLevel
+
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="ondo", venue_symbol="BTC-USD.P",
+        bids=[BookLevel(price=69999, base_size=1)],
+        asks=[BookLevel(price=70001, base_size=1)],
+        observed_at=NOW,
+    )
+
+    async def missing_request(url, *, method="GET", params=None):
+        return {"success": True, "result": []}
+
+    batch = await OndoCollector(
+        [MARKET], latest_market_data=latest, request_json=missing_request,
+        clock=lambda: NOW, error_handler=lambda venue, error: None,
+    ).collect(sample_time=NOW, include_hourly_context=False)
+
+    assert batch.market_snapshots == ()
+    assert latest.ready_venues(
+        markets=[MARKET], canonical_symbol="BTC", now=NOW,
+        stale_after_seconds=30,
     ) == set()
