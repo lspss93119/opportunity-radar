@@ -92,6 +92,7 @@ class OndoCollector:
     """Public REST collector. Never authenticates or submits orders."""
 
     venue = "ondo"
+    REFRESH_INTERVAL_SECONDS = 10.0
     BASE_URL = "https://api.ondoperps.xyz"
     CONTRACTS_URL = BASE_URL + "/v1/perps/contracts"
     DEPTH_URL = BASE_URL + "/v1/perps/depth"
@@ -105,12 +106,51 @@ class OndoCollector:
         request_json=default_request_json,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         error_handler: CollectorErrorHandler | None = None,
+        refresh_interval_seconds: float = REFRESH_INTERVAL_SECONDS,
     ) -> None:
+        if refresh_interval_seconds <= 0:
+            raise ValueError("refresh_interval_seconds must be positive")
         self._markets = markets_for_venue(markets, self.venue)
         self._request_json = request_json
         self._clock = clock
         self._error_handler = error_handler
         self._latest_market_data = latest_market_data
+        self._refresh_interval_seconds = refresh_interval_seconds
+        self._refresh_lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task[None] | None = None
+        self._started = False
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        await self.refresh_once()
+        self._refresh_task = asyncio.create_task(
+            self._run_refresh(),
+            name=f"{self.venue}-market-refresh",
+        )
+
+    async def stop(self) -> None:
+        self._started = False
+        refresh_task = self._refresh_task
+        if refresh_task is not None:
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
+        self._refresh_task = None
+
+    async def refresh_once(self) -> None:
+        async with self._refresh_lock:
+            await self.collect(
+                sample_time=self._clock(),
+                include_hourly_context=False,
+            )
+
+    async def _run_refresh(self) -> None:
+        while self._started:
+            await asyncio.sleep(self._refresh_interval_seconds)
+            if not self._started:
+                return
+            await self.refresh_once()
 
     async def _contracts(self) -> dict[str, dict]:
         raw = await self._request_json(

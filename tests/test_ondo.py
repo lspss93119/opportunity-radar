@@ -8,7 +8,9 @@ from radar.collectors.ondo import (
     parse_ondo_contracts,
 )
 from radar.config import MarketConfig, RadarConfig
+from radar.market_data import LatestMarketData
 from radar.pipeline import MarketDataPipeline
+from radar.state import RadarState
 
 NOW = datetime(2026, 10, 28, 8, 0, tzinfo=timezone.utc)
 MARKET = MarketConfig(venue="ondo", venue_symbol="BTC-USD.P", canonical_symbol="BTC")
@@ -145,6 +147,42 @@ def test_pipeline_only_registers_ondo_when_enabled():
     config = RadarConfig(markets=[MARKET], fees_bps={"ondo": 3.0})
     pipeline = MarketDataPipeline.from_config(config)
     assert sum(c.venue == "ondo" for c in pipeline.collectors) == 1
+
+
+@pytest.mark.asyncio
+async def test_ondo_pipeline_start_refreshes_cache_for_ten_second_sampling():
+    async def request(url, *, method="GET", params=None):
+        if url.endswith("/contracts"):
+            return CONTRACTS
+        if url.endswith("/depth"):
+            return DEPTH
+        raise AssertionError(url)
+
+    latest = LatestMarketData()
+    collector = OndoCollector(
+        [MARKET],
+        latest_market_data=latest,
+        request_json=request,
+        clock=lambda: NOW,
+        refresh_interval_seconds=0.01,
+    )
+    pipeline = MarketDataPipeline(
+        [collector],
+        RadarState(),
+        markets=[MARKET],
+        latest_market_data=latest,
+        clock=lambda: NOW,
+    )
+
+    await pipeline.start()
+    try:
+        batch = await pipeline.collect_once(now=NOW)
+    finally:
+        await pipeline.stop()
+
+    assert len(batch.market_snapshots) == 1
+    assert batch.market_snapshots[0].venue == "ondo"
+    assert batch.market_snapshots[0].best_bid == 69999
 
 
 @pytest.mark.asyncio
