@@ -11,4 +11,3 @@ Ruling: The full-history DuckDB sort was replaced by a per-UTC-partition latest-
 Ruling: The first successful output exposed that total 10-second valid slots cannot be subtracted from 60-second valid slots because the grids have a 6x observation count. Sampling-loss attribution is corrected to compare only 10-second observations whose timestamps lie on the same 60-second grid; the full scan will be rerun so the delivered CSV does not overstate minute-sampling loss.
 
 Ruling: US session coverage now uses the number of expected sample slots for that regime and UTC day, rather than dividing regular/extended/closed observations by a full 24-hour denominator. This is required to make regime baselines meaningful; the new regular-session 390-slot fixture passes locally and on the isolated Mac mini.
-

@@ -105,4 +105,3 @@
 - [ ] Audit all seven V1 `data_gap` events with raw 10s observations and record unknown/censored outcomes.
 - [ ] Verify all six output CSVs, report metrics, hashes, and production process/status invariants.
 - [ ] Push only the research code/docs commits to `feature/radar-v1` and record the final SHA.
-

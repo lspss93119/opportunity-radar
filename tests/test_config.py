@@ -522,4 +522,3 @@ def test_disabled_ondo_market_does_not_require_fee():
         enabled=False,
     )
     assert RadarConfig(markets=[market]).fees_bps == {}
-
