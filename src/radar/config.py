@@ -8,7 +8,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 EXPLICIT_FEE_VENUES = frozenset(
-    {"trade_xyz", "entropy", "arcus", "backpack", "lighter_robinhood"}
+    {"trade_xyz", "entropy", "arcus", "backpack", "lighter_robinhood", "ondo"}
 )
 
 
@@ -32,6 +32,10 @@ class MarketConfig(BaseModel):
     venue_symbol: str = Field(min_length=1)
     canonical_symbol: str = Field(min_length=1)
     enabled: bool = True
+    # Collection and Dashboard visibility are independent from executable
+    # monitor participation.  Existing markets remain in monitor scope by
+    # default; read-only feeds can opt out explicitly.
+    monitor_enabled: bool = True
 
 
 class AnomalyV2Config(BaseModel):
@@ -101,6 +105,14 @@ class RadarConfig(BaseModel):
     manual_opportunity: ManualOpportunityConfig = Field(
         default_factory=ManualOpportunityConfig
     )
+
+    def monitor_market_identities(self) -> set[tuple[str, str, str]]:
+        """Return enabled feeds allowed to form monitor routes."""
+        return {
+            (market.venue, market.venue_symbol, market.canonical_symbol)
+            for market in self.markets
+            if market.enabled and market.monitor_enabled
+        }
 
     @field_validator("sampling_seconds")
     @classmethod

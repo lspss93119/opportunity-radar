@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -10,7 +10,7 @@ import time
 
 from radar.config import SpreadMonitorConfig
 from radar.monitors.base import AlertRequest, JSONValue
-from radar.models import FundingSnapshot
+from radar.models import FundingSnapshot, MarketSnapshot
 from radar.state import RadarState
 from radar.storage.sqlite import SQLiteRuntimeStore
 
@@ -92,6 +92,7 @@ class SpreadMonitor:
         fees_bps: Mapping[str, float],
         *,
         runtime_store: SQLiteRuntimeStore | None = None,
+        market_identities: Collection[tuple[str, str, str]] | None = None,
         basis_window_seconds: int = ROLLING_WINDOW_SECONDS,
         basis_min_observations: int = MIN_HISTORY_OBSERVATIONS,
         basis_expected_interval_seconds: int = EXPECTED_INTERVAL_SECONDS,
@@ -102,6 +103,11 @@ class SpreadMonitor:
         self.config = config
         self._fees_bps = dict(fees_bps)
         self._runtime_store = runtime_store
+        self._market_identities = (
+            None
+            if market_identities is None
+            else frozenset(market_identities)
+        )
         self._basis_window_seconds = basis_window_seconds
         self._basis_min_observations = basis_min_observations
         self._basis_expected_interval_seconds = basis_expected_interval_seconds
@@ -171,6 +177,20 @@ class SpreadMonitor:
             expected_interval_seconds=self._basis_expected_interval_seconds,
         )
 
+    def _scoped_markets(self, state: RadarState) -> tuple[MarketSnapshot, ...]:
+        if self._market_identities is None:
+            return state.markets
+        return tuple(
+            snapshot
+            for snapshot in state.markets
+            if (
+                snapshot.venue,
+                snapshot.venue_symbol,
+                snapshot.canonical_symbol,
+            )
+            in self._market_identities
+        )
+
     def _rollback_basis_mutations(
         self,
         mutations: list[RollingBasisMutation],
@@ -216,7 +236,7 @@ class SpreadMonitor:
         cycle_started = time.perf_counter()
         candidate_build_started = time.perf_counter()
         candidates = build_spread_candidates(
-            state.markets,
+            self._scoped_markets(state),
             current_time,
             primary_size_usd=self.config.primary_size_usd,
             stale_after_seconds=self.config.stale_after_seconds,
@@ -386,7 +406,7 @@ class SpreadMonitor:
         cycle_started = time.perf_counter()
         candidate_build_started = time.perf_counter()
         candidates = build_spread_candidates(
-            state.markets,
+            self._scoped_markets(state),
             current_time,
             primary_size_usd=self.config.primary_size_usd,
             stale_after_seconds=self.config.stale_after_seconds,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -1189,6 +1189,7 @@ class ManualOpportunityMonitor:
         stale_after_seconds: int = DEFAULT_MANUAL_STALE_AFTER_SECONDS,
         live_quote_max_age_seconds: float = LIVE_QUOTE_MAX_AGE_SECONDS,
         live_quote_max_skew_seconds: float = LIVE_QUOTE_MAX_SKEW_SECONDS,
+        market_identities: Collection[tuple[str, str, str]] | None = None,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
@@ -1196,6 +1197,11 @@ class ManualOpportunityMonitor:
         self.config = config
         self._fees_bps = dict(fees_bps)
         self._runtime_store = runtime_store
+        self._market_identities = (
+            None
+            if market_identities is None
+            else frozenset(market_identities)
+        )
         self._stale_after_seconds = stale_after_seconds
         if (
             not math.isfinite(live_quote_max_age_seconds)
@@ -1262,11 +1268,12 @@ class ManualOpportunityMonitor:
         markets_by_symbol: dict[
             str, dict[tuple[str, str], MarketSnapshot]
         ] = {}
+        scoped_markets = self._scoped_markets(state)
         self._notification_gate.begin_cycle()
         self._lifecycle.begin_cycle()
         try:
             preparation_started = time.perf_counter()
-            for snapshot in state.markets:
+            for snapshot in scoped_markets:
                 markets_by_symbol.setdefault(snapshot.canonical_symbol, {})[
                     (snapshot.venue, snapshot.venue_symbol)
                 ] = snapshot
@@ -1381,7 +1388,7 @@ class ManualOpportunityMonitor:
                     _log_transition(
                         "candidate_reset",
                         sample_time=max(
-                            (snapshot.sample_time for snapshot in state.markets),
+                            (snapshot.sample_time for snapshot in scoped_markets),
                             default=current_time,
                         ),
                         available_at=current_time,
@@ -1438,6 +1445,20 @@ class ManualOpportunityMonitor:
                 len(self._lifecycle.active_keys),
                 len(alerts),
             )
+
+    def _scoped_markets(self, state: RadarState) -> tuple[MarketSnapshot, ...]:
+        if self._market_identities is None:
+            return state.markets
+        return tuple(
+            snapshot
+            for snapshot in state.markets
+            if (
+                snapshot.venue,
+                snapshot.venue_symbol,
+                snapshot.canonical_symbol,
+            )
+            in self._market_identities
+        )
 
     def _filter_notification_alerts(
         self,

@@ -519,3 +519,24 @@ def test_arcus_source_defaults_to_rest_and_accepts_ws():
         arcus={"source": "ws"},
     )
     assert ws_config.arcus.source == "ws"
+
+
+def test_ondo_market_requires_explicit_taker_fee():
+    market = MarketConfig(
+        venue="ondo", venue_symbol="BTC-USD.P", canonical_symbol="BTC"
+    )
+    with pytest.raises(ValidationError, match="explicit fees for: ondo"):
+        RadarConfig(markets=[market])
+
+    cfg = RadarConfig(markets=[market], fees_bps={"ondo": 0.0})
+    assert cfg.fees_bps["ondo"] == 0.0
+
+
+def test_disabled_ondo_market_does_not_require_fee():
+    market = MarketConfig(
+        venue="ondo",
+        venue_symbol="BTC-USD.P",
+        canonical_symbol="BTC",
+        enabled=False,
+    )
+    assert RadarConfig(markets=[market]).fees_bps == {}
