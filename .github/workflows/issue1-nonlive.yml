@@ -1,0 +1,25 @@
+name: Issue 1 non-live verification
+on:
+  pull_request:
+    branches: [feature/radar-v1]
+  push:
+    branches: [fix/radar-alert-delivery-20261017]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: uv sync --group dev
+      - name: Focused regression tests
+        run: uv run pytest -m "not live" tests/test_alert_worker.py tests/test_storage_sqlite.py tests/test_anomaly_alerts.py tests/test_manual_opportunity_monitor.py tests/test_spread_monitor.py
+      - name: Full non-live suite
+        run: uv run pytest -m "not live"
+      - name: Compile
+        run: uv run python -m compileall -q src tests
+      - name: Diff whitespace
+        run: git diff --check HEAD~1 HEAD
