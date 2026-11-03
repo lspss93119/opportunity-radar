@@ -231,6 +231,7 @@ async def test_disabled_anomaly_v2_persists_event_but_queues_nothing(tmp_path):
         assert queue.empty()
         assert store.get_monitor_state("spread", "anomaly_episodes_v2")
         assert store.list_opportunities(monitor_name="spread")
+        assert store.list_notification_outbox() == []
 
 
 def test_example_config_makes_anomaly_telegram_gate_explicit():

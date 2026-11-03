@@ -183,11 +183,14 @@ async def test_v2_restart_restores_active_episode_and_deduplicates_confirmation(
         monitor = make_monitor(store=store)
         prime(monitor)
         await monitor.evaluate(START, state_at(START))
+        confirmed_alerts = []
         for seconds in range(10, 61, 10):
-            await monitor.evaluate(
+            confirmed_alerts = await monitor.evaluate(
                 START + timedelta(seconds=seconds),
                 state_at(START + timedelta(seconds=seconds)),
             )
+        pending = store.list_notification_outbox()
+        assert [entry.alert for entry in pending] == confirmed_alerts
         assert monitor._anomaly_v2 is not None
         persisted_v2 = monitor._anomaly_v2.snapshot()
 

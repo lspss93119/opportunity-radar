@@ -962,6 +962,7 @@ def test_build_application_wires_monitor_runner_and_worker_to_one_queue(tmp_path
 
     try:
         assert app.monitor_runner.queue is app.alert_worker._queue
+        assert app.alert_worker._runtime_store is app.runtime_store
     finally:
         app.runtime_store.close()
 

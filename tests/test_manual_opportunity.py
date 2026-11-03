@@ -162,6 +162,22 @@ def test_manual_lifecycle_confirms_after_strict_sixty_seconds():
     assert lifecycle.active_episodes[0].confirmed_at == START + timedelta(seconds=60)
 
 
+def test_persisted_manual_lifecycle_alert_is_durable(tmp_path):
+    database = tmp_path / "runtime.sqlite3"
+    with SQLiteRuntimeStore(database) as store:
+        lifecycle = ManualOpportunityLifecycle(CONFIG, FEES, runtime_store=store)
+        alerts = []
+        for offset in range(0, 61, 10):
+            alerts = evaluate(lifecycle, observation(START + timedelta(seconds=offset)))
+
+        pending = store.list_notification_outbox()
+        assert [entry.alert for entry in pending] == alerts
+        assert store.get_monitor_state("manual_opportunity", "episodes") is not None
+        assert store.list_opportunities(monitor_name="manual_opportunity")[-1][
+            "event_type"
+        ] == "manual_initial"
+
+
 def test_one_failed_sample_resets_candidate_timer():
     lifecycle = ManualOpportunityLifecycle(CONFIG, FEES)
     for offset in (0, 10, 20):
