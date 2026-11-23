@@ -1016,6 +1016,7 @@ class HyperliquidCollector:
                 funding_rate=context.funding_rate,
                 interval_seconds=FUNDING_INTERVAL_SECONDS,
                 next_funding_time=next_funding_time,
+                rate_kind="predicted",
             )
             for market, context in configured_contexts
         )

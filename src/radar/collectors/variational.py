@@ -274,6 +274,9 @@ def variational_funding_snapshot(quote: QuotedMarketSnapshot) -> FundingSnapshot
         / VARIATIONAL_FUNDING_YEAR_SECONDS,
         interval_seconds=quote.funding_interval_seconds,
         next_funding_time=next_funding_time,
+        # v1 funding_rate is funding.last; Var funding accrues continuously
+        # and its last value tracks the rate being charged now.
+        rate_kind="predicted",
     )
 
 

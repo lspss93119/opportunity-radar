@@ -8,7 +8,6 @@ import pytest
 from radar.collectors.arcus import (
     ARCUS_L2_CONCURRENCY,
     ArcusCollector,
-    parse_arcus_funding_rates,
     parse_arcus_l2_order_book,
     parse_arcus_markets,
 )
@@ -69,40 +68,12 @@ def test_arcus_order_book_parser_reads_array_levels_and_sorts_sides():
         parse_arcus_l2_order_book({"bids": [["1876.0"]], "asks": [["1877.0", "1"]]})
 
 
-def test_arcus_funding_parser_uses_latest_api_timestamp():
-    point = parse_arcus_funding_rates(
-        load_fixture("funding_sndk_usd.json"), expected_market_id=33
-    )
+def test_arcus_market_parser_reads_accruing_next_funding_rate():
+    markets = parse_arcus_markets(load_fixture("markets.json"))
 
-    assert point is not None
-    assert point.funding_rate == pytest.approx(0.000005034722222222)
-    assert point.effective_time == datetime.fromtimestamp(1790128800, tz=UTC)
-
-
-def test_arcus_funding_parser_latest_row_matches_full_history_selection():
-    full_history = load_fixture("funding_sndk_usd.json")
-    latest_only = {"fundingRates": [full_history["fundingRates"][-1]]}
-
-    full_point = parse_arcus_funding_rates(full_history, expected_market_id=33)
-    latest_point = parse_arcus_funding_rates(latest_only, expected_market_id=33)
-
-    assert full_point == latest_point
-
-
-def test_arcus_funding_parser_rejects_wrong_market_id_and_malformed_response():
-    full_history = load_fixture("funding_sndk_usd.json")
-
-    with pytest.raises(ValueError, match="marketId does not match"):
-        parse_arcus_funding_rates(full_history, expected_market_id=999)
-    with pytest.raises(ValueError, match="invalid funding list"):
-        parse_arcus_funding_rates({"fundingRates": "invalid"}, expected_market_id=33)
-
-
-def test_arcus_funding_parser_returns_none_for_empty_history():
-    assert (
-        parse_arcus_funding_rates({"fundingRates": []}, expected_market_id=33)
-        is None
-    )
+    # fundingRate is the last applied rate; nextFundingRate is accruing now.
+    assert markets["SNDK-USD"].funding_rate == pytest.approx(0.000005034722222222)
+    assert markets["SNDK-USD"].next_funding_rate == pytest.approx(0.00000474537037037)
 
 
 class FixtureTransport:
@@ -116,10 +87,6 @@ class FixtureTransport:
         if url.startswith(ArcusCollector.L2_ORDER_BOOK_URL):
             symbol = url.rsplit("/", 1)[-1].lower().replace("-", "_")
             return load_fixture(f"l2_{symbol}.json")
-        if url == ArcusCollector.FUNDING_RATES_URL:
-            if params["market"] == "SNDK-USD":
-                return load_fixture("funding_sndk_usd.json")
-            return {"fundingRates": []}
         raise AssertionError(f"unexpected request: {url} {params}")
 
 
@@ -677,8 +644,7 @@ async def test_arcus_refresh_keeps_hourly_funding_and_context_separate():
         "NVDA",
     ]
     assert batch.market_snapshots == ()
-    assert len(batch.funding_snapshots) == 1
-    assert batch.funding_snapshots[0].canonical_symbol == "SNDK"
+    assert [f.canonical_symbol for f in batch.funding_snapshots] == ["SNDK", "NVDA"]
     assert [context.canonical_symbol for context in batch.hourly_contexts] == [
         "SNDK",
         "NVDA",
@@ -726,14 +692,15 @@ async def test_arcus_collector_normalizes_market_funding_context_and_executable_
     assert sndk.sell_10k_vwap is not None
     assert sndk.observed_at == OBSERVED_AT
 
-    assert len(hourly_batch.funding_snapshots) == 1
+    assert len(hourly_batch.funding_snapshots) == 2
     funding = hourly_batch.funding_snapshots[0]
     assert funding.canonical_symbol == "SNDK"
-    # Arcus fundingRates is an hourly decimal; positive = longs pay.
+    # nextFundingRate (accruing) is used, not fundingRate (last applied).
+    assert funding.funding_rate == pytest.approx(0.00000474537037037)
+    assert funding.rate_kind == "predicted"
     assert funding.interval_seconds == 3600
-    assert funding.rate_per_hour == pytest.approx(funding.funding_rate)
-    assert funding.apr == pytest.approx(funding.funding_rate * 8760)
-    assert funding.effective_time == datetime.fromtimestamp(1790128800, tz=UTC)
+    assert funding.apr == pytest.approx(0.00000474537037037 * 8760)
+    assert funding.effective_time == OBSERVED_AT
     assert funding.next_funding_time == datetime.fromtimestamp(1790132400, tz=UTC)
     assert funding.observed_at == OBSERVED_AT
 
@@ -749,14 +716,10 @@ async def test_arcus_collector_normalizes_market_funding_context_and_executable_
 
     assert sum(url == ArcusCollector.MARKETS_URL for url, _, _ in transport.calls) == 1
     assert sum(url.startswith(ArcusCollector.L2_ORDER_BOOK_URL) for url, _, _ in transport.calls) == 2
-    assert sum(url == ArcusCollector.FUNDING_RATES_URL for url, _, _ in transport.calls) == 2
-    funding_calls = [
-        params for url, _, params in transport.calls if url == ArcusCollector.FUNDING_RATES_URL
-    ]
-    assert funding_calls == [
-        {"market": "SNDK-USD", "limit": 1},
-        {"market": "NVDA-USD", "limit": 1},
-    ]
+    # Funding comes with the market metadata: no per-market fundingRates calls.
+    assert {url for url, _, _ in transport.calls} <= {ArcusCollector.MARKETS_URL} | {
+        url for url, _, _ in transport.calls if url.startswith(ArcusCollector.L2_ORDER_BOOK_URL)
+    }
     l2_calls = [
         params
         for url, _, params in transport.calls
@@ -767,69 +730,27 @@ async def test_arcus_collector_normalizes_market_funding_context_and_executable_
 
 
 @pytest.mark.asyncio
-async def test_arcus_funding_request_error_fails_closed():
+async def test_arcus_market_without_next_funding_rate_has_no_funding():
     transport = FixtureTransport()
-    failures: list[tuple[str, Exception]] = []
+    markets_payload = load_fixture("markets.json")
+    for market in markets_payload["markets"]:
+        if market["marketDisplayName"] == "NVDA-USD":
+            del market["nextFundingRate"]
 
-    async def failing_funding_transport(
-        url: str, *, method: str, json_body=None, params=None
-    ):
-        if url == ArcusCollector.FUNDING_RATES_URL:
-            raise OSError("HTTP Error 429: Too Many Requests")
+    async def request_json(url: str, *, method: str, json_body=None, params=None):
+        if url == ArcusCollector.MARKETS_URL:
+            return markets_payload
         return await transport(url, method=method, json_body=json_body, params=params)
 
     collector = ArcusCollector(
-        configured_markets(),
-        request_json=failing_funding_transport,
-        clock=lambda: OBSERVED_AT,
-        error_handler=lambda venue, error: failures.append((venue, error)),
+        configured_markets(), request_json=request_json, clock=lambda: OBSERVED_AT
     )
 
     await collector.refresh_once()
     batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
 
-    assert batch.funding_snapshots == ()
-    assert [context.canonical_symbol for context in batch.hourly_contexts] == [
-        "SNDK",
-        "NVDA",
-    ]
-    assert [(venue, str(error)) for venue, error in failures] == [
-        ("arcus", "HTTP Error 429: Too Many Requests"),
-        ("arcus", "HTTP Error 429: Too Many Requests"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_arcus_malformed_funding_response_fails_closed():
-    transport = FixtureTransport()
-    failures: list[tuple[str, Exception]] = []
-
-    async def malformed_funding_transport(
-        url: str, *, method: str, json_body=None, params=None
-    ):
-        if url == ArcusCollector.FUNDING_RATES_URL:
-            return {"fundingRates": "invalid"}
-        return await transport(url, method=method, json_body=json_body, params=params)
-
-    collector = ArcusCollector(
-        configured_markets(),
-        request_json=malformed_funding_transport,
-        clock=lambda: OBSERVED_AT,
-        error_handler=lambda venue, error: failures.append((venue, error)),
-    )
-
-    await collector.refresh_once()
-    batch = await collector.collect_hourly(sample_time=SAMPLE_TIME)
-
-    assert batch.funding_snapshots == ()
-    assert [context.canonical_symbol for context in batch.hourly_contexts] == [
-        "SNDK",
-        "NVDA",
-    ]
-    assert [(venue, str(error)) for venue, error in failures] == [
-        ("arcus", "fundingRates response has invalid funding list"),
-        ("arcus", "fundingRates response has invalid funding list"),
-    ]
+    assert [f.canonical_symbol for f in batch.funding_snapshots] == ["SNDK"]
+    assert [c.canonical_symbol for c in batch.hourly_contexts] == ["SNDK", "NVDA"]
 
 
 @pytest.mark.asyncio

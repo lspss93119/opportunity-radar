@@ -27,8 +27,10 @@ from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
-# Funding settles hourly; fundingRates is an hourly decimal, positive = longs pay
-# (docs.arcus.xyz/concepts/perpetuals/funding).
+# Funding settles hourly as an hourly decimal, positive = longs pay
+# (docs.arcus.xyz/concepts/perpetuals/funding). GET /v1/markets carries both
+# fundingRate (last applied, equal to the latest fundingRates row) and
+# nextFundingRate (accruing now); only the latter is current.
 FUNDING_INTERVAL_SECONDS = 3600
 ARCUS_L2_CONCURRENCY = 4
 ARCUS_WS_URL = "wss://api.arcus.xyz/v1/ws"
@@ -49,12 +51,7 @@ class ArcusMarketDetail:
     next_funding_time: datetime | None
     open_interest: float | None
     volume_24h: float | None
-
-
-@dataclass(frozen=True)
-class ArcusFundingPoint:
-    effective_time: datetime
-    funding_rate: float
+    next_funding_rate: float | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +109,11 @@ def parse_arcus_markets(payload: object) -> dict[str, ArcusMarketDetail]:
             ),
             volume_24h=_optional_non_negative_float(
                 raw_market.get("volume24hNotional"), "volume24hNotional"
+            ),
+            next_funding_rate=(
+                None
+                if raw_market.get("nextFundingRate") is None
+                else finite_float(raw_market.get("nextFundingRate"), "nextFundingRate")
             ),
         )
     return markets
@@ -423,42 +425,11 @@ class ArcusWebSocketFeed:
         self._last_sequences.clear()
 
 
-def parse_arcus_funding_rates(
-    payload: object, *, expected_market_id: int
-) -> ArcusFundingPoint | None:
-    if not isinstance(payload, dict):
-        raise ValueError("fundingRates response must be an object")
-    raw_rates = payload.get("fundingRates")
-    if not isinstance(raw_rates, list):
-        raise ValueError("fundingRates response has invalid funding list")
-
-    points: list[ArcusFundingPoint] = []
-    for raw_rate in raw_rates:
-        if not isinstance(raw_rate, dict):
-            raise ValueError("fundingRates entries must be objects")
-        market_id = int(finite_float(raw_rate.get("marketId"), "marketId"))
-        if market_id != expected_market_id:
-            raise ValueError("fundingRates marketId does not match request")
-        timestamp_micros = int(finite_float(raw_rate.get("time"), "funding time"))
-        points.append(
-            ArcusFundingPoint(
-                effective_time=datetime.fromtimestamp(
-                    timestamp_micros / 1_000_000, tz=UTC
-                ),
-                funding_rate=finite_float(
-                    raw_rate.get("fundingRate"), "fundingRate"
-                ),
-            )
-        )
-    return max(points, key=lambda point: point.effective_time) if points else None
-
-
 class ArcusCollector:
     venue = "arcus"
     BASE_URL = "https://api.arcus.xyz/v1"
     MARKETS_URL = f"{BASE_URL}/markets"
     L2_ORDER_BOOK_URL = f"{BASE_URL}/l2OrderBook"
-    FUNDING_RATES_URL = f"{BASE_URL}/fundingRates"
     REFRESH_INTERVAL_SECONDS = 10.0
 
     def __init__(
@@ -774,14 +745,21 @@ class ArcusCollector:
         configured_details: tuple[tuple[MarketConfig, ArcusMarketDetail], ...],
         metadata_observed_at: datetime,
     ) -> CollectorBatch:
-        funding_results = await asyncio.gather(
-            *(
-                self._collect_funding(market, detail)
-                for market, detail in configured_details
-            )
-        )
+        # The accruing rate arrives with the market metadata: no extra calls.
         funding_snapshots = tuple(
-            funding for funding in funding_results if funding is not None
+            FundingSnapshot(
+                effective_time=metadata_observed_at,
+                observed_at=metadata_observed_at,
+                venue=self.venue,
+                venue_symbol=market.venue_symbol,
+                canonical_symbol=market.canonical_symbol,
+                funding_rate=detail.next_funding_rate,
+                interval_seconds=FUNDING_INTERVAL_SECONDS,
+                next_funding_time=detail.next_funding_time,
+                rate_kind="predicted",
+            )
+            for market, detail in configured_details
+            if detail.next_funding_rate is not None
         )
         hourly_sample = sample_time.astimezone(UTC).replace(
             minute=0, second=0, microsecond=0
@@ -837,36 +815,6 @@ class ArcusCollector:
                 sell_5k_vwap=sell_vwap(bids, 5_000),
                 buy_10k_vwap=buy_vwap(asks, 10_000),
                 sell_10k_vwap=sell_vwap(bids, 10_000),
-            )
-        except Exception as error:  # noqa: BLE001
-            report_collector_error(self._error_handler, self.venue, error)
-            return None
-
-    async def _collect_funding(
-        self,
-        market: MarketConfig,
-        detail: ArcusMarketDetail,
-    ) -> FundingSnapshot | None:
-        try:
-            payload = await self._request_json(
-                self.FUNDING_RATES_URL,
-                method="GET",
-                params={"market": market.venue_symbol, "limit": 1},
-            )
-            point = parse_arcus_funding_rates(
-                payload, expected_market_id=detail.market_id
-            )
-            if point is None:
-                return None
-            return FundingSnapshot(
-                effective_time=point.effective_time,
-                observed_at=self._clock(),
-                venue=self.venue,
-                venue_symbol=market.venue_symbol,
-                canonical_symbol=market.canonical_symbol,
-                funding_rate=point.funding_rate,
-                interval_seconds=FUNDING_INTERVAL_SECONDS,
-                next_funding_time=detail.next_funding_time,
             )
         except Exception as error:  # noqa: BLE001
             report_collector_error(self._error_handler, self.venue, error)

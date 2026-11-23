@@ -263,6 +263,8 @@ class OndoCollector:
                     venue_symbol=market.venue_symbol, canonical_symbol=market.canonical_symbol,
                     funding_rate=rate,
                     interval_seconds=FUNDING_INTERVAL_SECONDS,
+                    # funding_rates reports the interval still accruing.
+                    rate_kind="predicted",
                     next_funding_time=effective if effective > now else None,
                 ))
             except Exception as error:

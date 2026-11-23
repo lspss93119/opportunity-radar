@@ -1265,6 +1265,9 @@ class BackpackCollector:
                 canonical_symbol=market.canonical_symbol,
                 funding_rate=point.funding_rate,
                 interval_seconds=detail.funding_interval_seconds,
+                # Backpack publishes only the last applied rate (markPrices
+                # fundingRate equals the latest fundingRates row), so it lags.
+                rate_kind="settled",
                 next_funding_time=(
                     None if mark_price is None else mark_price.next_funding_time
                 ),

@@ -4,7 +4,9 @@ For every canonical symbol and ordered venue pair (long A, short B), the net
 funding APR is ``APR_B - APR_A``: positive means the hedged pair is paid.
 
 * Spike: the current net APR stays at or above ``spike_net_apr`` for at least
-  ``spike_min_samples`` consecutive funding samples.
+  ``spike_min_samples`` consecutive funding samples. Both legs must report the
+  rate accruing now ("predicted"): a settled rate can lag a moving market by
+  up to an interval, which would show a differential that does not exist.
 * Carry: the time-weighted net APR over ``carry_window_hours`` is at least
   ``carry_avg_net_apr`` and the expected funding over ``carry_horizon_hours``
   exceeds the current $-sized round-trip cost.
@@ -351,9 +353,13 @@ class FundingMonitor:
         if pair is None:
             pair = PairState()
         changed = False
+        comparable = (
+            long_funding.rate_kind == "predicted"
+            and short_funding.rate_kind == "predicted"
+        )
         if pair.last_marker != marker:
             pair.last_marker = marker
-            if net_apr >= config.spike_net_apr:
+            if comparable and net_apr >= config.spike_net_apr:
                 if pair.streak == 0:
                     pair.streak_started_at = marker
                 pair.streak += 1

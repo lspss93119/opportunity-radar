@@ -21,7 +21,14 @@ NOW = datetime(2026, 11, 23, 12, 0, tzinfo=UTC)
 FEES = {"hyperliquid": 4.5, "variational": 0.0, "lighter": 0.0}
 
 
-def funding(venue: str, apr: float, observed_at: datetime, *, symbol: str = "ACE"):
+def funding(
+    venue: str,
+    apr: float,
+    observed_at: datetime,
+    *,
+    symbol: str = "ACE",
+    rate_kind: str = "predicted",
+):
     # Hourly venue: one interval's rate is APR / 8760.
     return FundingSnapshot(
         effective_time=observed_at,
@@ -32,6 +39,7 @@ def funding(venue: str, apr: float, observed_at: datetime, *, symbol: str = "ACE
         funding_rate=apr / 8760,
         interval_seconds=3600,
         next_funding_time=observed_at.replace(minute=0, second=0) + timedelta(hours=1),
+        rate_kind=rate_kind,
     )
 
 
@@ -353,3 +361,43 @@ def test_funding_history_hydration_skips_rows_without_interval(tmp_path):
 
     assert set(points) == {("hyperliquid", "ACE", "ACE")}
     assert points[("hyperliquid", "ACE", "ACE")][0][1] == pytest.approx(0.5)
+
+
+
+@pytest.mark.asyncio
+async def test_spike_ignores_pairs_with_a_settled_leg():
+    """A last-applied rate lags a moving market; comparing it to a live rate
+    produced false spikes in the trial (Lighter settled vs xyz predicted)."""
+    funding_monitor = monitor(carry_avg_net_apr=10.0)
+
+    def lagged_state(at):
+        state = state_at(at, -20.0, 5.0)
+        state.apply_context_batch(
+            CollectorBatch(
+                funding_snapshots=(
+                    funding("hyperliquid", -20.0, at, rate_kind="settled"),
+                    funding("variational", 5.0, at),
+                )
+            )
+        )
+        return state
+
+    for step in range(3):
+        at = NOW + timedelta(minutes=5 * step)
+        assert kinds(await funding_monitor.evaluate(at, lagged_state(at))) == []
+
+
+@pytest.mark.asyncio
+async def test_carry_still_uses_settled_legs():
+    funding_monitor = seeded(monitor(), 0.0, 0.20)
+    state = state_at(NOW, 0.0, 0.20)
+    state.apply_context_batch(
+        CollectorBatch(
+            funding_snapshots=(
+                funding("hyperliquid", 0.0, NOW, rate_kind="settled"),
+                funding("variational", 0.20, NOW),
+            ),
+            hourly_contexts=state.hourly_context,
+        )
+    )
+    assert CARRY in kinds(await funding_monitor.evaluate(NOW, state))

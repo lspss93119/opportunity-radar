@@ -73,6 +73,10 @@ class FundingSnapshot(BaseModel):
     funding_rate: float = Field(allow_inf_nan=False)
     interval_seconds: int = Field(gt=0)
     next_funding_time: datetime | None = None
+    # "predicted": the rate accruing now; "settled": the last applied rate,
+    # which can lag a moving market by up to one interval. Unknown sources
+    # default to "settled" so spike comparisons fail closed.
+    rate_kind: Literal["predicted", "settled"] = "settled"
 
     _effective_time_utc = field_validator("effective_time")(_require_utc)
     _observed_at_utc = field_validator("observed_at")(_require_utc)

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,7 +7,7 @@ import pytest
 
 from radar.collectors.lighter import (
     LighterCollector,
-    parse_lighter_fundings,
+    parse_lighter_funding_rates,
     parse_lighter_order_book_details,
     parse_lighter_order_book_orders,
 )
@@ -65,86 +64,33 @@ def test_lighter_order_parser_aggregates_and_sorts_orders():
         parse_lighter_order_book_orders({"code": 500, "asks": [], "bids": []})
 
 
-def test_lighter_funding_parser_uses_latest_settlement_rate_and_timestamp():
-    point = parse_lighter_fundings(load_fixture("fundings_btc.json"))
+def test_lighter_funding_rates_parser_keeps_lighter_rows_per_hour():
+    rates = parse_lighter_funding_rates(load_fixture("funding_rates.json"))
 
-    assert point is not None
-    assert point.funding_rate == pytest.approx(0.000011)
-    assert point.effective_time == datetime.fromtimestamp(1789470000, tz=UTC)
-
-
-@pytest.mark.parametrize(
-    ("direction", "expected_rate"),
-    [("long", 0.000045), ("short", -0.000045)],
-)
-def test_lighter_funding_parser_normalizes_percentage_rate_and_direction(
-    direction: str, expected_rate: float
-):
-    point = parse_lighter_fundings(
-        {
-            "code": 200,
-            "fundings": [
-                {
-                    "timestamp": 1789470000,
-                    "rate": "0.0045",
-                    "direction": direction,
-                }
-            ],
-        }
-    )
-
-    assert point is not None
-    assert point.funding_rate == pytest.approx(expected_rate)
+    # The bulk endpoint is 8h-normalized and lists other exchanges too.
+    assert rates == {
+        "BTC": pytest.approx(0.000011),
+        "ETH": pytest.approx(0.000012),
+        "SOL": pytest.approx(-0.000004),
+    }
 
 
-@pytest.mark.parametrize("direction", ["long", "short"])
-def test_lighter_funding_parser_preserves_zero_rate(
-    direction: str,
-):
-    point = parse_lighter_fundings(
-        {
-            "code": 200,
-            "fundings": [
-                {
-                    "timestamp": 1789470000,
-                    "rate": "0",
-                    "direction": direction,
-                }
-            ],
-        }
-    )
-
-    assert point is not None
-    assert point.funding_rate == 0.0
-
-
-@pytest.mark.parametrize("direction", [None, "sideways", 1])
-def test_lighter_funding_parser_rejects_unknown_or_malformed_direction(
-    direction: object,
-):
-    with pytest.raises(ValueError, match="direction"):
-        parse_lighter_fundings(
-            {
-                "code": 200,
-                "fundings": [
-                    {
-                        "timestamp": 1789470000,
-                        "rate": "0.0045",
-                        "direction": direction,
-                    }
-                ],
-            }
-        )
+def test_lighter_funding_rates_parser_rejects_failed_response():
+    with pytest.raises(ValueError):
+        parse_lighter_funding_rates({"code": 500, "funding_rates": []})
+    with pytest.raises(ValueError):
+        parse_lighter_funding_rates({"code": 200, "funding_rates": [
+            {"exchange": "lighter", "symbol": "BTC", "rate": "nan"}
+        ]})
 
 
 class FixtureTransport:
     def __init__(self, base_url: str = LighterCollector.BASE_URL):
         self.calls: list[tuple[str, str, dict | None]] = []
-        self.funding_call_times: list[float] = []
         normalized_base_url = base_url.rstrip("/")
         self.order_book_details_url = f"{normalized_base_url}/api/v1/orderBookDetails"
         self.order_book_orders_url = f"{normalized_base_url}/api/v1/orderBookOrders"
-        self.fundings_url = f"{normalized_base_url}/api/v1/fundings"
+        self.funding_rates_url = f"{normalized_base_url}/api/v1/funding-rates"
 
     async def __call__(self, url: str, *, method: str, json_body=None, params=None):
         self.calls.append((url, method, params))
@@ -154,11 +100,8 @@ class FixtureTransport:
             market_id = params["market_id"]
             symbol = {1: "btc", 0: "eth", 2: "sol"}[market_id]
             return load_fixture(f"order_book_{symbol}.json")
-        if url == self.fundings_url:
-            self.funding_call_times.append(time.monotonic())
-            market_id = params["market_id"]
-            symbol = {1: "btc", 0: "eth", 2: "sol"}[market_id]
-            return load_fixture(f"fundings_{symbol}.json")
+        if url == self.funding_rates_url:
+            return load_fixture("funding_rates.json")
         raise AssertionError(f"unexpected request: {url} {params}")
 
 
@@ -407,7 +350,6 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
         clock=lambda: OBSERVED_AT,
         websocket_connect=websocket_connect,
         latest_market_data=latest,
-        funding_request_spacing_seconds=0.05,
     )
 
     markets = configured_markets(venue)
@@ -451,17 +393,16 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
     assert btc.observed_at != btc.sample_time
 
     assert len(batch.funding_snapshots) == 3
-    assert batch.funding_snapshots[0].funding_rate == pytest.approx(0.000011)
-    # Fixture rate "0.0011" is a percent per hour paid by longs.
-    assert batch.funding_snapshots[0].interval_seconds == 3600
-    assert batch.funding_snapshots[0].rate_per_hour == pytest.approx(0.000011)
-    assert batch.funding_snapshots[0].apr == pytest.approx(0.000011 * 8760)
-    assert batch.funding_snapshots[0].effective_time == datetime.fromtimestamp(
-        1789470000, tz=UTC
-    )
-    # Settled at the 11:00 hour mark, so the next settlement is 12:00.
-    assert batch.funding_snapshots[0].next_funding_time == datetime(
-        2026, 9, 15, 12, 0, tzinfo=UTC
+    btc_funding = batch.funding_snapshots[0]
+    # Bulk funding-rates BTC 0.000088 per 8h is the current 0.000011 per hour.
+    assert btc_funding.funding_rate == pytest.approx(0.000011)
+    assert btc_funding.interval_seconds == 3600
+    assert btc_funding.apr == pytest.approx(0.000011 * 8760)
+    assert btc_funding.rate_kind == "predicted"
+    assert btc_funding.effective_time == OBSERVED_AT
+    assert btc_funding.next_funding_time == datetime(2026, 9, 15, 11, 0, tzinfo=UTC)
+    assert [f.funding_rate for f in batch.funding_snapshots] == pytest.approx(
+        [0.000011, 0.000012, -0.000004]
     )
 
     btc_context = batch.hourly_contexts[0]
@@ -473,16 +414,8 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
     assert all(method == "GET" for _, method, _ in transport.calls)
     assert sum(url == transport.order_book_details_url for url, _, _ in transport.calls) == 1
     assert sum(url == transport.order_book_orders_url for url, _, _ in transport.calls) == 0
-    assert sum(url == transport.fundings_url for url, _, _ in transport.calls) == 3
-    # Per-market /fundings calls are paced sequentially to respect the IP limit.
-    gaps = [
-        later - earlier
-        for earlier, later in zip(
-            transport.funding_call_times, transport.funding_call_times[1:]
-        )
-    ]
-    assert len(gaps) == 2
-    assert all(gap >= 0.045 for gap in gaps)
+    # One bulk request covers every market's funding.
+    assert sum(url == transport.funding_rates_url for url, _, _ in transport.calls) == 1
 
 
 @pytest.mark.parametrize(

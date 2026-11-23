@@ -1,8 +1,6 @@
 sampling_seconds: 10
 # Funding, OI and 24h-volume refresh period (must divide 3600).
 context_poll_seconds: 300
-# Pause between per-market Lighter funding calls (60 requests/min per IP).
-lighter_funding_request_spacing_seconds: 1.5
 
 fees_bps:
   lighter: 0.0

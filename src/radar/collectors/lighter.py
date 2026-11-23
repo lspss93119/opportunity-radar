@@ -25,13 +25,13 @@ from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
-# Funding settles every hour; /api/v1/fundings reports rate in percent with a
-# separate paying-side direction (docs.lighter.xyz/trading/funding).
+# Funding settles every hour (docs.lighter.xyz/trading/funding). The bulk
+# /api/v1/funding-rates endpoint returns every market's current (accruing)
+# rate normalized to 8 hours, positive = longs pay: its Hyperliquid rows are
+# exactly 8x Hyperliquid's live hourly rate (median of 93 coins, 2026-11-23),
+# and its Lighter rows divided by 8 track the hourly settlements.
 FUNDING_INTERVAL_SECONDS = 3600
-# Standard Lighter REST access is 60 requests per rolling minute per IP and a
-# breach triggers a 60s firewall cooldown, so per-market /fundings calls are
-# paced to at most 40/min, leaving room for the 1/min metadata refresh.
-FUNDING_REQUEST_SPACING_SECONDS = 1.5
+FUNDING_RATES_NORMALIZED_SECONDS = 8 * 3600
 LIGHTER_ROBINHOOD_BASE_URL = "https://api.rh.lighter.xyz"
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_ROBINHOOD_WS_URL = "wss://api.rh.lighter.xyz/stream"
@@ -45,12 +45,6 @@ class LighterMarketDetail:
     index_price: float
     open_interest: float
     volume_24h: float
-
-
-@dataclass(frozen=True)
-class LighterFundingPoint:
-    effective_time: datetime
-    funding_rate: float
 
 
 @dataclass(frozen=True)
@@ -505,33 +499,22 @@ def parse_lighter_order_book_orders(
     )
 
 
-def parse_lighter_fundings(payload: object) -> LighterFundingPoint | None:
-    response = _require_success(payload, "fundings")
-    raw_fundings = response.get("fundings")
-    if not isinstance(raw_fundings, list):
-        raise ValueError("fundings response has invalid funding list")
-
-    points: list[LighterFundingPoint] = []
-    for raw_funding in raw_fundings:
-        if not isinstance(raw_funding, dict):
-            raise ValueError("fundings entries must be objects")
-        timestamp = finite_float(raw_funding.get("timestamp"), "funding timestamp")
-        direction = raw_funding.get("direction")
-        if direction not in ("long", "short"):
-            raise ValueError("funding direction must be long or short")
-        raw_rate = finite_float(raw_funding.get("rate"), "funding rate")
-        if raw_rate < 0:
-            raise ValueError("funding rate must be non-negative")
-        funding_rate = raw_rate / 100.0
-        if direction == "short":
-            funding_rate = -funding_rate
-        points.append(
-            LighterFundingPoint(
-                effective_time=datetime.fromtimestamp(timestamp, tz=UTC),
-                funding_rate=funding_rate,
-            )
-        )
-    return max(points, key=lambda point: point.effective_time) if points else None
+def parse_lighter_funding_rates(payload: object) -> dict[str, float]:
+    """Return each Lighter market's current rate per settlement hour."""
+    response = _require_success(payload, "funding-rates")
+    raw_rates = response.get("funding_rates")
+    if not isinstance(raw_rates, list):
+        raise ValueError("funding-rates response has invalid rate list")
+    rates: dict[str, float] = {}
+    for raw_rate in raw_rates:
+        if not isinstance(raw_rate, dict) or raw_rate.get("exchange") != "lighter":
+            continue
+        symbol = raw_rate.get("symbol")
+        if not isinstance(symbol, str) or not symbol or symbol in rates:
+            continue
+        rate_8h = finite_float(raw_rate.get("rate"), "funding rate")
+        rates[symbol] = rate_8h * FUNDING_INTERVAL_SECONDS / FUNDING_RATES_NORMALIZED_SECONDS
+    return rates
 
 
 class LighterCollector:
@@ -557,13 +540,9 @@ class LighterCollector:
         ws_url: str | None = None,
         latest_market_data: LatestMarketData | None = None,
         metadata_refresh_seconds: float = METADATA_REFRESH_SECONDS,
-        funding_request_spacing_seconds: float = FUNDING_REQUEST_SPACING_SECONDS,
     ) -> None:
         if metadata_refresh_seconds < 0:
             raise ValueError("metadata_refresh_seconds must be non-negative")
-        if funding_request_spacing_seconds < 0:
-            raise ValueError("funding_request_spacing_seconds must be non-negative")
-        self._funding_request_spacing_seconds = funding_request_spacing_seconds
         self.venue = venue
         self.base_url = (self.BASE_URL if base_url is None else base_url).rstrip("/")
         if ws_url is None:
@@ -575,7 +554,7 @@ class LighterCollector:
         self.ws_url = ws_url
         self.order_book_details_url = f"{self.base_url}/api/v1/orderBookDetails"
         self.order_book_orders_url = f"{self.base_url}/api/v1/orderBookOrders"
-        self.fundings_url = f"{self.base_url}/api/v1/fundings"
+        self.funding_rates_url = f"{self.base_url}/api/v1/funding-rates"
         self._markets = markets_for_venue(markets, self.venue)
         self._request_json = request_json
         self._clock = clock
@@ -759,13 +738,8 @@ class LighterCollector:
             for market in self._markets
             if market.venue_symbol in self._details
         )
-        funding_results = []
-        for index, (market, detail) in enumerate(configured_details):
-            if index and self._funding_request_spacing_seconds:
-                await asyncio.sleep(self._funding_request_spacing_seconds)
-            funding_results.append(await self._collect_funding(market, detail))
-        funding_snapshots = tuple(
-            funding for funding in funding_results if funding is not None
+        funding_snapshots = await self._collect_funding(
+            tuple(market for market, _detail in configured_details)
         )
         hourly_sample = sample_time.astimezone(UTC).replace(
             minute=0, second=0, microsecond=0
@@ -826,38 +800,37 @@ class LighterCollector:
             return None
 
     async def _collect_funding(
-        self,
-        market: MarketConfig,
-        detail: LighterMarketDetail,
-    ) -> FundingSnapshot | None:
-        end_timestamp = int(self._clock().timestamp())
+        self, markets: tuple[MarketConfig, ...]
+    ) -> tuple[FundingSnapshot, ...]:
+        """One bulk request for every market's current rate (not per market)."""
+        if not markets:
+            return ()
         try:
-            payload = await self._request_json(
-                self.fundings_url,
-                method="GET",
-                params={
-                    "market_id": detail.market_id,
-                    "resolution": "1h",
-                    "start_timestamp": max(0, end_timestamp - 2 * 60 * 60),
-                    "end_timestamp": end_timestamp,
-                    "count_back": 1,
-                },
-            )
-            point = parse_lighter_fundings(payload)
-            if point is None:
-                return None
-            return FundingSnapshot(
-                effective_time=point.effective_time,
-                observed_at=self._clock(),
-                venue=self.venue,
-                venue_symbol=market.venue_symbol,
-                canonical_symbol=market.canonical_symbol,
-                funding_rate=point.funding_rate,
-                interval_seconds=FUNDING_INTERVAL_SECONDS,
-                # Settlements happen on every hour mark.
-                next_funding_time=point.effective_time
-                + timedelta(seconds=FUNDING_INTERVAL_SECONDS),
-            )
+            payload = await self._request_json(self.funding_rates_url, method="GET")
+            rates = parse_lighter_funding_rates(payload)
         except Exception as error:  # noqa: BLE001
             report_collector_error(self._error_handler, self.venue, error)
-            return None
+            return ()
+        observed_at = self._clock()
+        next_funding_time = observed_at.astimezone(UTC).replace(
+            minute=0, second=0, microsecond=0
+        ) + timedelta(seconds=FUNDING_INTERVAL_SECONDS)
+        snapshots: list[FundingSnapshot] = []
+        for market in markets:
+            rate = rates.get(market.venue_symbol)
+            if rate is None:
+                continue
+            snapshots.append(
+                FundingSnapshot(
+                    effective_time=observed_at,
+                    observed_at=observed_at,
+                    venue=self.venue,
+                    venue_symbol=market.venue_symbol,
+                    canonical_symbol=market.canonical_symbol,
+                    funding_rate=rate,
+                    interval_seconds=FUNDING_INTERVAL_SECONDS,
+                    next_funding_time=next_funding_time,
+                    rate_kind="predicted",
+                )
+            )
+        return tuple(snapshots)

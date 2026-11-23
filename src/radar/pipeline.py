@@ -225,7 +225,6 @@ class MarketDataPipeline:
                 config.markets,
                 clock=clock,
                 error_handler=collector_error_handler,
-                funding_request_spacing_seconds=config.lighter_funding_request_spacing_seconds,
                 **collector_kwargs,
             ),
         ]
@@ -243,9 +242,6 @@ class MarketDataPipeline:
                     base_url=LIGHTER_ROBINHOOD_BASE_URL,
                     clock=clock,
                     error_handler=collector_error_handler,
-                    funding_request_spacing_seconds=(
-                        config.lighter_funding_request_spacing_seconds
-                    ),
                     **collector_kwargs,
                 )
             )

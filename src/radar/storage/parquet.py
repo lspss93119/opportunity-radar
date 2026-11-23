@@ -69,6 +69,8 @@ FUNDING_SCHEMA = pa.schema(
         # Nullable only because partitions written before P0-1 lack the column.
         pa.field("interval_seconds", pa.int64()),
         pa.field("next_funding_time", UTC_TIMESTAMP),
+        # Nullable only because partitions written before this lack the column.
+        pa.field("rate_kind", pa.string()),
     ]
 )
 
@@ -112,7 +114,13 @@ QUOTED_MARKET_SCHEMA = pa.schema(
 # Nullable columns appended after partitions already existed in production.
 # Older files simply lack them; readers must treat a missing column as null.
 APPENDED_NULLABLE_COLUMNS = frozenset(
-    {"interval_seconds", "price_source", "long_open_interest", "short_open_interest"}
+    {
+        "interval_seconds",
+        "price_source",
+        "long_open_interest",
+        "short_open_interest",
+        "rate_kind",
+    }
 )
 
 DATASET_SCHEMAS = {
