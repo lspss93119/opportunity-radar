@@ -9,6 +9,7 @@ import pytest
 from radar.collectors.hyperliquid import (
     HyperliquidOrderBookFeed,
     HyperliquidOrderBookSnapshot,
+    ReconnectBudget,
     _HyperliquidSession,
 )
 from radar.config import MarketConfig
@@ -93,6 +94,11 @@ def l2_book_message(
             ],
         },
     }
+
+
+async def wait_for_real(predicate) -> None:
+    while not predicate():
+        await asyncio.sleep(0.002)
 
 
 async def wait_until(predicate) -> None:
@@ -608,10 +614,13 @@ async def test_hyperliquid_non_l2_messages_do_not_reset_silence_watchdog(
     try:
         await wait_until(lambda: feed.snapshot("BTC") is not None)
         websocket.push(message)
-        await asyncio.wait_for(
-            wait_until(lambda: websocket.closed),
-            timeout=1,
-        )
+        # One silence window resubscribes, the next one closes the socket.
+        await asyncio.wait_for(wait_for_real(lambda: websocket.closed), timeout=1)
+        assert [sent.get("method") for sent in websocket.sent] == [
+            "subscribe",
+            "unsubscribe",
+            "subscribe",
+        ]
     finally:
         await feed.stop()
 
@@ -1013,3 +1022,77 @@ def test_hyperliquid_new_session_resets_per_coin_readiness_and_silence_state():
     assert second.coin_last_l2book_at == {"BTC": None, "UNI": None}
     assert second.coin_last_l2book_monotonic == {"BTC": None, "UNI": None}
     assert second.coin_silent == set()
+
+
+
+@pytest.mark.asyncio
+async def test_resubscribe_recovers_without_opening_a_new_connection():
+    websocket = FixtureWebSocket(
+        [l2_book_message("BTC", bids=((99.0, 1.0),), asks=((101.0, 1.0),))]
+    )
+    connects: list[object] = []
+
+    def connect(_url: str, **_kwargs: object):
+        connects.append(websocket)
+        return websocket
+
+    feed = HyperliquidOrderBookFeed(
+        "wss://test.invalid/ws",
+        ["BTC"],
+        connect=connect,
+        l2_silence_timeout_seconds=0.05,
+    )
+    await feed.start()
+    try:
+        await wait_until(lambda: feed.snapshot("BTC") is not None)
+        await asyncio.wait_for(
+            wait_for_real(lambda: [m.get("method") for m in websocket.sent][-2:]
+                          == ["unsubscribe", "subscribe"]),
+            timeout=1,
+        )
+        # The resubscription brings data back on the same socket.
+        websocket.push(l2_book_message("BTC", bids=((98.0, 1.0),), asks=((102.0, 1.0),)))
+        await asyncio.sleep(0.03)
+        assert not websocket.closed
+        assert len(connects) == 1
+    finally:
+        await feed.stop()
+
+
+def test_reconnect_budget_spaces_reconnects_across_feeds():
+    clock = [100.0]
+    budget = ReconnectBudget(10.0, monotonic=lambda: clock[0])
+
+    assert budget.reserve() == 0.0  # first reconnect goes now
+    assert budget.reserve() == pytest.approx(10.0)  # another feed waits its turn
+    assert budget.reserve() == pytest.approx(20.0)
+    clock[0] = 200.0
+    assert budget.reserve() == 0.0  # quiet period: no wait
+
+
+@pytest.mark.asyncio
+async def test_feed_waits_for_shared_budget_before_reconnecting():
+    connections = [ClosingWebSocket([]) for _ in range(3)]
+    delays: list[float] = []
+    clock = [0.0]
+
+    async def reconnect_sleep(delay: float) -> None:
+        delays.append(delay)
+        clock[0] += delay
+        await asyncio.sleep(0)
+
+    feed = HyperliquidOrderBookFeed(
+        "wss://test.invalid/ws",
+        ["BTC"],
+        connect=lambda _url, **_kwargs: connections.pop(0),
+        reconnect_delays=(1.0,),
+        reconnect_sleep=reconnect_sleep,
+        reconnect_budget=ReconnectBudget(10.0, monotonic=lambda: clock[0]),
+    )
+    await feed.start()
+    try:
+        await wait_until(lambda: len(delays) >= 3)
+    finally:
+        await feed.stop()
+    # 1s backoff, then the second reconnect waits out the 10s spacing.
+    assert delays[:3] == [1.0, 1.0, pytest.approx(9.0)]

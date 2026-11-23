@@ -195,6 +195,11 @@ class RadarConfig(BaseModel):
     lighter_funding_request_spacing_seconds: float = Field(
         default=1.5, ge=0, le=10, allow_inf_nan=False
     )
+    # Minimum gap between Hyperliquid websocket reconnects across all of this
+    # process's HL feeds; Hyperliquid refuses new sockets past a per-IP limit.
+    hyperliquid_reconnect_spacing_seconds: float = Field(
+        default=10.0, ge=0, le=300, allow_inf_nan=False
+    )
     fees_bps: dict[str, float] = Field(default_factory=dict)
     maker_fees_bps: dict[str, float] = Field(default_factory=dict)
     markets: list[MarketConfig] = Field(default_factory=list)

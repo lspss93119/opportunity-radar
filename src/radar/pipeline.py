@@ -205,7 +205,7 @@ class MarketDataPipeline:
     ) -> "MarketDataPipeline":
         from radar.collectors.arcus import ArcusCollector
         from radar.collectors.backpack import BackpackCollector
-        from radar.collectors.hyperliquid import HyperliquidCollector
+        from radar.collectors.hyperliquid import HyperliquidCollector, ReconnectBudget
         from radar.collectors.ondo import OndoCollector
         from radar.collectors.lighter import (
             LIGHTER_ROBINHOOD_BASE_URL,
@@ -213,6 +213,8 @@ class MarketDataPipeline:
         )
 
         latest_market_data = LatestMarketData()
+        # One budget for every Hyperliquid feed: they share the public IP.
+        hyperliquid_budget = ReconnectBudget(config.hyperliquid_reconnect_spacing_seconds)
         collector_kwargs: _CollectorOptions = {
             "latest_market_data": latest_market_data,
         }
@@ -250,6 +252,7 @@ class MarketDataPipeline:
         collectors.append(
             HyperliquidCollector(
                 config.markets,
+                reconnect_budget=hyperliquid_budget,
                 clock=clock,
                 error_handler=collector_error_handler,
                 **collector_kwargs,
@@ -262,6 +265,7 @@ class MarketDataPipeline:
             collectors.append(
                 HyperliquidCollector(
                     config.markets,
+                    reconnect_budget=hyperliquid_budget,
                     venue="trade_xyz",
                     dex="xyz",
                     clock=clock,
@@ -273,6 +277,7 @@ class MarketDataPipeline:
             collectors.append(
                 HyperliquidCollector(
                     config.markets,
+                    reconnect_budget=hyperliquid_budget,
                     venue="entropy",
                     dex="io",
                     clock=clock,

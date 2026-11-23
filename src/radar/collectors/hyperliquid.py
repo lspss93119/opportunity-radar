@@ -36,6 +36,8 @@ HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
 HYPERLIQUID_HEARTBEAT_INTERVAL_SECONDS = 50.0
 HYPERLIQUID_RECONNECT_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 L2_SILENCE_TIMEOUT_SECONDS = 20.0
+# Minimum gap between any two Hyperliquid reconnects in this process.
+HYPERLIQUID_RECONNECT_SPACING_SECONDS = 10.0
 COIN_SILENCE_DIAGNOSTIC_SECONDS = 20.0
 LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +56,39 @@ class HyperliquidOrderBookSnapshot:
     bids: tuple[BookLevel, ...]
     asks: tuple[BookLevel, ...]
     observed_at: datetime
+
+
+class ReconnectBudget:
+    """Process-wide spacing between Hyperliquid reconnects.
+
+    Every Hyperliquid feed in the process (and every other client on the same
+    public IP) shares one connection limit; past it Hyperliquid refuses new
+    sockets with "Cannot open more than 15 connections", which also blocks
+    production feeds behind the same IP. Initial connects are not delayed;
+    reconnects are spaced so a stall cannot become a burst of new sockets.
+    """
+
+    def __init__(
+        self,
+        spacing_seconds: float = HYPERLIQUID_RECONNECT_SPACING_SECONDS,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if spacing_seconds < 0:
+            raise ValueError("spacing_seconds must be non-negative")
+        self._spacing_seconds = spacing_seconds
+        self._monotonic = monotonic
+        self._next_allowed = float("-inf")
+
+    def reserve(self) -> float:
+        """Claim the next reconnect slot; return how long to wait for it."""
+        now = self._monotonic()
+        start = max(now, self._next_allowed)
+        self._next_allowed = start + self._spacing_seconds
+        return start - now
+
+
+SHARED_RECONNECT_BUDGET = ReconnectBudget()
 
 
 @dataclass
@@ -80,6 +115,7 @@ class _HyperliquidSession:
         default_factory=dict
     )
     coin_silent: set[str] = field(default_factory=set)
+    resubscribed_at_monotonic: float | None = None
 
 
 def parse_hyperliquid_meta_and_asset_ctxs(
@@ -156,6 +192,7 @@ class HyperliquidOrderBookFeed:
         reconnect_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         l2_silence_timeout_seconds: float = L2_SILENCE_TIMEOUT_SECONDS,
+        reconnect_budget: ReconnectBudget | None = None,
     ) -> None:
         if reconnect_delay_seconds is not None and reconnect_delay_seconds < 0:
             raise ValueError("reconnect_delay_seconds must be non-negative")
@@ -188,6 +225,9 @@ class HyperliquidOrderBookFeed:
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._monotonic = monotonic
         self._l2_silence_timeout_seconds = l2_silence_timeout_seconds
+        self._reconnect_budget = (
+            SHARED_RECONNECT_BUDGET if reconnect_budget is None else reconnect_budget
+        )
         self._error_handler = error_handler
         self._snapshots: dict[str, HyperliquidOrderBookSnapshot] = {}
         self._task: asyncio.Task[None] | None = None
@@ -280,6 +320,16 @@ class HyperliquidOrderBookFeed:
                 session_healthy,
             )
             await self._reconnect_sleep(delay)
+            budget_wait = self._reconnect_budget.reserve()
+            if budget_wait > 0:
+                LOGGER.info(
+                    "hyperliquid websocket reconnect spaced venue=%s wait_seconds=%.1f",
+                    self._venue,
+                    budget_wait,
+                )
+                await self._reconnect_sleep(budget_wait)
+            if self._stopping:
+                return
             if session_healthy:
                 backoff_index = 0
             else:
@@ -437,12 +487,32 @@ class HyperliquidOrderBookFeed:
                     or self._session_generation != session.generation
                 ):
                     return
+                elapsed = self._monotonic() - session.last_l2_activity_monotonic
+                resubscribed_at = session.resubscribed_at_monotonic
+                if (
+                    resubscribed_at is None
+                    or session.last_l2_activity_monotonic > resubscribed_at
+                ):
+                    # First stall (or a new one after recovery): resubscribe on
+                    # the same socket instead of opening a new connection.
+                    LOGGER.warning(
+                        "hyperliquid websocket l2 silence resubscribe venue=%s "
+                        "session=%d elapsed_seconds=%.3f",
+                        self._venue,
+                        session.generation,
+                        elapsed,
+                    )
+                    await self._resubscribe(websocket)
+                    now = self._monotonic()
+                    session.resubscribed_at_monotonic = now
+                    session.last_l2_activity_monotonic = now
+                    continue
                 LOGGER.warning(
                     "hyperliquid websocket l2 silence timeout venue=%s "
                     "session=%d elapsed_seconds=%.3f",
                     self._venue,
                     session.generation,
-                    self._monotonic() - session.last_l2_activity_monotonic,
+                    elapsed,
                 )
                 assert websocket is not None
                 await websocket.close()
@@ -457,6 +527,18 @@ class HyperliquidOrderBookFeed:
                 await asyncio.wait_for(activity_event.wait(), timeout=remaining)
             except asyncio.TimeoutError:
                 continue
+
+    async def _resubscribe(self, websocket: Any) -> None:
+        for method in ("unsubscribe", "subscribe"):
+            for coin in self._coins:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "method": method,
+                            "subscription": {"type": "l2Book", "coin": coin},
+                        }
+                    )
+                )
 
     def _mark_session_healthy(
         self, session: _HyperliquidSession, *, source: str
@@ -599,7 +681,7 @@ class HyperliquidOrderBookFeed:
         )
         coin = subscription.get("coin") if isinstance(subscription, dict) else None
         if (
-            method != "subscribe"
+            method not in ("subscribe", "unsubscribe")
             or subscription_type != "l2Book"
             or not isinstance(coin, str)
             or coin not in self._coin_set
@@ -706,11 +788,13 @@ class HyperliquidCollector:
         ws_url: str | None = None,
         latest_market_data: LatestMarketData | None = None,
         metadata_refresh_seconds: float = METADATA_REFRESH_SECONDS,
+        reconnect_budget: ReconnectBudget | None = None,
     ) -> None:
         if metadata_refresh_seconds < 0:
             raise ValueError("metadata_refresh_seconds must be non-negative")
         self.venue = venue
         self.dex = dex
+        self._reconnect_budget = reconnect_budget
         self._markets = markets_for_venue(markets, self.venue)
         self._request_json = request_json
         self._clock = clock
@@ -735,6 +819,7 @@ class HyperliquidCollector:
             on_book=self._publish_book,
             on_invalidate=self._invalidate_book,
             error_handler=self._error_handler,
+            reconnect_budget=self._reconnect_budget,
         )
 
     async def set_markets(self, markets: Sequence[MarketConfig]) -> None:
@@ -748,6 +833,11 @@ class HyperliquidCollector:
         self._order_book_feed = self._new_order_book_feed()
         if self._started:
             await old_feed.stop()
+            # A rebuilt feed is a reconnect for the shared per-IP budget.
+            budget = self._reconnect_budget or SHARED_RECONNECT_BUDGET
+            wait = budget.reserve()
+            if wait > 0:
+                await asyncio.sleep(wait)
             await self._order_book_feed.start()
 
     async def start(self) -> None:

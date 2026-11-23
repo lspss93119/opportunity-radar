@@ -1432,3 +1432,26 @@ async def test_live_state_keeps_thin_books_that_fill_the_evaluated_size():
 def test_from_config_gates_live_state_on_spread_evaluation_size():
     pipeline = MarketDataPipeline.from_config(RadarConfig())
     assert pipeline._live_depth_usd == 1_000
+
+
+def test_from_config_shares_one_hyperliquid_reconnect_budget():
+    config = RadarConfig(
+        fees_bps={"trade_xyz": 9.0},
+        hyperliquid_reconnect_spacing_seconds=30.0,
+        markets=[
+            MarketConfig(venue="hyperliquid", venue_symbol="BTC", canonical_symbol="BTC"),
+            MarketConfig(venue="trade_xyz", venue_symbol="xyz:TSLA", canonical_symbol="TSLA"),
+        ],
+    )
+    pipeline = MarketDataPipeline.from_config(config)
+
+    budgets = {
+        id(collector._order_book_feed._reconnect_budget)
+        for collector in pipeline.collectors
+        if isinstance(collector, HyperliquidCollector)
+    }
+    assert len(budgets) == 1
+    feed = next(
+        c for c in pipeline.collectors if isinstance(c, HyperliquidCollector)
+    )._order_book_feed
+    assert feed._reconnect_budget._spacing_seconds == 30.0
