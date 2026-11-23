@@ -138,10 +138,37 @@ class SpreadMonitorConfig(BaseModel):
     anomaly_v2: AnomalyV2Config = Field(default_factory=AnomalyV2Config)
 
 
+class FundingMonitorConfig(BaseModel):
+    """Cross-venue funding differential alerts (spike and carry).
+
+    APR values are decimals (1.0 = 100%/year). Net APR for long A / short B is
+    APR_B - APR_A: positive means the pair is paid to hold.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    interval_seconds: int = Field(default=60, gt=0)
+    primary_size_usd: Literal[1000, 5000, 10000] = 1000
+    # Funding older than this is not compared (context polls run every ~5 min).
+    stale_after_seconds: int = Field(default=900, gt=0)
+    spike_net_apr: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    spike_min_samples: int = Field(default=2, ge=1)
+    carry_avg_net_apr: float = Field(default=0.15, gt=0, allow_inf_nan=False)
+    carry_window_hours: float = Field(default=24, gt=0, le=72, allow_inf_nan=False)
+    # Carry is held for days: expected funding over this holding period must
+    # exceed the round-trip cost (15% APR over 7 days is about 29 bps).
+    carry_horizon_hours: float = Field(default=7 * 24, gt=0, allow_inf_nan=False)
+    carry_min_coverage: float = Field(default=0.8, gt=0, le=1, allow_inf_nan=False)
+    max_history_gap_seconds: int = Field(default=2 * 60 * 60, gt=0)
+    rearm_seconds: int = Field(default=60 * 60, ge=0)
+
+
 class MonitorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     spread: SpreadMonitorConfig = Field(default_factory=SpreadMonitorConfig)
+    funding: FundingMonitorConfig = Field(default_factory=FundingMonitorConfig)
 
 
 class RadarConfig(BaseModel):

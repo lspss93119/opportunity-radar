@@ -725,7 +725,9 @@ monitors:
   spread:
     enabled: true
     interval_seconds: 10
-    primary_size_usd: 10000
+    # $1k: long-tail books are often too thin for $10k (alerts still show $5k/$10k).
+    primary_size_usd: 1000
+    rfq_stale_after_seconds: 120
     candidate_net_bps: 10
     candidate_duration_seconds: 30
     alert_net_bps: 20
@@ -740,3 +742,17 @@ monitors:
       max_gap_seconds: 20
       mean_alignment_max_bps: 5
       expansion_notify_step_bps: 5
+  # Cross-venue funding differential (APR decimals: 1.0 = 100%/year).
+  funding:
+    enabled: true
+    interval_seconds: 60
+    primary_size_usd: 1000
+    stale_after_seconds: 900
+    spike_net_apr: 1.0
+    spike_min_samples: 2
+    carry_avg_net_apr: 0.15
+    carry_window_hours: 24
+    carry_horizon_hours: 168
+    carry_min_coverage: 0.8
+    max_history_gap_seconds: 7200
+    rearm_seconds: 3600

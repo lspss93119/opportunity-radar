@@ -5,6 +5,7 @@ from typing import TypeAlias
 
 from radar.config import RadarConfig
 from radar.monitors.base import Monitor
+from radar.monitors.funding import FundingMonitor
 from radar.monitors.manual_opportunity import ManualOpportunityMonitor
 from radar.monitors.spread.factory import create_spread_monitor
 from radar.storage.sqlite import SQLiteRuntimeStore
@@ -23,6 +24,14 @@ MONITOR_FACTORIES: dict[str, MonitorFactory] = {
         stale_after_seconds=config.monitors.spread.stale_after_seconds,
         market_identities=config.monitor_market_identities(),
     ),
+    "funding": lambda config, runtime_store: FundingMonitor(
+        config.monitors.funding,
+        config.fees_bps,
+        spread_stale_after_seconds=config.monitors.spread.stale_after_seconds,
+        rfq_stale_after_seconds=config.monitors.spread.rfq_stale_after_seconds,
+        market_identities=config.spread_monitor_market_identities(),
+        runtime_store=runtime_store,
+    ),
 }
 
 
@@ -34,6 +43,7 @@ def build_enabled_monitors(
     enabled_names = (
         ("spread", config.monitors.spread.enabled),
         ("manual_opportunity", config.manual_opportunity.enabled),
+        ("funding", config.monitors.funding.enabled),
     )
     monitors: list[Monitor] = []
     for name, enabled in enabled_names:

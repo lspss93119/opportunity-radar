@@ -22,15 +22,19 @@ class AlertRouter:
         self,
         spread_processor: AlertProcessor,
         manual_processor: AlertProcessor,
+        funding_processor: AlertProcessor | None = None,
     ) -> None:
         self._spread_processor = spread_processor
         self._manual_processor = manual_processor
+        self._funding_processor = funding_processor
 
     async def process(self, alert: AlertRequest) -> None:
         if alert.monitor == "spread":
             await self._spread_processor.process(alert)
         elif alert.monitor == "manual_opportunity":
             await self._manual_processor.process(alert)
+        elif alert.monitor == "funding" and self._funding_processor is not None:
+            await self._funding_processor.process(alert)
         else:
             raise ValueError(f"unknown alert monitor: {alert.monitor}")
 

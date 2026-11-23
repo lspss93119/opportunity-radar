@@ -10,7 +10,9 @@ from radar.monitors.spread.factory import create_spread_monitor
 def test_example_config_loads():
     cfg = load_config(Path("config/radar.example.yaml"))
     assert cfg.sampling_seconds == 10
-    assert cfg.monitors.spread.primary_size_usd == 10_000
+    assert cfg.monitors.spread.primary_size_usd == 1_000
+    assert cfg.monitors.funding.enabled is True
+    assert cfg.monitors.funding.spike_net_apr == 1.0
     assert cfg.fees_bps["trade_xyz"] == 9.0
     assert cfg.fees_bps["entropy"] == 9.0
     assert cfg.fees_bps["arcus"] == 2.25

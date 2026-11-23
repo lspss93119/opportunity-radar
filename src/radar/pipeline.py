@@ -17,6 +17,8 @@ from radar.collectors.base import (
 )
 from radar.collectors.variational import (
     VariationalCollector,
+    variational_funding_snapshot,
+    variational_hourly_context,
     variational_market_snapshot,
 )
 from radar.config import MarketConfig, RadarConfig
@@ -505,6 +507,20 @@ class MarketDataPipeline:
                 if symbol in kept
             }
 
+    def _rfq_context_batch(self, sample_time: datetime, now: datetime) -> CollectorBatch:
+        """Funding and OI for every RFQ quote still within its freshness limit."""
+        quotes = [
+            quote
+            for quote in self._latest_quotes.values()
+            if 0 <= (now - quote.quote_time).total_seconds() <= self._rfq_stale_after_seconds
+        ]
+        return CollectorBatch(
+            funding_snapshots=tuple(variational_funding_snapshot(q) for q in quotes),
+            hourly_contexts=tuple(
+                variational_hourly_context(q, sample_time=sample_time) for q in quotes
+            ),
+        )
+
     def _fresh_rfq_snapshots(
         self, sample_time: datetime, now: datetime
     ) -> tuple[MarketSnapshot, ...]:
@@ -626,7 +642,7 @@ class MarketDataPipeline:
                     collector.venue,
                     TypeError("collector returned a non-CollectorBatch value"),
                 )
-        batch = merge_batches(batches)
+        batch = merge_batches((*batches, self._rfq_context_batch(hour, current_time)))
         self.state.apply_context_batch(batch)
         if self.storage is not None:
             self.storage.append(batch)

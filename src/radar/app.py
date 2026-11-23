@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from radar.alerts.funding import FundingAlertProcessor
 from radar.alerts.spread import SpreadAlertProcessor
 from radar.alerts.manual_opportunity import ManualOpportunityAlertProcessor
 from radar.alerts.telegram import TelegramTransport
@@ -29,6 +30,7 @@ from radar.diagnostics import (
     advance_scheduled_sample_time,
     install_diagnostic_logging,
 )
+from radar.history.funding import load_recent_funding_points
 from radar.history.spread import SpreadHistory
 from radar.history.manual_opportunity import (
     ManualOpportunityHistory,
@@ -36,6 +38,7 @@ from radar.history.manual_opportunity import (
 )
 from radar.models import FundingSnapshot, MarketSnapshot
 from radar.monitors.base import AlertRequest, JSONValue
+from radar.monitors.funding import FundingMonitor
 from radar.monitors.manual_opportunity import ManualOpportunityMonitor
 from radar.monitors.registry import build_enabled_monitors
 from radar.monitors.runner import MonitorRunner
@@ -894,6 +897,19 @@ def build_application(
         hydrate_history = getattr(monitor, "hydrate_history", None)
         if callable(hydrate_history):
             hydrate_history(history_points)
+    for monitor in monitors:
+        if isinstance(monitor, FundingMonitor):
+            # Slow startup read; evaluation itself never touches Parquet.
+            monitor.hydrate_history(
+                load_recent_funding_points(
+                    Path(data_root),
+                    as_of=clock(),
+                    window=timedelta(
+                        hours=config.monitors.funding.carry_window_hours,
+                        seconds=config.monitors.funding.max_history_gap_seconds,
+                    ),
+                )
+            )
     manual_monitors = tuple(
         monitor for monitor in monitors if monitor.name == "manual_opportunity"
     )
@@ -955,6 +971,7 @@ def build_application(
             ),
             min_profit_bps=config.manual_opportunity.expected_net_min_bps,
         ),
+        FundingAlertProcessor(telegram),
     )
     alert_worker = AlertWorker(
         queue,

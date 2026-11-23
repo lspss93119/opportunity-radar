@@ -14,7 +14,12 @@ from radar.collectors.base import (
 )
 from radar.collectors.http import request_json as default_request_json
 from radar.config import MarketConfig
-from radar.models import FundingSnapshot, MarketSnapshot, QuotedMarketSnapshot
+from radar.models import (
+    FundingSnapshot,
+    HourlyContext,
+    MarketSnapshot,
+    QuotedMarketSnapshot,
+)
 
 VARIATIONAL_VENUE = "variational"
 VARIATIONAL_STATS_URL = (
@@ -251,6 +256,13 @@ class VariationalCollector:
 
 def variational_funding_snapshot(quote: QuotedMarketSnapshot) -> FundingSnapshot:
     """Normalize a Variational annualized funding quote to one interval's rate."""
+    interval = quote.funding_interval_seconds
+    # Settlements fall on whole multiples of the interval (all live v2
+    # next_timestamp values checked on 2026-11-23).
+    quote_epoch = int(quote.quote_time.timestamp())
+    next_funding_time = datetime.fromtimestamp(
+        quote_epoch - quote_epoch % interval + interval, tz=UTC
+    )
     return FundingSnapshot(
         effective_time=quote.quote_time,
         observed_at=quote.fetched_at,
@@ -261,6 +273,23 @@ def variational_funding_snapshot(quote: QuotedMarketSnapshot) -> FundingSnapshot
         * quote.funding_interval_seconds
         / VARIATIONAL_FUNDING_YEAR_SECONDS,
         interval_seconds=quote.funding_interval_seconds,
+        next_funding_time=next_funding_time,
+    )
+
+
+def variational_hourly_context(
+    quote: QuotedMarketSnapshot, *, sample_time: datetime
+) -> HourlyContext:
+    """Variational reports OI per side in USD; there is no base-unit total."""
+    return HourlyContext(
+        sample_time=sample_time.astimezone(UTC).replace(minute=0, second=0, microsecond=0),
+        observed_at=quote.fetched_at,
+        venue=quote.venue,
+        venue_symbol=quote.venue_symbol,
+        canonical_symbol=quote.canonical_symbol,
+        volume_24h=quote.volume_24h,
+        long_open_interest=quote.long_open_interest,
+        short_open_interest=quote.short_open_interest,
     )
 
 

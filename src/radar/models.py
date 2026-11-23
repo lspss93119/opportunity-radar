@@ -101,6 +101,9 @@ class HourlyContext(BaseModel):
     canonical_symbol: str = Field(min_length=1)
     open_interest: float | None = Field(default=None, ge=0)
     volume_24h: float | None = Field(default=None, ge=0)
+    # USD per side; only venues that publish the long/short split (Variational).
+    long_open_interest: float | None = Field(default=None, ge=0)
+    short_open_interest: float | None = Field(default=None, ge=0)
 
     _sample_time_utc = field_validator("sample_time")(_require_utc)
     _observed_at_utc = field_validator("observed_at")(_require_utc)

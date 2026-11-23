@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import websockets
@@ -784,7 +784,9 @@ class LighterCollector:
                 canonical_symbol=market.canonical_symbol,
                 funding_rate=point.funding_rate,
                 interval_seconds=FUNDING_INTERVAL_SECONDS,
-                next_funding_time=None,
+                # Settlements happen on every hour mark.
+                next_funding_time=point.effective_time
+                + timedelta(seconds=FUNDING_INTERVAL_SECONDS),
             )
         except Exception as error:  # noqa: BLE001
             report_collector_error(self._error_handler, self.venue, error)

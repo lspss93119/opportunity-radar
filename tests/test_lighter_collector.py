@@ -459,7 +459,10 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
     assert batch.funding_snapshots[0].effective_time == datetime.fromtimestamp(
         1789470000, tz=UTC
     )
-    assert batch.funding_snapshots[0].next_funding_time is None
+    # Settled at the 11:00 hour mark, so the next settlement is 12:00.
+    assert batch.funding_snapshots[0].next_funding_time == datetime(
+        2026, 9, 15, 12, 0, tzinfo=UTC
+    )
 
     btc_context = batch.hourly_contexts[0]
     assert btc_context.sample_time == datetime(2026, 9, 15, 10, 0, tzinfo=UTC)

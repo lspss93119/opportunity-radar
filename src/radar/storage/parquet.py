@@ -81,6 +81,9 @@ HOURLY_CONTEXT_SCHEMA = pa.schema(
         pa.field("canonical_symbol", pa.string(), nullable=False),
         pa.field("open_interest", pa.float64()),
         pa.field("volume_24h", pa.float64()),
+        # Nullable only because partitions written before P0-5 lack the columns.
+        pa.field("long_open_interest", pa.float64()),
+        pa.field("short_open_interest", pa.float64()),
     ]
 )
 
@@ -108,7 +111,9 @@ QUOTED_MARKET_SCHEMA = pa.schema(
 
 # Nullable columns appended after partitions already existed in production.
 # Older files simply lack them; readers must treat a missing column as null.
-APPENDED_NULLABLE_COLUMNS = frozenset({"interval_seconds", "price_source"})
+APPENDED_NULLABLE_COLUMNS = frozenset(
+    {"interval_seconds", "price_source", "long_open_interest", "short_open_interest"}
+)
 
 DATASET_SCHEMAS = {
     "market": MARKET_SCHEMA,
