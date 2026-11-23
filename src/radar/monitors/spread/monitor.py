@@ -27,6 +27,7 @@ from radar.monitors.spread.models import (
     SpreadCandidate,
     SpreadPairKey,
     build_spread_candidates,
+    parse_price_source,
 )
 
 UTC = timezone.utc
@@ -227,6 +228,7 @@ class SpreadMonitor:
             current_time,
             primary_size_usd=self.config.primary_size_usd,
             stale_after_seconds=self.config.stale_after_seconds,
+            rfq_stale_after_seconds=self.config.rfq_stale_after_seconds,
             fees_bps=self._fees_bps,
             require_fees=False,
         )
@@ -395,6 +397,7 @@ class SpreadMonitor:
             current_time,
             primary_size_usd=self.config.primary_size_usd,
             stale_after_seconds=self.config.stale_after_seconds,
+            rfq_stale_after_seconds=self.config.rfq_stale_after_seconds,
             fees_bps=self._fees_bps,
             require_fees=False,
         )
@@ -564,6 +567,8 @@ class SpreadMonitor:
             if episode.alert_condition_since is not None
             else 0,
             "observed_at_skew_seconds": candidate.observed_at_skew_seconds,
+            "long_price_source": candidate.long_price_source,
+            "short_price_source": candidate.short_price_source,
             "round_trip_fee_bps": (
                 2.0 * (candidate.long_fee_bps + candidate.short_fee_bps)
                 if candidate.long_fee_bps is not None
@@ -710,6 +715,8 @@ class SpreadMonitor:
                 "raw_spread_bps": candidate.raw_spread_bps,
                 "net_spread_bps": candidate.net_spread_bps,
                 "observed_at_skew_seconds": candidate.observed_at_skew_seconds,
+                "long_price_source": candidate.long_price_source,
+                "short_price_source": candidate.short_price_source,
             },
             "candidate_confirmed": episode.candidate_confirmed,
             "candidate_confirmed_at": (
@@ -767,6 +774,8 @@ class SpreadMonitor:
             observed_at_skew_seconds=cls._non_negative(
                 candidate_raw.get("observed_at_skew_seconds", 0.0)
             ),
+            long_price_source=parse_price_source(candidate_raw.get("long_price_source")),
+            short_price_source=parse_price_source(candidate_raw.get("short_price_source")),
         )
         episode_id = cls._text(raw["episode_id"])
         first_seen_at = cls._timestamp(raw["first_seen_at"])

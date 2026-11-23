@@ -18,6 +18,7 @@ from radar.history.spread import (
     WindowStats,
 )
 from radar.monitors.base import AlertRequest, JSONValue
+from radar.monitors.spread.models import parse_price_source
 from radar.storage.sqlite import SQLiteRuntimeStore
 
 SUPPORTED_SIZES = frozenset({1_000, 5_000, 10_000})
@@ -213,6 +214,8 @@ def parse_spread_alert(alert: AlertRequest) -> SpreadAlertDetails:
             expected_venue_symbol=short_venue_symbol,
             expected_canonical_symbol=canonical_symbol,
         ),
+        long_price_source=parse_price_source(payload.get("long_price_source")),
+        short_price_source=parse_price_source(payload.get("short_price_source")),
     )
 
 
@@ -290,6 +293,8 @@ def parse_anomaly_alert(alert: AlertRequest) -> AnomalyAlertDetails:
         observed_at_skew_seconds=_require_number(
             payload, "observed_at_skew_seconds", non_negative=True
         ),
+        long_price_source=parse_price_source(payload.get("long_price_source")),
+        short_price_source=parse_price_source(payload.get("short_price_source")),
     )
 
 
@@ -307,6 +312,18 @@ def _format_funding(
 
 def _display_venue(venue: str) -> str:
     return " ".join(part.capitalize() for part in venue.split("_"))
+
+
+RFQ_LABEL = "［RFQ 報價］"
+
+
+def _source_label(price_source: str) -> str:
+    return f" {RFQ_LABEL}" if price_source == "rfq" else ""
+
+
+def _price_label(side: str, price_source: str) -> str:
+    """Book sides walk depth (VWAP); RFQ sides are the venue's own size quote."""
+    return f"{side} RFQ 報價" if price_source == "rfq" else f"{side} VWAP"
 
 
 def _format_price(value: float) -> str:
@@ -355,8 +372,10 @@ def format_spread_alert(
             "\n".join(
                 (
                     f"價差警報 | {details.canonical_symbol} | ${details.primary_size_usd:,}",
-                    f"做多: {long_venue} ({details.long_venue_symbol})",
-                    f"做空: {short_venue} ({details.short_venue_symbol})",
+                    f"做多: {long_venue} ({details.long_venue_symbol})"
+                    f"{_source_label(details.long_price_source)}",
+                    f"做空: {short_venue} ({details.short_venue_symbol})"
+                    f"{_source_label(details.short_price_source)}",
                     (
                         f"原始價差: {details.raw_spread_bps:.2f} bps | "
                         f"淨價差: {_format_bps(details.net_spread_bps)} bps"
@@ -380,8 +399,10 @@ def format_spread_alert(
             ),
             "\n".join(
                 (
-                    f"買入 VWAP: {_format_price(details.long_buy_vwap)} | "
-                    f"賣出 VWAP: {_format_price(details.short_sell_vwap)}",
+                    f"{_price_label('買入', details.long_price_source)}: "
+                    f"{_format_price(details.long_buy_vwap)} | "
+                    f"{_price_label('賣出', details.short_price_source)}: "
+                    f"{_format_price(details.short_sell_vwap)}",
                     f"樣本時間: {_format_timestamp(details.sample_time)}",
                 )
             ),
@@ -492,11 +513,15 @@ def format_anomaly_alert(
     return "\n\n".join(
         (
             heading,
-            f"Long {long_venue} ({details.long_venue_symbol})\n"
-            f"Short {short_venue} ({details.short_venue_symbol})",
+            f"Long {long_venue} ({details.long_venue_symbol})"
+            f"{_source_label(details.long_price_source)}\n"
+            f"Short {short_venue} ({details.short_venue_symbol})"
+            f"{_source_label(details.short_price_source)}",
             body,
-            f"Buy VWAP {_format_price(details.long_buy_vwap)} · "
-            f"Sell VWAP {_format_price(details.short_sell_vwap)}\n"
+            f"{_price_label('Buy', details.long_price_source)} "
+            f"{_format_price(details.long_buy_vwap)} · "
+            f"{_price_label('Sell', details.short_price_source)} "
+            f"{_format_price(details.short_sell_vwap)}\n"
             f"Raw {_format_bps(details.raw_spread_bps, signed=True)} bps · "
             f"Net {_format_bps(details.net_spread_bps, signed=True)} bps\n"
             f"Sample {_format_timestamp(details.sample_time)}",
@@ -785,9 +810,11 @@ class SpreadAlertProcessor:
         anomaly_v2_config: AnomalyV2Config | None = None,
         runtime_store: SQLiteRuntimeStore | None = None,
         stale_after_seconds: int = 30,
+        rfq_stale_after_seconds: int | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._history = history
+        self._rfq_stale_after_seconds = rfq_stale_after_seconds
         self._telegram = telegram
         self._candidate_net_bps = candidate_net_bps
         self._alert_net_bps = alert_net_bps
@@ -1133,6 +1160,7 @@ class SpreadAlertProcessor:
                     primary_size_usd=details.primary_size_usd,
                     confirmed_at=confirmed_at,
                     stale_after_seconds=self._stale_after_seconds,
+                    rfq_stale_after_seconds=self._rfq_stale_after_seconds,
                 )
             except Exception as error:  # noqa: BLE001
                 last_error = error

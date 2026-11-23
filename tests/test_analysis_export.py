@@ -614,3 +614,40 @@ def test_quoted_market_conversion_reads_high_fragment_count_in_batches(
     assert result.row_count == 24
     assert batch_sizes
     assert all(size is not None and size <= 8192 for size in batch_sizes)
+
+
+def test_partition_straddling_schema_upgrade_exports_with_blank_new_columns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "data"
+    partition = data_root / "market" / f"date={DATE_TEXT}"
+    partition.mkdir(parents=True)
+    legacy_schema = MARKET_SCHEMA.remove(MARKET_SCHEMA.get_field_index("price_source"))
+    rows = _source_rows()
+    pq.write_table(
+        pa.Table.from_pylist(rows[0], schema=legacy_schema),
+        partition / "part-01.parquet",
+    )
+    current_rows = [{**row, "price_source": "rfq"} for row in rows[1]]
+    pq.write_table(
+        pa.Table.from_pylist(current_rows, schema=MARKET_SCHEMA),
+        partition / "part-02.parquet",
+    )
+    output = tmp_path / "analysis" / "market" / f"date={DATE_TEXT}.csv.gz"
+    monkeypatch.setattr(analysis_export, "_run_rclone", FakeRclone(output))
+
+    result = analysis_export.export_market_date(
+        data_root=data_root,
+        output_root=tmp_path / "analysis",
+        target_date=TARGET_DATE,
+        remote="opportunity-drive-own",
+        rclone=Path("/opt/homebrew/bin/rclone"),
+    )
+
+    with gzip.open(output, "rt", encoding="utf-8", newline="") as handle:
+        exported = list(csv.DictReader(handle))
+    assert result.row_count == len(rows[0]) + len(rows[1])
+    assert [row["price_source"] for row in exported] == (
+        [""] * len(rows[0]) + ["rfq"] * len(rows[1])
+    )

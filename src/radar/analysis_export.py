@@ -18,7 +18,7 @@ from typing import Literal, cast
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
-from radar.storage.parquet import DATASET_SCHEMAS
+from radar.storage.parquet import APPENDED_NULLABLE_COLUMNS, DATASET_SCHEMAS
 
 REMOTE_NAME = "opportunity-drive-own"
 REMOTE_ROOT = "OpportunityRadar/analysis_csv"
@@ -97,25 +97,42 @@ def _source_files(
     return files
 
 
+def _without_appended_columns(schema: pa.Schema) -> pa.Schema:
+    for name in APPENDED_NULLABLE_COLUMNS:
+        index = schema.get_field_index(name)
+        if index >= 0:
+            schema = schema.remove(index)
+    return schema
+
+
+def _schema_compatible(file_schema: pa.Schema, schema: pa.Schema) -> bool:
+    """Accept the export schema itself or a legacy file lacking appended columns."""
+    return file_schema.equals(schema, check_metadata=True) or file_schema.equals(
+        _without_appended_columns(schema), check_metadata=True
+    )
+
+
 def _source_schema_and_rows(files: Sequence[Path]) -> tuple[pa.Schema, int]:
-    first = pq.ParquetFile(files[0])
-    try:
-        schema = first.schema_arrow
-        row_count = first.metadata.num_rows
-    finally:
-        close = getattr(first, "close", None)
-        if callable(close):
-            close()
-    for path in files[1:]:
+    schemas: list[pa.Schema] = []
+    row_count = 0
+    for path in files:
         parquet = pq.ParquetFile(path)
         try:
-            if not parquet.schema_arrow.equals(schema, check_metadata=True):
-                raise ExportError(f"source Parquet schema mismatch: {path.name}")
+            schemas.append(parquet.schema_arrow)
             row_count += parquet.metadata.num_rows
         finally:
             close = getattr(parquet, "close", None)
             if callable(close):
                 close()
+    schema = schemas[0]
+    # A partition straddling a schema upgrade mixes legacy and current files;
+    # export it with the widest schema and blank the missing legacy columns.
+    widest = max(schemas, key=len)
+    if all(_schema_compatible(candidate, widest) for candidate in schemas):
+        schema = widest
+    for path, candidate in zip(files, schemas, strict=True):
+        if not _schema_compatible(candidate, schema):
+            raise ExportError(f"source Parquet schema mismatch: {path.name}")
     return schema, row_count
 
 
@@ -205,12 +222,12 @@ def _convert_partition(
         for path in files:
             parquet = pq.ParquetFile(path)
             try:
-                if not parquet.schema_arrow.equals(schema, check_metadata=True):
+                if not _schema_compatible(parquet.schema_arrow, schema):
                     raise ExportError(f"source Parquet schema mismatch: {path.name}")
                 for batch in parquet.iter_batches(batch_size=CSV_BATCH_SIZE):
                     for row in batch.to_pylist():
                         writer.writerow(
-                            [_csv_value(field, row[field.name]) for field in fields]
+                            [_csv_value(field, row.get(field.name)) for field in fields]
                         )
                         row_count += 1
             finally:

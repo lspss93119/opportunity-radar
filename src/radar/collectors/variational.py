@@ -14,7 +14,7 @@ from radar.collectors.base import (
 )
 from radar.collectors.http import request_json as default_request_json
 from radar.config import MarketConfig
-from radar.models import FundingSnapshot, QuotedMarketSnapshot
+from radar.models import FundingSnapshot, MarketSnapshot, QuotedMarketSnapshot
 
 VARIATIONAL_VENUE = "variational"
 VARIATIONAL_STATS_URL = (
@@ -258,4 +258,29 @@ def variational_funding_snapshot(quote: QuotedMarketSnapshot) -> FundingSnapshot
         * quote.funding_interval_seconds
         / VARIATIONAL_FUNDING_YEAR_SECONDS,
         interval_seconds=quote.funding_interval_seconds,
+    )
+
+
+def variational_market_snapshot(
+    quote: QuotedMarketSnapshot, *, sample_time: datetime
+) -> MarketSnapshot:
+    """Expose the $1k RFQ quote through the same size -> price interface as books.
+
+    Only $1k is quoted at a monitored size, so 5k/10k stay unavailable; the
+    quote's own ``updated_at`` is its observation time for staleness checks.
+    """
+    return MarketSnapshot(
+        sample_time=sample_time,
+        observed_at=quote.quote_time,
+        venue=quote.venue,
+        venue_symbol=quote.venue_symbol,
+        canonical_symbol=quote.canonical_symbol,
+        best_bid=quote.bid_1k,
+        best_bid_size=1_000 / quote.bid_1k,
+        best_ask=quote.ask_1k,
+        best_ask_size=1_000 / quote.ask_1k,
+        mark_price=quote.mark_price,
+        buy_1k_vwap=quote.ask_1k,
+        sell_1k_vwap=quote.bid_1k,
+        price_source="rfq",
     )

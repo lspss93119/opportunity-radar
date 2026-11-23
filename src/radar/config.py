@@ -70,6 +70,8 @@ class SpreadMonitorConfig(BaseModel):
     alert_net_bps: float = Field(default=20.0, ge=0, allow_inf_nan=False)
     alert_duration_seconds: int = Field(default=120, ge=0)
     stale_after_seconds: int = Field(default=30, gt=0)
+    # RFQ venues (Variational) refresh quotes about once a minute.
+    rfq_stale_after_seconds: int = Field(default=120, gt=0)
     anomaly_v2: AnomalyV2Config = Field(default_factory=AnomalyV2Config)
 
 
@@ -99,6 +101,14 @@ class RadarConfig(BaseModel):
         return {
             (market.venue, market.venue_symbol, market.canonical_symbol)
             for market in self.markets
+            if market.enabled and market.monitor_enabled
+        }
+
+    def spread_monitor_market_identities(self) -> set[tuple[str, str, str]]:
+        """Feeds the spread monitor may pair, including enabled RFQ quote feeds."""
+        return self.monitor_market_identities() | {
+            (market.venue, market.venue_symbol, market.canonical_symbol)
+            for market in self.quoted_markets
             if market.enabled and market.monitor_enabled
         }
 

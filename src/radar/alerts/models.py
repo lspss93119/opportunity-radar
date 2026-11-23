@@ -38,6 +38,8 @@ class SpreadAlertDetails:
     alert_duration_seconds: int
     long_funding: FundingContext | None
     short_funding: FundingContext | None
+    long_price_source: str = "order_book"
+    short_price_source: str = "order_book"
 
 
 @dataclass(frozen=True)
@@ -78,3 +80,5 @@ class AnomalyAlertDetails:
     short_fee_bps: float | None
     net_spread_bps: float | None
     observed_at_skew_seconds: float
+    long_price_source: str = "order_book"
+    short_price_source: str = "order_book"

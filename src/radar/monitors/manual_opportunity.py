@@ -1423,11 +1423,17 @@ class ManualOpportunityMonitor:
             )
 
     def _scoped_markets(self, state: RadarState) -> tuple[MarketSnapshot, ...]:
-        if self._market_identities is None:
-            return state.markets
-        return tuple(
+        # This lifecycle is BBO-only; RFQ quotes are not a visible book BBO.
+        books = tuple(
             snapshot
             for snapshot in state.markets
+            if snapshot.price_source == "order_book"
+        )
+        if self._market_identities is None:
+            return books
+        return tuple(
+            snapshot
+            for snapshot in books
             if (
                 snapshot.venue,
                 snapshot.venue_symbol,

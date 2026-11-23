@@ -38,6 +38,17 @@ class SpreadCandidate:
     raw_spread_bps: float
     net_spread_bps: float | None
     observed_at_skew_seconds: float = 0.0
+    long_price_source: str = "order_book"
+    short_price_source: str = "order_book"
+
+
+def parse_price_source(value: object) -> str:
+    """Read a persisted price source; state saved before P0-2 is all order books."""
+    if value is None:
+        return "order_book"
+    if value not in ("order_book", "rfq"):
+        raise ValueError("unknown price source")
+    return str(value)
 
 
 def _finite_number(value: float, field_name: str) -> float:
@@ -87,10 +98,13 @@ def is_valid_market_snapshot(
     now: datetime,
     *,
     stale_after_seconds: int,
+    rfq_stale_after_seconds: int | None = None,
 ) -> bool:
     current_time = _as_utc(now, "now")
     if stale_after_seconds <= 0:
         raise ValueError("stale_after_seconds must be positive")
+    if snapshot.price_source == "rfq" and rfq_stale_after_seconds is not None:
+        stale_after_seconds = rfq_stale_after_seconds
     if any(
         not isinstance(value, str) or not value.strip()
         for value in (snapshot.venue, snapshot.venue_symbol, snapshot.canonical_symbol)
@@ -127,6 +141,7 @@ def build_spread_candidates(
     fees_bps: Mapping[str, float],
     top_n: int | None = None,
     require_fees: bool = True,
+    rfq_stale_after_seconds: int | None = None,
 ) -> tuple[SpreadCandidate, ...]:
     """Build every valid directional cross-venue pair.
 
@@ -145,6 +160,7 @@ def build_spread_candidates(
             snapshot,
             current_time,
             stale_after_seconds=stale_after_seconds,
+            rfq_stale_after_seconds=rfq_stale_after_seconds,
         ):
             continue
         grouped.setdefault(snapshot.canonical_symbol, []).append(snapshot)
@@ -219,6 +235,8 @@ def build_spread_candidates(
                                 - _as_utc(short_snapshot.observed_at, "observed_at")
                             ).total_seconds()
                         ),
+                        long_price_source=long_snapshot.price_source,
+                        short_price_source=short_snapshot.price_source,
                     )
                 )
     return tuple(candidates)

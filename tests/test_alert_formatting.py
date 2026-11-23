@@ -269,3 +269,32 @@ def test_parse_accepts_utc_offset_and_normalizes_timestamps():
     )
 
     assert details.sample_time == SAMPLE_TIME
+
+
+def test_spread_alert_labels_rfq_quote_side_only():
+    from radar.alerts.spread import format_spread_alert, parse_spread_alert
+
+    details = parse_spread_alert(
+        make_alert(
+            long_venue="variational",
+            long_price_source="rfq",
+            short_price_source="order_book",
+            funding_context={"long": None, "short": None},
+        )
+    )
+    message = format_spread_alert(details, make_context())
+
+    assert "做多: Variational (BTC) ［RFQ 報價］" in message
+    assert "做空: Hyperliquid (BTC)\n" in message
+    assert "買入 RFQ 報價: " in message
+    assert "賣出 VWAP: " in message
+
+
+def test_spread_alert_without_price_source_stays_unlabeled():
+    from radar.alerts.spread import format_spread_alert, parse_spread_alert
+
+    details = parse_spread_alert(make_alert())
+    message = format_spread_alert(details, make_context())
+
+    assert details.long_price_source == "order_book"
+    assert "RFQ" not in message

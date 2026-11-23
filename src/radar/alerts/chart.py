@@ -21,6 +21,11 @@ HISTORICAL_MEDIAN_TOLERANCE_BPS = 0.01
 REFERENCE_LABEL_MIN_GAP_BPS = 2.0
 
 
+
+def _venue_title(venue: str, price_source: str) -> str:
+    # ASCII marker: the default Matplotlib font has no CJK glyphs.
+    return f"{venue} (RFQ)" if price_source == "rfq" else venue
+
 def _downsample_points(
     points: tuple[HistoricalSpreadPoint, ...],
     *,
@@ -285,8 +290,8 @@ def render_spread_chart(
             bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
         )
         axis.set_title(
-            f"{details.canonical_symbol} | {details.long_venue} → "
-            f"{details.short_venue} | ${details.primary_size_usd:,}",
+            f"{details.canonical_symbol} | {_venue_title(details.long_venue, details.long_price_source)} → "
+            f"{_venue_title(details.short_venue, details.short_price_source)} | ${details.primary_size_usd:,}",
             fontsize=11,
         )
         axis.set_xlabel("Time (UTC)", fontsize=9)
@@ -376,8 +381,8 @@ def render_anomaly_chart(
                 color=color,
             )
         axis.set_title(
-            f"{details.canonical_symbol} | {details.long_venue} → "
-            f"{details.short_venue} | ${details.primary_size_usd:,}",
+            f"{details.canonical_symbol} | {_venue_title(details.long_venue, details.long_price_source)} → "
+            f"{_venue_title(details.short_venue, details.short_price_source)} | ${details.primary_size_usd:,}",
             fontsize=11,
         )
         axis.set_xlabel("Time (UTC)", fontsize=9)

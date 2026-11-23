@@ -53,6 +53,8 @@ MARKET_SCHEMA = pa.schema(
         pa.field("sell_5k_vwap", pa.float64()),
         pa.field("buy_10k_vwap", pa.float64()),
         pa.field("sell_10k_vwap", pa.float64()),
+        # Nullable only because partitions written before P0-2 lack the column.
+        pa.field("price_source", pa.string()),
     ]
 )
 
@@ -103,6 +105,10 @@ QUOTED_MARKET_SCHEMA = pa.schema(
         pa.field("short_open_interest", pa.float64()),
     ]
 )
+
+# Nullable columns appended after partitions already existed in production.
+# Older files simply lack them; readers must treat a missing column as null.
+APPENDED_NULLABLE_COLUMNS = frozenset({"interval_seconds", "price_source"})
 
 DATASET_SCHEMAS = {
     "market": MARKET_SCHEMA,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -36,6 +37,10 @@ class MarketSnapshot(BaseModel):
     sell_5k_vwap: float | None = Field(default=None, gt=0)
     buy_10k_vwap: float | None = Field(default=None, gt=0)
     sell_10k_vwap: float | None = Field(default=None, gt=0)
+
+    # "order_book": prices walk a public book; "rfq": a venue's size-specific
+    # quote (e.g. Variational $1k), executable but not a visible book.
+    price_source: Literal["order_book", "rfq"] = "order_book"
 
     _sample_time_utc = field_validator("sample_time")(_require_utc)
     _observed_at_utc = field_validator("observed_at")(_require_utc)

@@ -70,6 +70,17 @@ def _as_utc(value: datetime, field_name: str) -> datetime:
     return value.astimezone(UTC)
 
 
+def _stale_limit(
+    price_source: object,
+    stale_after_seconds: int,
+    rfq_stale_after_seconds: int | None,
+) -> int:
+    """RFQ quotes refresh more slowly than books and carry their own limit."""
+    if price_source == "rfq" and rfq_stale_after_seconds is not None:
+        return rfq_stale_after_seconds
+    return stale_after_seconds
+
+
 def _stats_for_window(
     points: list[HistoricalSpreadPoint],
     *,
@@ -255,6 +266,7 @@ class SpreadHistory:
         as_of: datetime,
         window: timedelta = timedelta(days=1),
         stale_after_seconds: int | None = None,
+        rfq_stale_after_seconds: int | None = None,
     ) -> dict[SpreadPairKey, tuple[tuple[datetime, float], ...]]:
         """Load one bounded prior window for stable-basis monitor hydration."""
         try:
@@ -284,8 +296,9 @@ class SpreadHistory:
                 venue_symbol,
                 canonical_symbol,
                 {buy_column} AS buy_vwap,
-                {sell_column} AS sell_vwap
-            FROM read_parquet('{market_glob}')
+                {sell_column} AS sell_vwap,
+                price_source
+            FROM read_parquet('{market_glob}', union_by_name=true)
             WHERE sample_time >= ?
               AND sample_time < ?
         """
@@ -304,6 +317,7 @@ class SpreadHistory:
             canonical_symbol,
             buy_vwap,
             sell_vwap,
+            price_source,
         ) in rows:
             if not all(
                 isinstance(value, str) and value.strip()
@@ -318,7 +332,9 @@ class SpreadHistory:
             if (
                 stale_after_seconds is not None
                 and abs((sample_time_utc - observed_at_utc).total_seconds())
-                > stale_after_seconds
+                > _stale_limit(
+                    price_source, stale_after_seconds, rfq_stale_after_seconds
+                )
             ):
                 continue
             feed_key = (venue, venue_symbol, canonical_symbol, sample_time_utc)
@@ -374,6 +390,7 @@ class SpreadHistory:
         primary_size_usd: int,
         confirmed_at: datetime,
         stale_after_seconds: int,
+        rfq_stale_after_seconds: int | None = None,
     ) -> AnomalyConfirmationContext:
         """Query exact-pair prior-only context for anomaly notification gating."""
         try:
@@ -404,8 +421,9 @@ class SpreadHistory:
                     venue_symbol,
                     canonical_symbol,
                     {buy_column} AS buy_vwap,
-                    {sell_column} AS sell_vwap
-                FROM read_parquet('{market_glob}')
+                    {sell_column} AS sell_vwap,
+                    price_source
+                FROM read_parquet('{market_glob}', union_by_name=true)
                 WHERE sample_time >= ?
                   AND sample_time < ?
                   AND canonical_symbol = ?
@@ -422,7 +440,7 @@ class SpreadHistory:
                 FROM filtered
             )
             SELECT sample_time, observed_at, venue, venue_symbol,
-                   canonical_symbol, buy_vwap, sell_vwap
+                   canonical_symbol, buy_vwap, sell_vwap, price_source
             FROM ranked
             WHERE row_number = 1
             ORDER BY sample_time, venue, venue_symbol
@@ -448,6 +466,7 @@ class SpreadHistory:
             row_symbol,
             buy_vwap,
             sell_vwap,
+            price_source,
         ) in rows:
             if row_symbol != canonical_symbol:
                 continue
@@ -458,7 +477,9 @@ class SpreadHistory:
                 continue
             if sample_utc >= confirmed_utc or observed_utc > confirmed_utc:
                 continue
-            if abs((sample_utc - observed_utc).total_seconds()) > stale_after_seconds:
+            if abs((sample_utc - observed_utc).total_seconds()) > _stale_limit(
+                price_source, stale_after_seconds, rfq_stale_after_seconds
+            ):
                 continue
             if venue not in (long_venue, short_venue):
                 continue

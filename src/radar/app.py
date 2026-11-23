@@ -825,6 +825,7 @@ def build_application(
             primary_size_usd=config.monitors.spread.primary_size_usd,
             as_of=clock(),
             stale_after_seconds=config.monitors.spread.stale_after_seconds,
+            rfq_stale_after_seconds=config.monitors.spread.rfq_stale_after_seconds,
         )
     else:
         history_points = history.load_recent_pair_points(
@@ -879,6 +880,7 @@ def build_application(
         anomaly_v2_config=config.monitors.spread.anomaly_v2,
         runtime_store=runtime_store,
         stale_after_seconds=config.monitors.spread.stale_after_seconds,
+        rfq_stale_after_seconds=config.monitors.spread.rfq_stale_after_seconds,
     )
     processor = AlertRouter(
         spread_processor,

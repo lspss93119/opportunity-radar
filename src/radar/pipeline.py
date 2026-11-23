@@ -14,9 +14,13 @@ from radar.collectors.base import (
     markets_for_venue,
     report_collector_error,
 )
-from radar.collectors.variational import VariationalCollector
+from radar.collectors.variational import (
+    VariationalCollector,
+    variational_market_snapshot,
+)
 from radar.config import MarketConfig, RadarConfig
 from radar.market_data import LatestMarketData, MarketAvailabilityDiagnostic
+from radar.models import MarketSnapshot, QuotedMarketSnapshot
 from radar.state import RadarState
 from radar.storage.parquet import ParquetStorage
 
@@ -121,6 +125,7 @@ class MarketDataPipeline:
         quoted_market_collector: VariationalCollector | None = None,
         quoted_market_poll_interval_seconds: float = 30.0,
         context_poll_seconds: int = 3600,
+        rfq_stale_after_seconds: int = 120,
     ) -> None:
         if sampling_seconds != SAMPLE_INTERVAL_SECONDS:
             raise ValueError("sampling_seconds must be a 10-second interval")
@@ -135,6 +140,10 @@ class MarketDataPipeline:
         ):
             raise ValueError("context_poll_seconds must evenly divide 3600")
         self._context_poll_seconds = context_poll_seconds
+        if isinstance(rfq_stale_after_seconds, bool) or rfq_stale_after_seconds <= 0:
+            raise ValueError("rfq_stale_after_seconds must be positive")
+        self._rfq_stale_after_seconds = rfq_stale_after_seconds
+        self._latest_quotes: dict[str, QuotedMarketSnapshot] = {}
         self._collectors = tuple(collectors)
         self.state = state
         self._markets = tuple(markets)
@@ -292,6 +301,7 @@ class MarketDataPipeline:
             stale_after_seconds=config.monitors.spread.stale_after_seconds,
             quoted_market_collector=quoted_market_collector,
             context_poll_seconds=config.context_poll_seconds,
+            rfq_stale_after_seconds=config.monitors.spread.rfq_stale_after_seconds,
         )
 
     @property
@@ -414,11 +424,31 @@ class MarketDataPipeline:
                 )
                 in included_keys
             )
+            + self._fresh_rfq_snapshots(resolved_sample_time, current_time)
         )
         self.state.apply_market_batch(batch)
         if self.storage is not None:
             self.storage.append(batch)
         return batch
+
+    def _fresh_rfq_snapshots(
+        self, sample_time: datetime, now: datetime
+    ) -> tuple[MarketSnapshot, ...]:
+        """Expose each RFQ quote while its own ``updated_at`` is still fresh."""
+        snapshots: list[MarketSnapshot] = []
+        for venue_symbol in sorted(self._latest_quotes):
+            quote = self._latest_quotes[venue_symbol]
+            age_seconds = (now - quote.quote_time).total_seconds()
+            if not 0 <= age_seconds <= self._rfq_stale_after_seconds:
+                continue
+            try:
+                snapshots.append(
+                    variational_market_snapshot(quote, sample_time=sample_time)
+                )
+            except ValueError:
+                # A crossed or otherwise invalid quote is skipped, never repaired.
+                continue
+        return tuple(snapshots)
 
     def _record_market_availability(
         self, diagnostics: Sequence[MarketAvailabilityDiagnostic]
@@ -598,6 +628,8 @@ class MarketDataPipeline:
         while True:
             try:
                 snapshots = await collector.poll_once()
+                for snapshot in snapshots:
+                    self._latest_quotes[snapshot.venue_symbol] = snapshot
                 if snapshots and self.storage is not None:
                     self.storage.append_quoted(snapshots)
             except asyncio.CancelledError:

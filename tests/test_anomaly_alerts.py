@@ -696,3 +696,17 @@ async def test_delivery_state_and_success_audit_are_atomic(tmp_path, monkeypatch
             event["event_type"] for event in store.list_opportunities(monitor_name="spread")
         ] == ["anomaly_delivery_attempt"]
         assert len(telegram.texts) == 1
+
+
+def test_anomaly_format_labels_rfq_quote_side():
+    from radar.alerts.spread import parse_anomaly_alert
+
+    request = alert()
+    request.payload["short_price_source"] = "rfq"
+    details = parse_anomaly_alert(request)
+    message = format_anomaly_alert(details, context(10.0, 9.0, 8.8))
+
+    assert "Long Arcus (QQQ-USD)\n" in message
+    assert "Short Lighter Robinhood (QQQ) ［RFQ 報價］" in message
+    assert "Sell RFQ 報價 " in message
+    assert "Buy VWAP " in message

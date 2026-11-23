@@ -14,7 +14,11 @@ from radar.monitors.spread.anomaly import (
     AnomalyTracker,
 )
 from radar.monitors.spread.basis import RollingBasisStats
-from radar.monitors.spread.models import SpreadCandidate, SpreadPairKey
+from radar.monitors.spread.models import (
+    SpreadCandidate,
+    SpreadPairKey,
+    parse_price_source,
+)
 from radar.state import RadarState
 
 OpportunityEvent = tuple[str, str, object, datetime]
@@ -373,6 +377,8 @@ class AnomalyV2Lifecycle:
             "short_fee_bps": candidate.short_fee_bps,
             "net_spread_bps": candidate.net_spread_bps,
             "observed_at_skew_seconds": candidate.observed_at_skew_seconds,
+            "long_price_source": candidate.long_price_source,
+            "short_price_source": candidate.short_price_source,
             "funding_context": {
                 "long": _funding_payload(state, candidate.key, "long"),
                 "short": _funding_payload(state, candidate.key, "short"),
@@ -456,6 +462,8 @@ def _candidate_to_dict(candidate: SpreadCandidate) -> dict[str, JSONValue]:
         "raw_spread_bps": candidate.raw_spread_bps,
         "net_spread_bps": candidate.net_spread_bps,
         "observed_at_skew_seconds": candidate.observed_at_skew_seconds,
+        "long_price_source": candidate.long_price_source,
+        "short_price_source": candidate.short_price_source,
     }
 
 
@@ -487,6 +495,8 @@ def _candidate_from_dict(raw: object) -> SpreadCandidate:
             raw.get("observed_at_skew_seconds", 0.0),
             "observed_at_skew_seconds",
         ),
+        long_price_source=parse_price_source(raw.get("long_price_source")),
+        short_price_source=parse_price_source(raw.get("short_price_source")),
     )
 
 
