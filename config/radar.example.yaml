@@ -34,7 +34,7 @@ discovery:
   symbol_overrides:
     - {venue: variational, venue_symbol: US500, canonical_symbol: SPY}
   # Pre-IPO contracts define a share differently on each venue.
-  exclude_symbols: [ANT, OPENAI]
+  exclude_symbols: [ANT, ANTHROPIC, OPENAI, SPCX, SHEIN, UNITREE]
   exclude_markets: []
 
 manual_opportunity:

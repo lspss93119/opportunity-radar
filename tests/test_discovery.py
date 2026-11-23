@@ -244,3 +244,22 @@ async def test_discovery_lists_each_venue_once_and_pairs_across_them():
         for venue in ("lighter", "hyperliquid")
         for symbol in ("BTC", "ETH", "SOL")
     }
+
+
+
+def test_default_pre_ipo_exclusions_cover_alternate_tickers():
+    result = select_universe(
+        [
+            listing("lighter", "ANTHROPIC", mark=1554.0),
+            listing("lighter_robinhood", "ANTHROPIC", mark=1558.0),
+            listing("lighter", "SPCX", mark=139.7),
+            listing("trade_xyz", "xyz:SPCX", mark=139.6),
+            listing("lighter", "SHEIN", mark=4.54),
+            listing("trade_xyz", "xyz:UNITREE", mark=108.4),
+            listing("lighter", "UNITREE", mark=108.3),
+        ],
+        config(),
+    )
+
+    assert result.markets == ()
+    assert {e.reason for e in result.exclusions} == {"excluded_symbol"}

@@ -94,8 +94,18 @@ class DiscoveryConfig(BaseModel):
             )
         ]
     )
-    # Pre-IPO contracts define a "share" differently on each venue.
-    exclude_symbols: list[str] = Field(default_factory=lambda: ["ANT", "OPENAI"])
+    # Pre-IPO contracts define a "share" differently on each venue (Anthropic
+    # trades as ANT on some venues and as ANTHROPIC, ~17.6x larger, on others).
+    exclude_symbols: list[str] = Field(
+        default_factory=lambda: [
+            "ANT",
+            "ANTHROPIC",
+            "OPENAI",
+            "SPCX",
+            "SHEIN",
+            "UNITREE",
+        ]
+    )
     exclude_markets: list[MarketRef] = Field(default_factory=list)
 
 
