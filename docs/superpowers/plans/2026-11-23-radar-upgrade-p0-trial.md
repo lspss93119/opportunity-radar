@@ -46,6 +46,23 @@
 - **B. Telegram**：同一個 bot、另外開一個試跑用的 chat。不用改程式，只換 `RADAR_TELEGRAM_CHAT_ID`。**你要先建好 chat、把 bot 加進去，並提供 chat id。**
 - **C. 分支傳送方式**：push `feature/radar-upgrade-p0` 到 `origin`（GitHub），再在 Mac mini 上 clone。
 
+## 4a. 第一次試跑中止紀錄（2026-11-23）
+
+- **時間**：11:51 UTC 啟動，12:02 UTC 手動停止。
+- **現象**：試跑的 HL feed 在約 14 分鐘內重連 19 次（多數由 l2 靜默超時觸發）。HL 開始以「Cannot open more than 15 connections」拒絕這個 IP 的新連線，**正式環境重連時也被拒絕**。約 11:59–12:06 UTC 這段時間，正式 Radar 的 HL core 和 xyz 共 28 個市場收不到資料。停止試跑後約 3 分鐘自動恢復。
+- **共用 IP 的狀況**：開發機和 Mac mini 對外是同一個公網 IP，這個 IP 上還有其他長期執行的 HL 用戶端（合計約 29 條連線）；正式 Radar 只佔 2–3 條。
+- **原因**：HL 偶爾會整條連線 20 秒不送 l2Book，正式環境也有這個現象。原本的處理是立刻斷線，並在 1 秒後重連；三個 HL feed 各自這樣做，就把整個 IP 的連線名額推過上限。
+- **修正**（`ee087e2`）：
+  - 第一次靜默時，先在同一條連線上重新訂閱；第二次靜默才斷線重連。
+  - 同一個程序內的所有 HL feed 共用一個重連限額，設定值是 `hyperliquid_reconnect_spacing_seconds`（預設 10 秒）。重掃時重建 feed 也算一次重連。
+
+## 4b. 重試前的額外安全措施
+
+- 試跑設定加上 `hyperliquid_reconnect_spacing_seconds: 30`（比預設更保守）。
+- **自動中止**：啟動一個獨立的監看腳本，每 30 秒讀一次正式 Radar 的 tmux 畫面（唯讀）。只要出現新的「Cannot open more than 15 connections」，就立刻對試跑送 Ctrl-C 停止。
+- 試跑期間，同一個 IP 上其他用不到的 HL 用戶端可以暫時關掉，以空出餘裕（由使用者決定）。
+- 試跑期間，開發機和 Mac mini 上都不會再額外跑任何會連 HL 的 smoke test。
+
 ## 5. 試跑步驟（取得同意後才執行）
 
 所有指令都在 Mac mini 上執行，只會建立新的目錄和檔案。
@@ -67,6 +84,7 @@
    - 新增 `monitors.funding:`，`enabled: true`，其他用預設值（飆升 100% / 2 次採樣、carry 15% / 24h、持有 7 天）
    - `manual_opportunity.enabled: false`（正式環境已經在跑，試跑不重複發）
    - `lighter_funding_request_spacing_seconds: 3.0`（§4-A）
+   - `hyperliquid_reconnect_spacing_seconds: 30`（§4b）
    - 確認 `fees_bps` 有包含 `variational`（可以設 0，或填查證過的值）
 3. **用新的 tmux session 啟動**（不碰 `radar` 這個 session）
    ```bash
