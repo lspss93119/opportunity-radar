@@ -155,6 +155,44 @@ def is_live_synchronized_pair(
     )
 
 
+def _is_live_pair(
+    long_snapshot: MarketSnapshot,
+    short_snapshot: MarketSnapshot,
+    now: datetime,
+    *,
+    max_age_seconds: float,
+    max_skew_seconds: float,
+) -> bool:
+    """Books must be contemporaneous; an RFQ leg has its own staleness limit.
+
+    RFQ quotes refresh about once a minute, so they can never meet the book
+    skew rule. The book leg of such a pair must still be live, and the RFQ
+    leg already passed ``rfq_stale_after_seconds`` in is_valid_market_snapshot.
+    """
+    books = [
+        snapshot
+        for snapshot in (long_snapshot, short_snapshot)
+        if snapshot.price_source != "rfq"
+    ]
+    if len(books) == 2:
+        return is_live_synchronized_pair(
+            long_snapshot,
+            short_snapshot,
+            now,
+            max_age_seconds=max_age_seconds,
+            max_skew_seconds=max_skew_seconds,
+        )
+    current_time = _as_utc(now, "now")
+    for book in books:
+        try:
+            age = (current_time - _as_utc(book.observed_at, "observed_at")).total_seconds()
+        except ValueError:
+            return False
+        if not 0 <= age <= max_age_seconds:
+            return False
+    return True
+
+
 def _fee_for(venue: str, fees_bps: Mapping[str, float]) -> float | None:
     for configured_venue, value in fees_bps.items():
         if not isinstance(configured_venue, str) or configured_venue.lower() != venue.lower():
@@ -243,7 +281,7 @@ def build_spread_candidates(
                     continue
                 if long_sample_time != short_sample_time:
                     continue
-                if live_quote_max_age_seconds is not None and not is_live_synchronized_pair(
+                if live_quote_max_age_seconds is not None and not _is_live_pair(
                     long_snapshot,
                     short_snapshot,
                     current_time,

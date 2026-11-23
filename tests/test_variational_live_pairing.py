@@ -248,3 +248,42 @@ def test_persisted_spread_and_anomaly_state_round_trip_price_sources():
     legacy_candidate = SpreadMonitor._deserialize_episode(legacy).candidate
     assert legacy_candidate.long_price_source == "order_book"
     assert legacy_candidate.short_price_source == "order_book"
+
+
+def test_live_guard_exempts_rfq_leg_but_keeps_book_leg_live():
+    rfq = variational_market_snapshot(make_quote(age_seconds=90), sample_time=NOW)
+
+    def candidates(book_age: float):
+        return build_spread_candidates(
+            [rfq, make_book(age_seconds=book_age)],
+            NOW,
+            primary_size_usd=1_000,
+            stale_after_seconds=30,
+            rfq_stale_after_seconds=120,
+            fees_bps={},
+            require_fees=False,
+            live_quote_max_age_seconds=3.0,
+            live_quote_max_skew_seconds=3.0,
+        )
+
+    # 90s RFQ age and 89s skew would fail the book rule; the RFQ leg is exempt.
+    assert len(candidates(book_age=1.0)) == 2
+    # The order-book leg still has to be within the 3s live limit.
+    assert candidates(book_age=5.0) == ()
+
+
+def test_live_guard_still_applies_to_two_order_books():
+    other = make_book(venue="hyperliquid", age_seconds=10.0)
+    assert (
+        build_spread_candidates(
+            [make_book(age_seconds=1.0), other],
+            NOW,
+            primary_size_usd=1_000,
+            stale_after_seconds=30,
+            fees_bps={},
+            require_fees=False,
+            live_quote_max_age_seconds=3.0,
+            live_quote_max_skew_seconds=3.0,
+        )
+        == ()
+    )

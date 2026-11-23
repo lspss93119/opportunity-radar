@@ -530,7 +530,8 @@ async def test_collect_once_logs_reason_coded_market_availability_summary(caplog
     )
     assert "configured=2" in summary
     assert "included=1" in summary
-    assert "insufficient_buy_10k=1" in summary
+    assert "live_depth_usd=10000" in summary
+    assert "insufficient_buy=1" in summary
 
 
 @pytest.mark.asyncio
@@ -1395,3 +1396,39 @@ def test_from_config_passes_lighter_funding_spacing_to_both_lighter_venues():
     }
     assert spacings == {"lighter": 3.0, "lighter_robinhood": 3.0}
     assert RadarConfig().lighter_funding_request_spacing_seconds == 1.5
+
+
+
+@pytest.mark.asyncio
+async def test_live_state_keeps_thin_books_that_fill_the_evaluated_size():
+    """A long-tail book that fills $1k but not $10k must reach live monitors."""
+    latest = LatestMarketData()
+    markets = (MarketConfig(venue="lighter", venue_symbol="VVV", canonical_symbol="VVV"),)
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="VVV",
+        bids=[BookLevel(price=25.0, base_size=100.0)],  # $2.5k each side
+        asks=[BookLevel(price=25.1, base_size=100.0)],
+        observed_at=NOW,
+    )
+    thin_10k = MarketDataPipeline(
+        [], RadarState(), markets=markets, latest_market_data=latest, clock=lambda: NOW
+    )
+    at_1k = MarketDataPipeline(
+        [],
+        RadarState(),
+        markets=markets,
+        latest_market_data=latest,
+        clock=lambda: NOW,
+        live_depth_usd=1_000,
+    )
+
+    assert (await thin_10k.collect_once(now=NOW)).market_snapshots == ()
+    batch = await at_1k.collect_once(now=NOW)
+    assert [snapshot.venue_symbol for snapshot in batch.market_snapshots] == ["VVV"]
+    assert batch.market_snapshots[0].buy_10k_vwap is None
+
+
+def test_from_config_gates_live_state_on_spread_evaluation_size():
+    pipeline = MarketDataPipeline.from_config(RadarConfig())
+    assert pipeline._live_depth_usd == 1_000

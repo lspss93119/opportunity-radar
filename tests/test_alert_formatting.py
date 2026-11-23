@@ -298,3 +298,20 @@ def test_spread_alert_without_price_source_stays_unlabeled():
 
     assert details.long_price_source == "order_book"
     assert "RFQ" not in message
+
+
+def test_rfq_spread_alert_shows_quote_age_instead_of_skew():
+    from radar.alerts.spread import format_spread_alert, parse_spread_alert
+
+    details = parse_spread_alert(
+        make_alert(
+            long_venue="variational",
+            long_price_source="rfq",
+            observed_at_skew_seconds=74.6,
+            funding_context={"long": None, "short": None},
+        )
+    )
+    message = format_spread_alert(details, make_context())
+
+    assert "RFQ 報價年齡: 75s" in message
+    assert "觀測偏差" not in message

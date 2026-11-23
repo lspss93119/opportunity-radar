@@ -447,7 +447,11 @@ def format_spread_alert(
             ),
             "\n".join(
                 (
-                    f"觀測偏差: {details.observed_at_skew_seconds:.2f}s",
+                    (
+                        f"RFQ 報價年齡: {details.observed_at_skew_seconds:.0f}s"
+                        if "rfq" in (details.long_price_source, details.short_price_source)
+                        else f"觀測偏差: {details.observed_at_skew_seconds:.2f}s"
+                    ),
                     (
                         "資金費率: "
                         f"{_format_funding(details.long_venue, details.long_funding)} | "
@@ -570,6 +574,11 @@ def format_anomaly_alert(
                         details.spread_by_size_bps, unavailable="thin"
                     )
                 )
+                else ""
+            )
+            + (
+                f"RFQ quote age {details.observed_at_skew_seconds:.0f}s\n"
+                if "rfq" in (details.long_price_source, details.short_price_source)
                 else ""
             )
             + f"Sample {_format_timestamp(details.sample_time)}",

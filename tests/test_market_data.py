@@ -264,9 +264,9 @@ def test_latest_market_view_is_immutable():
         ("missing", "missing_view"),
         ("unready", "unready"),
         ("stale", "stale"),
-        ("insufficient_buy", "insufficient_buy_10k_depth"),
-        ("insufficient_sell", "insufficient_sell_10k_depth"),
-        ("insufficient_both", "insufficient_both_10k_depth"),
+        ("insufficient_buy", "insufficient_buy_depth"),
+        ("insufficient_sell", "insufficient_sell_depth"),
+        ("insufficient_both", "insufficient_both_depth"),
         ("included", "included"),
     ],
 )
@@ -342,7 +342,7 @@ def test_build_batch_with_diagnostics_preserves_candidate_snapshot_for_depth_omi
         stale_after_seconds=30,
     )
 
-    assert diagnostics[0].reason == "insufficient_buy_10k_depth"
+    assert diagnostics[0].reason == "insufficient_buy_depth"
     assert batch.market_snapshots[0].buy_10k_vwap is None
     assert batch.market_snapshots[0].sell_10k_vwap == pytest.approx(99.0)
 

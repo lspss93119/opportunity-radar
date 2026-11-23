@@ -140,6 +140,7 @@ class MarketDataPipeline:
         context_poll_seconds: int = 3600,
         rfq_stale_after_seconds: int = 120,
         quoted_markets: Sequence[MarketConfig] = (),
+        live_depth_usd: int = 10_000,
     ) -> None:
         if sampling_seconds != SAMPLE_INTERVAL_SECONDS:
             raise ValueError("sampling_seconds must be a 10-second interval")
@@ -159,6 +160,10 @@ class MarketDataPipeline:
         self._rfq_stale_after_seconds = rfq_stale_after_seconds
         self._latest_quotes: dict[str, QuotedMarketSnapshot] = {}
         self._storage_cadence = _storage_cadence((*markets, *quoted_markets))
+        if live_depth_usd not in (1_000, 5_000, 10_000):
+            raise ValueError("live_depth_usd must be 1000, 5000, or 10000")
+        # Feeds reach live state only when both sides fill the evaluated size.
+        self._live_depth_usd = live_depth_usd
         self._collectors = tuple(collectors)
         self.state = state
         self._markets = tuple(markets)
@@ -337,6 +342,7 @@ class MarketDataPipeline:
             context_poll_seconds=config.context_poll_seconds,
             rfq_stale_after_seconds=config.monitors.spread.rfq_stale_after_seconds,
             quoted_markets=config.quoted_markets,
+            live_depth_usd=config.monitors.spread.primary_size_usd,
         )
 
     @property
@@ -436,6 +442,7 @@ class MarketDataPipeline:
                 sample_time=resolved_sample_time,
                 now=current_time,
                 stale_after_seconds=self._stale_after_seconds,
+                live_depth_usd=self._live_depth_usd,
             )
         )
         included_keys = {
@@ -462,7 +469,7 @@ class MarketDataPipeline:
             )
             + rfq_snapshots
         )
-        # Keep the strict 10k-depth gate for live monitoring, but archive every
+        # Keep the live depth gate (the evaluated size) for monitoring, but archive every
         # fresh, valid BBO even when only the smaller VWAP tiers are executable.
         # Historical research must not lose $1k/$5k observations merely because
         # the same book cannot fill $10k on both sides.
@@ -569,16 +576,17 @@ class MarketDataPipeline:
         self._market_availability_cycles += 1
         LOGGER.info(
             "market availability cycle configured=%d included=%d missing_view=%d "
-            "unready=%d stale=%d insufficient_buy_10k=%d "
-            "insufficient_sell_10k=%d insufficient_both_10k=%d",
+            "unready=%d stale=%d live_depth_usd=%d insufficient_buy=%d "
+            "insufficient_sell=%d insufficient_both=%d",
             len(diagnostics),
             counts["included"],
             counts["missing_view"],
             counts["unready"],
             counts["stale"],
-            counts["insufficient_buy_10k_depth"],
-            counts["insufficient_sell_10k_depth"],
-            counts["insufficient_both_10k_depth"],
+            self._live_depth_usd,
+            counts["insufficient_buy_depth"],
+            counts["insufficient_sell_depth"],
+            counts["insufficient_both_depth"],
         )
 
         for diagnostic in diagnostics:
@@ -617,8 +625,8 @@ class MarketDataPipeline:
             LOGGER.info(
                 "market availability feed summary venue=%s venue_symbol=%s "
                 "canonical_symbol=%s included=%d missing_view=%d unready=%d "
-                "stale=%d insufficient_buy_10k=%d insufficient_sell_10k=%d "
-                "insufficient_both_10k=%d",
+                "stale=%d insufficient_buy=%d insufficient_sell=%d "
+                "insufficient_both=%d",
                 venue,
                 venue_symbol,
                 canonical_symbol,
@@ -626,9 +634,9 @@ class MarketDataPipeline:
                 feed_counts["missing_view"],
                 feed_counts["unready"],
                 feed_counts["stale"],
-                feed_counts["insufficient_buy_10k_depth"],
-                feed_counts["insufficient_sell_10k_depth"],
-                feed_counts["insufficient_both_10k_depth"],
+                feed_counts["insufficient_buy_depth"],
+                feed_counts["insufficient_sell_depth"],
+                feed_counts["insufficient_both_depth"],
             )
 
     async def collect_hourly_once(

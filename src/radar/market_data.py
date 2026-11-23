@@ -192,12 +192,14 @@ class LatestMarketData:
         sample_time: datetime,
         now: datetime,
         stale_after_seconds: int,
+        live_depth_usd: int = 10_000,
     ) -> CollectorBatch:
         batch, _diagnostics = self.build_batch_with_diagnostics(
             markets,
             sample_time=sample_time,
             now=now,
             stale_after_seconds=stale_after_seconds,
+            live_depth_usd=live_depth_usd,
         )
         return batch
 
@@ -208,7 +210,9 @@ class LatestMarketData:
         sample_time: datetime,
         now: datetime,
         stale_after_seconds: int,
+        live_depth_usd: int = 10_000,
     ) -> tuple[CollectorBatch, tuple[MarketAvailabilityDiagnostic, ...]]:
+        """``live_depth_usd`` is the size both sides must fill to be "included"."""
         sample_time = _require_utc(sample_time, "sample_time")
         now = _require_utc(now, "now")
         self._validate_stale_after(stale_after_seconds)
@@ -237,6 +241,7 @@ class LatestMarketData:
                 sample_time=sample_time,
                 now=now,
                 stale_after_seconds=stale_after_seconds,
+                live_depth_usd=live_depth_usd,
             )
             diagnostics.append(
                 MarketAvailabilityDiagnostic(
@@ -262,6 +267,7 @@ class LatestMarketData:
         sample_time: datetime,
         now: datetime,
         stale_after_seconds: int,
+        live_depth_usd: int = 10_000,
     ) -> tuple[MarketSnapshot | None, str]:
         if not view.ready or not view.bids or not view.asks:
             return None, "unready"
@@ -296,12 +302,17 @@ class LatestMarketData:
             buy_10k_vwap=buy_10k,
             sell_10k_vwap=sell_10k,
         )
-        if buy_10k is None and sell_10k is None:
-            reason = "insufficient_both_10k_depth"
-        elif buy_10k is None:
-            reason = "insufficient_buy_10k_depth"
-        elif sell_10k is None:
-            reason = "insufficient_sell_10k_depth"
+        live_buy, live_sell = {
+            1_000: (buy_1k, sell_1k),
+            5_000: (buy_5k, sell_5k),
+            10_000: (buy_10k, sell_10k),
+        }[live_depth_usd]
+        if live_buy is None and live_sell is None:
+            reason = "insufficient_both_depth"
+        elif live_buy is None:
+            reason = "insufficient_buy_depth"
+        elif live_sell is None:
+            reason = "insufficient_sell_depth"
         else:
             reason = "included"
         return snapshot, reason
