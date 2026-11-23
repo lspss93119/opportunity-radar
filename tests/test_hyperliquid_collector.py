@@ -180,8 +180,6 @@ class FixtureTransport:
             return load_fixture("meta_and_asset_ctxs.json")
         if json_body["type"] == "l2Book":
             return load_fixture(f"l2_{json_body['coin'].lower()}.json")
-        if json_body["type"] == "fundingHistory":
-            return load_fixture(f"funding_{json_body['coin'].lower()}.json")
         raise AssertionError(f"unexpected request: {json_body}")
 
 
@@ -229,15 +227,16 @@ async def test_hyperliquid_collector_normalizes_market_funding_and_hourly_contex
 
     assert len(batch.funding_snapshots) == 3
     btc_funding = batch.funding_snapshots[0]
-    assert btc_funding.funding_rate == pytest.approx(0.0002)
-    # fundingHistory.fundingRate is already an hourly decimal; positive = longs pay.
+    # metaAndAssetCtxs.funding is the current hourly decimal; positive = longs pay.
+    assert btc_funding.funding_rate == pytest.approx(0.0000125)
     assert btc_funding.interval_seconds == 3600
-    assert btc_funding.rate_per_hour == pytest.approx(0.0002)
-    assert btc_funding.apr == pytest.approx(0.0002 * 8760)
-    assert btc_funding.effective_time == datetime.fromtimestamp(
-        1789470000, tz=UTC
+    assert btc_funding.rate_per_hour == pytest.approx(0.0000125)
+    assert btc_funding.apr == pytest.approx(0.1095)
+    assert btc_funding.effective_time == OBSERVED_AT
+    assert btc_funding.next_funding_time == datetime(2026, 9, 15, 11, 0, tzinfo=UTC)
+    assert [f.funding_rate for f in batch.funding_snapshots] == pytest.approx(
+        [0.0000125, 0.0000200, -0.0000100]
     )
-    assert btc_funding.next_funding_time is None
 
     btc_context = batch.hourly_contexts[0]
     assert btc_context.sample_time == datetime(2026, 9, 15, 10, 0, tzinfo=UTC)
@@ -249,7 +248,8 @@ async def test_hyperliquid_collector_normalizes_market_funding_and_hourly_contex
     assert all(method == "POST" for _, method, _ in transport.calls)
     assert sum(body["type"] == "metaAndAssetCtxs" for _, _, body in transport.calls) == 1
     assert sum(body["type"] == "l2Book" for _, _, body in transport.calls) == 0
-    assert sum(body["type"] == "fundingHistory" for _, _, body in transport.calls) == 3
+    # Funding comes from the shared metadata request, never one call per coin.
+    assert sum(body["type"] == "fundingHistory" for _, _, body in transport.calls) == 0
     assert [
         body for _, _, body in transport.calls if body["type"] == "metaAndAssetCtxs"
     ] == [{"type": "metaAndAssetCtxs"}]
@@ -380,8 +380,6 @@ class Hip3FixtureTransport:
             return load_fixture("hip3_meta_and_asset_ctxs.json")
         if request_type == "l2Book" and json_body["coin"] == "xyz:TSLA":
             return load_fixture("hip3_l2_xyz_tsla.json")
-        if request_type == "fundingHistory" and json_body["coin"] == "xyz:TSLA":
-            return load_fixture("hip3_funding_xyz_tsla.json")
         raise AssertionError(f"unexpected HIP-3 request: {json_body}")
 
 
@@ -397,8 +395,6 @@ class EntropyFixtureTransport:
             return load_fixture_from_entropy("meta_and_asset_ctxs.json")
         if request_type == "l2Book" and json_body["coin"] == "io:SNDK":
             return load_fixture_from_entropy("l2_io_sndk.json")
-        if request_type == "fundingHistory" and json_body["coin"] == "io:SNDK":
-            return load_fixture_from_entropy("funding_io_sndk.json")
         raise AssertionError(f"unexpected Entropy request: {json_body}")
 
 
@@ -452,10 +448,10 @@ async def test_trade_xyz_collector_adds_dex_only_to_metadata_and_normalizes_hip3
     assert funding.venue == "trade_xyz"
     assert funding.venue_symbol == "xyz:TSLA"
     assert funding.canonical_symbol == "TSLA"
-    assert funding.funding_rate == pytest.approx(0.0002)
+    assert funding.funding_rate == pytest.approx(0.0000125)
     assert funding.interval_seconds == 3600
-    assert funding.apr == pytest.approx(0.0002 * 8760)
-    assert funding.effective_time == datetime.fromtimestamp(1789470000, tz=UTC)
+    assert funding.apr == pytest.approx(0.1095)
+    assert funding.effective_time == batch.hourly_contexts[0].observed_at
 
     context = batch.hourly_contexts[0]
     assert context.venue == "trade_xyz"
@@ -515,13 +511,11 @@ async def test_entropy_collector_uses_io_namespace_and_maps_sndk():
     assert snapshot.canonical_symbol == "SNDK"
     assert snapshot.buy_10k_vwap is not None
     assert snapshot.sell_10k_vwap is not None
-    assert batch.funding_snapshots[0].effective_time == datetime.fromtimestamp(
-        1790128800, tz=UTC
-    )
     entropy_funding = batch.funding_snapshots[0]
-    assert entropy_funding.funding_rate == pytest.approx(0.0000016101)
+    assert entropy_funding.effective_time == batch.hourly_contexts[0].observed_at
+    assert entropy_funding.funding_rate == pytest.approx(0.00000625)
     assert entropy_funding.interval_seconds == 3600
-    assert entropy_funding.apr == pytest.approx(0.0000016101 * 8760)
+    assert entropy_funding.apr == pytest.approx(0.00000625 * 8760)
     assert batch.hourly_contexts[0].canonical_symbol == "SNDK"
 
     assert [

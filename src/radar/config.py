@@ -23,6 +23,60 @@ class MarketConfig(BaseModel):
     # monitor participation.  Existing markets remain in monitor scope by
     # default; read-only feeds can opt out explicitly.
     monitor_enabled: bool = True
+    # Set by market discovery (never in YAML): discovered feeds join only the
+    # spread monitor, not the BBO-only manual lifecycle.
+    discovered: bool = False
+
+
+DiscoveryVenue = Literal[
+    "lighter", "lighter_robinhood", "hyperliquid", "trade_xyz", "variational"
+]
+
+
+class SymbolOverride(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    venue: DiscoveryVenue
+    venue_symbol: str = Field(min_length=1)
+    canonical_symbol: str = Field(min_length=1)
+
+
+class MarketRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    venue: str = Field(min_length=1)
+    venue_symbol: str = Field(min_length=1)
+
+
+class DiscoveryConfig(BaseModel):
+    """Automatic market listing and canonical pairing for public venues."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    venues: list[DiscoveryVenue] = Field(
+        default_factory=lambda: [
+            "lighter",
+            "lighter_robinhood",
+            "hyperliquid",
+            "trade_xyz",
+            "variational",
+        ]
+    )
+    min_volume_24h_usd: float = Field(default=100_000, ge=0, allow_inf_nan=False)
+    # Same ticker, different asset (or unit) shows up as a large mark gap.
+    max_mark_deviation: float = Field(default=0.2, gt=0, lt=1, allow_inf_nan=False)
+    rescan_seconds: int = Field(default=6 * 60 * 60, ge=600)
+    symbol_overrides: list[SymbolOverride] = Field(
+        default_factory=lambda: [
+            SymbolOverride(
+                venue="variational", venue_symbol="US500", canonical_symbol="SPY"
+            )
+        ]
+    )
+    # Pre-IPO contracts define a "share" differently on each venue.
+    exclude_symbols: list[str] = Field(default_factory=lambda: ["ANT", "OPENAI"])
+    exclude_markets: list[MarketRef] = Field(default_factory=list)
 
 
 class AnomalyV2Config(BaseModel):
@@ -95,20 +149,21 @@ class RadarConfig(BaseModel):
     manual_opportunity: ManualOpportunityConfig = Field(
         default_factory=ManualOpportunityConfig
     )
+    discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
 
     def monitor_market_identities(self) -> set[tuple[str, str, str]]:
         """Return enabled feeds allowed to form monitor routes."""
         return {
             (market.venue, market.venue_symbol, market.canonical_symbol)
             for market in self.markets
-            if market.enabled and market.monitor_enabled
+            if market.enabled and market.monitor_enabled and not market.discovered
         }
 
     def spread_monitor_market_identities(self) -> set[tuple[str, str, str]]:
         """Feeds the spread monitor may pair, including enabled RFQ quote feeds."""
-        return self.monitor_market_identities() | {
+        return {
             (market.venue, market.venue_symbol, market.canonical_symbol)
-            for market in self.quoted_markets
+            for market in (*self.markets, *self.quoted_markets)
             if market.enabled and market.monitor_enabled
         }
 

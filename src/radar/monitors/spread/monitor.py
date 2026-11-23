@@ -165,6 +165,21 @@ class SpreadMonitor:
             expected_interval_seconds=self._basis_expected_interval_seconds,
         )
 
+    def set_market_identities(
+        self, market_identities: Collection[tuple[str, str, str]]
+    ) -> None:
+        """Adopt a rescanned universe and drop basis state for removed feeds."""
+        identities = frozenset(market_identities)
+        self._market_identities = identities
+        for key in tuple(self._basis_by_key):
+            if (
+                (key.long_venue, key.long_venue_symbol, key.canonical_symbol)
+                not in identities
+                or (key.short_venue, key.short_venue_symbol, key.canonical_symbol)
+                not in identities
+            ):
+                del self._basis_by_key[key]
+
     def _scoped_markets(self, state: RadarState) -> tuple[MarketSnapshot, ...]:
         if self._market_identities is None:
             return state.markets

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,6 +20,7 @@ from radar.alerts.telegram import TelegramTransport
 from radar.alerts.worker import AlertProcessor, AlertRouter, AlertWorker
 from radar.collectors.base import CollectorBatch
 from radar.config import RadarConfig, load_config
+from radar.discovery import DiscoveryResult, discover_markets, merge_universe
 from radar.diagnostics import (
     DiagnosticLogSession,
     EventLoopLagWatchdog,
@@ -153,6 +154,7 @@ class RadarApplication:
         stats: PilotStats | None = None,
         diagnostic_log_path: Path | None = None,
         diagnostic_session_id: str | None = None,
+        discover: Callable[[RadarConfig], Awaitable[DiscoveryResult]] | None = None,
     ) -> None:
         if flush_interval_seconds <= 0:
             raise ValueError("flush_interval_seconds must be positive")
@@ -178,6 +180,49 @@ class RadarApplication:
         self._event_loop_watchdog_task: asyncio.Task[None] | None = None
         self._gc_telemetry: GCTelemetry | None = None
         self._diagnostic_log_session: DiagnosticLogSession | None = None
+        self._discover = discover
+
+    async def refresh_universe(self) -> bool:
+        """Rescan venues and adopt the new universe; keep the old one on failure."""
+        if self._discover is None:
+            return False
+        try:
+            result = await self._discover(self.config)
+            updated = merge_universe(self.config, result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            LOGGER.error("market discovery failed; keeping current universe", exc_info=error)
+            return False
+        if (
+            updated.markets == self.config.markets
+            and updated.quoted_markets == self.config.quoted_markets
+        ):
+            return True
+        await self.pipeline.set_universe(updated.markets, updated.quoted_markets)
+        identities = updated.spread_monitor_market_identities()
+        for monitor in self.monitor_runner.monitors:
+            set_identities = getattr(monitor, "set_market_identities", None)
+            if callable(set_identities):
+                set_identities(identities)
+        LOGGER.info(
+            "market universe updated markets=%d quoted_markets=%d spread_feeds=%d",
+            len(updated.markets),
+            len(updated.quoted_markets),
+            len(identities),
+        )
+        self.config = updated
+        return True
+
+    async def _run_universe_rescans(self, stop_event: asyncio.Event) -> None:
+        interval = self.config.discovery.rescan_seconds
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                pass
+            await self.refresh_universe()
 
     def _diagnostic_resource_snapshot(self) -> ResourceSnapshot:
         try:
@@ -434,7 +479,14 @@ class RadarApplication:
         worker_task = asyncio.create_task(self.alert_worker.run_forever())
         await asyncio.sleep(0)
         self._next_scheduled_sample_time = None
+        rescan_task: asyncio.Task[None] | None = None
         try:
+            if self._discover is not None:
+                # Adopt the discovered universe before any feed subscribes.
+                await self.refresh_universe()
+                rescan_task = asyncio.create_task(
+                    self._run_universe_rescans(event), name="radar-universe-rescan"
+                )
             start_pipeline = getattr(self.pipeline, "start", None)
             if callable(start_pipeline):
                 await start_pipeline()
@@ -539,6 +591,9 @@ class RadarApplication:
                     self._next_scheduled_sample_time = advance.next_sample_time
         finally:
             event.set()
+            if rescan_task is not None:
+                rescan_task.cancel()
+                await asyncio.gather(rescan_task, return_exceptions=True)
             try:
                 await self._stop_diagnostics()
             except Exception as error:  # noqa: BLE001
@@ -917,6 +972,7 @@ def build_application(
         clock=clock,
         stats=stats,
         diagnostic_log_path=DEFAULT_DIAGNOSTIC_LOG,
+        discover=discover_markets if config.discovery.enabled else None,
     )
 
 

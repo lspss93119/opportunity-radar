@@ -20,6 +20,21 @@ maker_fees_bps:
   arcus: 0.0
   backpack: 1.8
 
+# Automatic market listing and canonical pairing (read-only public APIs).
+# Discovered feeds join the spread monitor only; YAML markets below stay as
+# written and always win over a discovered duplicate.
+discovery:
+  enabled: false
+  venues: [lighter, lighter_robinhood, hyperliquid, trade_xyz, variational]
+  min_volume_24h_usd: 100000
+  max_mark_deviation: 0.2
+  rescan_seconds: 21600
+  symbol_overrides:
+    - {venue: variational, venue_symbol: US500, canonical_symbol: SPY}
+  # Pre-IPO contracts define a share differently on each venue.
+  exclude_symbols: [ANT, OPENAI]
+  exclude_markets: []
+
 manual_opportunity:
   enabled: false
   confirmation_seconds: 60

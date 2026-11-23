@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
@@ -206,7 +207,13 @@ class MarketDataPipeline:
                 **collector_kwargs,
             ),
         ]
-        if markets_for_venue(config.markets, "lighter_robinhood"):
+        discovered_venues = (
+            set(config.discovery.venues) if config.discovery.enabled else set()
+        )
+        if (
+            markets_for_venue(config.markets, "lighter_robinhood")
+            or "lighter_robinhood" in discovered_venues
+        ):
             collectors.append(
                 LighterCollector(
                     config.markets,
@@ -225,7 +232,10 @@ class MarketDataPipeline:
                 **collector_kwargs,
             )
         )
-        if markets_for_venue(config.markets, "trade_xyz"):
+        if (
+            markets_for_venue(config.markets, "trade_xyz")
+            or "trade_xyz" in discovered_venues
+        ):
             collectors.append(
                 HyperliquidCollector(
                     config.markets,
@@ -275,7 +285,7 @@ class MarketDataPipeline:
                 )
             )
         quoted_market_collector = None
-        if config.quoted_markets:
+        if config.quoted_markets or "variational" in discovered_venues:
             if request_json is None:
                 quoted_market_collector = VariationalCollector(
                     config.quoted_markets,
@@ -430,6 +440,41 @@ class MarketDataPipeline:
         if self.storage is not None:
             self.storage.append(batch)
         return batch
+
+    async def set_universe(
+        self,
+        markets: Sequence[MarketConfig],
+        quoted_markets: Sequence[MarketConfig],
+    ) -> None:
+        """Swap the collected market universe without restarting the pipeline."""
+        self._markets = tuple(markets)
+        for collector in self._collectors:
+            set_markets = getattr(collector, "set_markets", None)
+            if not callable(set_markets):
+                continue
+            try:
+                result = set_markets(markets)
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                report_collector_error(
+                    self._collector_error_handler, collector.venue, error
+                )
+        collector = self._quoted_market_collector
+        if collector is not None:
+            collector.set_markets(quoted_markets)
+            kept = {
+                market.venue_symbol
+                for market in quoted_markets
+                if market.enabled and market.venue == collector.venue
+            }
+            self._latest_quotes = {
+                symbol: quote
+                for symbol, quote in self._latest_quotes.items()
+                if symbol in kept
+            }
 
     def _fresh_rfq_snapshots(
         self, sample_time: datetime, now: datetime

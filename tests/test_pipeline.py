@@ -1283,3 +1283,16 @@ def test_pipeline_from_config_uses_configured_context_period():
 def test_pipeline_rejects_context_period_that_does_not_divide_hour(period):
     with pytest.raises(ValueError):
         MarketDataPipeline([], RadarState(), context_poll_seconds=period)
+
+
+def test_from_config_creates_collectors_for_discovery_venues_without_yaml_markets():
+    config = RadarConfig(
+        fees_bps={"lighter_robinhood": 0.0, "trade_xyz": 9.0},
+        markets=[MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC")],
+        discovery={"enabled": True},
+    )
+    pipeline = MarketDataPipeline.from_config(config)
+
+    venues = {collector.venue for collector in pipeline.collectors}
+    assert {"lighter", "lighter_robinhood", "hyperliquid", "trade_xyz"} <= venues
+    assert pipeline._quoted_market_collector is not None

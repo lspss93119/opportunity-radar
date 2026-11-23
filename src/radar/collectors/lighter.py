@@ -621,6 +621,12 @@ class LighterCollector:
                 return
             await self._refresh_metadata_once()
 
+    async def set_markets(self, markets: Sequence[MarketConfig]) -> None:
+        """Replace this venue's markets; subscriptions follow on refresh."""
+        self._markets = markets_for_venue(markets, self.venue)
+        if self._started:
+            await self._refresh_metadata_once()
+
     def _publish_book(
         self, market_id: int, snapshot: LighterOrderBookSnapshot
     ) -> None:

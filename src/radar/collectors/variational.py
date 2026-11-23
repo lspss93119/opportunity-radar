@@ -217,6 +217,9 @@ class VariationalCollector:
         self.poll_interval_seconds = poll_interval_seconds
         self._last_quote_times: dict[str, datetime] = {}
 
+    def set_markets(self, markets: Sequence[MarketConfig]) -> None:
+        self._markets = markets_for_venue(markets, self.venue)
+
     async def poll_once(self) -> tuple[QuotedMarketSnapshot, ...]:
         try:
             payload = await self._request_json(

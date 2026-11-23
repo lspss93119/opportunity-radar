@@ -6,7 +6,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import websockets
@@ -28,8 +28,9 @@ from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
-# Core and HIP-3 perps pay funding every hour; fundingRate is an hourly decimal,
-# positive = longs pay (hyperliquid-docs/trading/funding).
+# Core and HIP-3 perps pay funding every hour; metaAndAssetCtxs ``funding`` is
+# the current hourly decimal rate, positive = longs pay
+# (hyperliquid-docs/trading/funding).
 FUNDING_INTERVAL_SECONDS = 3600
 HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
 HYPERLIQUID_HEARTBEAT_INTERVAL_SECONDS = 50.0
@@ -46,12 +47,6 @@ class HyperliquidAssetContext:
     funding_rate: float
     open_interest: float
     volume_24h: float
-
-
-@dataclass(frozen=True)
-class HyperliquidFundingPoint:
-    effective_time: datetime
-    funding_rate: float
 
 
 @dataclass(frozen=True)
@@ -139,29 +134,6 @@ def parse_hyperliquid_l2_book(
     bids.sort(key=lambda level: level.price, reverse=True)
     asks.sort(key=lambda level: level.price)
     return bids, asks
-
-
-def parse_hyperliquid_funding_history(
-    payload: object, *, expected_coin: str | None = None
-) -> HyperliquidFundingPoint | None:
-    if not isinstance(payload, list):
-        raise ValueError("fundingHistory response must be a list")
-    points: list[HyperliquidFundingPoint] = []
-    for raw_point in payload:
-        if not isinstance(raw_point, dict):
-            raise ValueError("fundingHistory entries must be objects")
-        if expected_coin is not None and raw_point.get("coin") != expected_coin:
-            raise ValueError("fundingHistory coin does not match request")
-        timestamp_ms = int(finite_float(raw_point.get("time"), "funding time"))
-        points.append(
-            HyperliquidFundingPoint(
-                effective_time=datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC),
-                funding_rate=finite_float(
-                    raw_point.get("fundingRate"), "fundingRate"
-                ),
-            )
-        )
-    return max(points, key=lambda point: point.effective_time) if points else None
 
 
 class HyperliquidOrderBookFeed:
@@ -750,16 +722,33 @@ class HyperliquidCollector:
         self._metadata_observed_at: datetime | None = None
         self._metadata_task: asyncio.Task[None] | None = None
         self._started = False
-        self._order_book_feed = HyperliquidOrderBookFeed(
+        self._websocket_connect = websocket_connect
+        self._order_book_feed = self._new_order_book_feed()
+
+    def _new_order_book_feed(self) -> HyperliquidOrderBookFeed:
+        return HyperliquidOrderBookFeed(
             self.ws_url,
             tuple(market.venue_symbol for market in self._markets),
-            connect=websocket_connect,
-            clock=clock,
+            connect=self._websocket_connect,
+            clock=self._clock,
             venue=self.venue,
             on_book=self._publish_book,
             on_invalidate=self._invalidate_book,
-            error_handler=error_handler,
+            error_handler=self._error_handler,
         )
+
+    async def set_markets(self, markets: Sequence[MarketConfig]) -> None:
+        """Replace this venue's markets, resubscribing only when coins change."""
+        new_markets = markets_for_venue(markets, self.venue)
+        old_coins = {market.venue_symbol for market in self._markets}
+        self._markets = new_markets
+        if {market.venue_symbol for market in new_markets} == old_coins:
+            return
+        old_feed = self._order_book_feed
+        self._order_book_feed = self._new_order_book_feed()
+        if self._started:
+            await old_feed.stop()
+            await self._order_book_feed.start()
 
     async def start(self) -> None:
         if self._started:
@@ -922,11 +911,23 @@ class HyperliquidCollector:
             for market in self._markets
             if market.venue_symbol in contexts
         )
-        funding_results = await asyncio.gather(
-            *(self._collect_funding(market) for market, _ in configured_contexts)
-        )
+        # metaAndAssetCtxs already carries every coin's current (predicted)
+        # hourly rate; one request per coin would exceed the IP weight limit.
+        next_funding_time = metadata_observed_at.astimezone(UTC).replace(
+            minute=0, second=0, microsecond=0
+        ) + timedelta(hours=1)
         funding_snapshots = tuple(
-            funding for funding in funding_results if funding is not None
+            FundingSnapshot(
+                effective_time=metadata_observed_at,
+                observed_at=metadata_observed_at,
+                venue=self.venue,
+                venue_symbol=market.venue_symbol,
+                canonical_symbol=market.canonical_symbol,
+                funding_rate=context.funding_rate,
+                interval_seconds=FUNDING_INTERVAL_SECONDS,
+                next_funding_time=next_funding_time,
+            )
+            for market, context in configured_contexts
         )
         hourly_sample = sample_time.astimezone(UTC).replace(
             minute=0, second=0, microsecond=0
@@ -947,38 +948,3 @@ class HyperliquidCollector:
             funding_snapshots=funding_snapshots,
             hourly_contexts=hourly_contexts,
         )
-
-    async def _collect_funding(
-        self,
-        market: MarketConfig,
-    ) -> FundingSnapshot | None:
-        end_time = int(self._clock().timestamp() * 1000)
-        try:
-            payload = await self._request_json(
-                self.INFO_URL,
-                method="POST",
-                json_body={
-                    "type": "fundingHistory",
-                    "coin": market.venue_symbol,
-                    "startTime": end_time - 2 * 60 * 60 * 1000,
-                    "endTime": end_time,
-                },
-            )
-            point = parse_hyperliquid_funding_history(
-                payload, expected_coin=market.venue_symbol
-            )
-            if point is None:
-                return None
-            return FundingSnapshot(
-                effective_time=point.effective_time,
-                observed_at=self._clock(),
-                venue=self.venue,
-                venue_symbol=market.venue_symbol,
-                canonical_symbol=market.canonical_symbol,
-                funding_rate=point.funding_rate,
-                interval_seconds=FUNDING_INTERVAL_SECONDS,
-                next_funding_time=None,
-            )
-        except Exception as error:  # noqa: BLE001
-            report_collector_error(self._error_handler, self.venue, error)
-            return None
