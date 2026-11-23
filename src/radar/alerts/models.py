@@ -40,6 +40,7 @@ class SpreadAlertDetails:
     short_funding: FundingContext | None
     long_price_source: str = "order_book"
     short_price_source: str = "order_book"
+    spread_by_size_bps: dict[int, float | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -82,3 +83,4 @@ class AnomalyAlertDetails:
     observed_at_skew_seconds: float
     long_price_source: str = "order_book"
     short_price_source: str = "order_book"
+    spread_by_size_bps: dict[int, float | None] | None = None

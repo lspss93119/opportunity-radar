@@ -146,8 +146,9 @@ class FakeMonitor:
     def __init__(self) -> None:
         self.identities: list[set] = []
 
-    def set_market_identities(self, identities) -> None:
+    def set_market_identities(self, identities, sample_seconds=None) -> None:
         self.identities.append(set(identities))
+        self.sample_seconds = sample_seconds
 
 
 def make_app(discover) -> tuple[RadarApplication, FakePipeline, FakeMonitor]:

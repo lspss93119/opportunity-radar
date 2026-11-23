@@ -183,6 +183,7 @@ async def test_manual_monitor_runner_and_text_processor_have_no_slow_or_trading_
 async def test_disabled_anomaly_v2_persists_event_but_queues_nothing(tmp_path):
     database = tmp_path / "runtime.sqlite3"
     config = SpreadMonitorConfig(
+        primary_size_usd=10_000,  # fixtures carry $10k depth
         anomaly_v2=AnomalyV2Config(
             enabled=True,
             telegram_enabled=False,

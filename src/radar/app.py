@@ -201,10 +201,11 @@ class RadarApplication:
             return True
         await self.pipeline.set_universe(updated.markets, updated.quoted_markets)
         identities = updated.spread_monitor_market_identities()
+        sample_seconds = updated.market_sample_seconds()
         for monitor in self.monitor_runner.monitors:
             set_identities = getattr(monitor, "set_market_identities", None)
             if callable(set_identities):
-                set_identities(identities)
+                set_identities(identities, sample_seconds)
         LOGGER.info(
             "market universe updated markets=%d quoted_markets=%d spread_feeds=%d",
             len(updated.markets),

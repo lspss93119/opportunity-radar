@@ -215,11 +215,16 @@ def select_universe(
         if len(venues_by_symbol[listing.canonical_symbol]) < 2:
             exclusions.append(_exclusion(listing, "no_counterpart"))
             continue
+        long_tail = (
+            listing.venue == VARIATIONAL_VENUE
+            or listing.volume_24h_usd < discovery.full_rate_min_volume_usd
+        )
         market = MarketConfig(
             venue=listing.venue,
             venue_symbol=listing.venue_symbol,
             canonical_symbol=listing.canonical_symbol,
             discovered=True,
+            sample_seconds=discovery.long_tail_sample_seconds if long_tail else 10,
         )
         (quoted if listing.venue == VARIATIONAL_VENUE else markets).append(market)
     return DiscoveryResult(

@@ -26,6 +26,9 @@ class MarketConfig(BaseModel):
     # Set by market discovery (never in YAML): discovered feeds join only the
     # spread monitor, not the BBO-only manual lifecycle.
     discovered: bool = False
+    # How often this feed feeds rolling history and Parquet; prices are still
+    # evaluated every 10s. A pair uses the slower cadence of its two feeds.
+    sample_seconds: Literal[10, 30, 60] = 10
 
 
 DiscoveryVenue = Literal[
@@ -67,6 +70,10 @@ class DiscoveryConfig(BaseModel):
     # Same ticker, different asset (or unit) shows up as a large mark gap.
     max_mark_deviation: float = Field(default=0.2, gt=0, lt=1, allow_inf_nan=False)
     rescan_seconds: int = Field(default=6 * 60 * 60, ge=600)
+    # Feeds below this 24h volume (and every RFQ feed, which refreshes about
+    # once a minute) are long-tail and keep history at the slower cadence.
+    full_rate_min_volume_usd: float = Field(default=5_000_000, ge=0, allow_inf_nan=False)
+    long_tail_sample_seconds: Literal[30, 60] = 30
     symbol_overrides: list[SymbolOverride] = Field(
         default_factory=lambda: [
             SymbolOverride(
@@ -117,7 +124,9 @@ class SpreadMonitorConfig(BaseModel):
 
     enabled: bool = True
     interval_seconds: int = Field(default=10, gt=0)
-    primary_size_usd: Literal[1000, 5000, 10000] = 10000
+    # Long-tail books are often too thin for $10k, so $1k is the evaluated size;
+    # $5k/$10k spreads ride along in alerts as capacity context.
+    primary_size_usd: Literal[1000, 5000, 10000] = 1000
     top_n: int = Field(default=3, gt=0)
     candidate_net_bps: float = Field(default=10.0, ge=0, allow_inf_nan=False)
     candidate_duration_seconds: int = Field(default=30, ge=0)
@@ -157,6 +166,13 @@ class RadarConfig(BaseModel):
             (market.venue, market.venue_symbol, market.canonical_symbol)
             for market in self.markets
             if market.enabled and market.monitor_enabled and not market.discovered
+        }
+
+    def market_sample_seconds(self) -> dict[tuple[str, str, str], int]:
+        return {
+            (market.venue, market.venue_symbol, market.canonical_symbol): market.sample_seconds
+            for market in (*self.markets, *self.quoted_markets)
+            if market.enabled
         }
 
     def spread_monitor_market_identities(self) -> set[tuple[str, str, str]]:
@@ -218,7 +234,14 @@ class RadarConfig(BaseModel):
     ) -> list[MarketConfig]:
         if any(market.venue.lower() != "variational" for market in value):
             raise ValueError("quoted_markets must contain only variational markets")
-        return value
+        # RFQ quotes refresh about once a minute; 10s history would only repeat
+        # them. An explicit sample_seconds in YAML still wins.
+        return [
+            market
+            if "sample_seconds" in market.model_fields_set
+            else market.model_copy(update={"sample_seconds": 30})
+            for market in value
+        ]
 
     @model_validator(mode="after")
     def enabled_markets_require_explicit_fee(self) -> "RadarConfig":

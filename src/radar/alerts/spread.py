@@ -216,6 +216,7 @@ def parse_spread_alert(alert: AlertRequest) -> SpreadAlertDetails:
         ),
         long_price_source=parse_price_source(payload.get("long_price_source")),
         short_price_source=parse_price_source(payload.get("short_price_source")),
+        spread_by_size_bps=_parse_spread_by_size(payload.get("spread_by_size_bps")),
     )
 
 
@@ -295,6 +296,7 @@ def parse_anomaly_alert(alert: AlertRequest) -> AnomalyAlertDetails:
         ),
         long_price_source=parse_price_source(payload.get("long_price_source")),
         short_price_source=parse_price_source(payload.get("short_price_source")),
+        spread_by_size_bps=_parse_spread_by_size(payload.get("spread_by_size_bps")),
     )
 
 
@@ -312,6 +314,34 @@ def _format_funding(
 
 def _display_venue(venue: str) -> str:
     return " ".join(part.capitalize() for part in venue.split("_"))
+
+
+def _parse_spread_by_size(value: JSONValue) -> dict[int, float | None] | None:
+    """Optional capacity context; malformed or missing data hides the line."""
+    if not isinstance(value, dict):
+        return None
+    parsed: dict[int, float | None] = {}
+    for size in SUPPORTED_SIZES:
+        raw = value.get(str(size))
+        if raw is None:
+            parsed[size] = None
+        elif isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw):
+            parsed[size] = float(raw)
+        else:
+            return None
+    return parsed
+
+
+def _format_size_context(
+    spreads: dict[int, float | None] | None, *, unavailable: str
+) -> str | None:
+    if spreads is None:
+        return None
+    return " | ".join(
+        f"${size // 1000}k "
+        + (unavailable if spreads[size] is None else f"{spreads[size]:+.2f}")
+        for size in sorted(spreads)
+    )
 
 
 RFQ_LABEL = "［RFQ 報價］"
@@ -403,6 +433,15 @@ def format_spread_alert(
                     f"{_format_price(details.long_buy_vwap)} | "
                     f"{_price_label('賣出', details.short_price_source)}: "
                     f"{_format_price(details.short_sell_vwap)}",
+                    *(
+                        (f"各金額原始價差 (bps): {size_line}",)
+                        if (
+                            size_line := _format_size_context(
+                                details.spread_by_size_bps, unavailable="深度不足"
+                            )
+                        )
+                        else ()
+                    ),
                     f"樣本時間: {_format_timestamp(details.sample_time)}",
                 )
             ),
@@ -524,7 +563,16 @@ def format_anomaly_alert(
             f"{_format_price(details.short_sell_vwap)}\n"
             f"Raw {_format_bps(details.raw_spread_bps, signed=True)} bps · "
             f"Net {_format_bps(details.net_spread_bps, signed=True)} bps\n"
-            f"Sample {_format_timestamp(details.sample_time)}",
+            + (
+                f"Size bps  {size_line}\n"
+                if (
+                    size_line := _format_size_context(
+                        details.spread_by_size_bps, unavailable="thin"
+                    )
+                )
+                else ""
+            )
+            + f"Sample {_format_timestamp(details.sample_time)}",
         )
     )
 

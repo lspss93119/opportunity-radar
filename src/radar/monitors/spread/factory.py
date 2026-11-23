@@ -15,4 +15,5 @@ def create_spread_monitor(
         config.fees_bps,
         runtime_store=runtime_store,
         market_identities=config.spread_monitor_market_identities(),
+        market_sample_seconds=config.market_sample_seconds(),
     )

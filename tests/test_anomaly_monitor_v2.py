@@ -70,6 +70,7 @@ def make_monitor(
     telegram_enabled: bool = True,
 ) -> SpreadMonitor:
     config = SpreadMonitorConfig(
+        primary_size_usd=10_000,  # fixtures carry $10k depth
         stale_after_seconds=120,
         anomaly_v2=AnomalyV2Config(
             enabled=enabled,

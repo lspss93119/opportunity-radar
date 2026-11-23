@@ -28,6 +28,7 @@ from radar.monitors.spread.models import (
     SpreadPairKey,
     build_spread_candidates,
     parse_price_source,
+    spread_by_size,
 )
 
 UTC = timezone.utc
@@ -41,6 +42,10 @@ LOGGER = logging.getLogger(__name__)
 
 def _elapsed_ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000.0
+
+
+def _on_cadence(sample_time: datetime, interval_seconds: int) -> bool:
+    return int(sample_time.timestamp()) % interval_seconds == 0
 
 
 def _pair_sort_key(key: SpreadPairKey) -> tuple[str, str, str, str, str]:
@@ -92,6 +97,7 @@ class SpreadMonitor:
         *,
         runtime_store: SQLiteRuntimeStore | None = None,
         market_identities: Collection[tuple[str, str, str]] | None = None,
+        market_sample_seconds: Mapping[tuple[str, str, str], int] | None = None,
         basis_window_seconds: int = ROLLING_WINDOW_SECONDS,
         basis_min_observations: int = MIN_HISTORY_OBSERVATIONS,
         basis_expected_interval_seconds: int = EXPECTED_INTERVAL_SECONDS,
@@ -108,6 +114,7 @@ class SpreadMonitor:
         self._basis_window_seconds = basis_window_seconds
         self._basis_min_observations = basis_min_observations
         self._basis_expected_interval_seconds = basis_expected_interval_seconds
+        self._market_sample_seconds = dict(market_sample_seconds or {})
         self._episodes: dict[SpreadPairKey, SpreadEpisode] = {}
         self._basis_by_key: dict[SpreadPairKey, RollingBasis] = {}
         self._anomaly_v2 = (
@@ -154,23 +161,66 @@ class SpreadMonitor:
                 if not isinstance(timestamp, datetime):
                     raise TypeError("history sample_time must be a datetime")
                 points.append((timestamp, float(value)))
-            basis = self._new_basis()
-            basis.hydrate(points)
+            interval = self._pair_interval(key)
+            basis = self._new_basis(key)
+            basis.hydrate(
+                point for point in points if _on_cadence(point[0], interval)
+            )
             self._basis_by_key[key] = basis
 
-    def _new_basis(self) -> RollingBasis:
-        return RollingBasis(
-            window_seconds=self._basis_window_seconds,
-            min_observations=self._basis_min_observations,
-            expected_interval_seconds=self._basis_expected_interval_seconds,
+    def _pair_interval(self, key: SpreadPairKey) -> int:
+        """A pair keeps history at the slower cadence of its two feeds."""
+        default = self._basis_expected_interval_seconds
+        return max(
+            self._market_sample_seconds.get(
+                (key.long_venue, key.long_venue_symbol, key.canonical_symbol), default
+            ),
+            self._market_sample_seconds.get(
+                (key.short_venue, key.short_venue_symbol, key.canonical_symbol), default
+            ),
         )
 
+    def _new_basis(self, key: SpreadPairKey | None = None) -> RollingBasis:
+        interval = (
+            self._basis_expected_interval_seconds if key is None else self._pair_interval(key)
+        )
+        # Keep the same coverage requirement whatever the cadence.
+        min_observations = math.ceil(
+            self._basis_min_observations
+            * self._basis_expected_interval_seconds
+            / interval
+        )
+        return RollingBasis(
+            window_seconds=self._basis_window_seconds,
+            min_observations=min_observations,
+            expected_interval_seconds=interval,
+        )
+
+    def _observe_basis(
+        self, basis: RollingBasis, candidate: SpreadCandidate
+    ) -> tuple[RollingBasisStats, RollingBasisMutation | None]:
+        """Append on the pair's cadence; between samples only read prior stats."""
+        if _on_cadence(candidate.sample_time, self._pair_interval(candidate.key)):
+            return basis.observe_with_rollback(
+                candidate.sample_time, candidate.raw_spread_bps
+            )
+        return basis.stats_before(candidate.sample_time), None
+
     def set_market_identities(
-        self, market_identities: Collection[tuple[str, str, str]]
+        self,
+        market_identities: Collection[tuple[str, str, str]],
+        market_sample_seconds: Mapping[tuple[str, str, str], int] | None = None,
     ) -> None:
         """Adopt a rescanned universe and drop basis state for removed feeds."""
         identities = frozenset(market_identities)
         self._market_identities = identities
+        if market_sample_seconds is not None:
+            previous = {key: self._pair_interval(key) for key in self._basis_by_key}
+            self._market_sample_seconds = dict(market_sample_seconds)
+            # A cadence change would mix intervals in one window; start over.
+            for key, interval in previous.items():
+                if self._pair_interval(key) != interval:
+                    del self._basis_by_key[key]
         for key in tuple(self._basis_by_key):
             if (
                 (key.long_venue, key.long_venue_symbol, key.canonical_symbol)
@@ -263,14 +313,12 @@ class SpreadMonitor:
             for candidate in candidates:
                 basis = self._basis_by_key.get(candidate.key)
                 if basis is None:
-                    basis = self._new_basis()
+                    basis = self._new_basis(candidate.key)
                     self._basis_by_key[candidate.key] = basis
                     created_basis_keys.add(candidate.key)
-                stats, mutation = basis.observe_with_rollback(
-                    candidate.sample_time,
-                    candidate.raw_spread_bps,
-                )
-                basis_mutations.append(mutation)
+                stats, mutation = self._observe_basis(basis, candidate)
+                if mutation is not None:
+                    basis_mutations.append(mutation)
                 basis_stats[candidate.key] = stats
             basis_ms = _elapsed_ms(basis_started)
 
@@ -429,14 +477,12 @@ class SpreadMonitor:
             for candidate in candidates:
                 basis = self._basis_by_key.get(candidate.key)
                 if basis is None:
-                    basis = self._new_basis()
+                    basis = self._new_basis(candidate.key)
                     self._basis_by_key[candidate.key] = basis
                     created_basis_keys.add(candidate.key)
-                stats, mutation = basis.observe_with_rollback(
-                    candidate.sample_time,
-                    candidate.raw_spread_bps,
-                )
-                basis_mutations.append(mutation)
+                stats, mutation = self._observe_basis(basis, candidate)
+                if mutation is not None:
+                    basis_mutations.append(mutation)
                 basis_stats[candidate.key] = stats
             basis_ms = _elapsed_ms(basis_started)
 
@@ -584,6 +630,7 @@ class SpreadMonitor:
             "observed_at_skew_seconds": candidate.observed_at_skew_seconds,
             "long_price_source": candidate.long_price_source,
             "short_price_source": candidate.short_price_source,
+            "spread_by_size_bps": spread_by_size(state.markets, candidate.key),
             "round_trip_fee_bps": (
                 2.0 * (candidate.long_fee_bps + candidate.short_fee_bps)
                 if candidate.long_fee_bps is not None

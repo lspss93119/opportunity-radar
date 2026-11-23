@@ -18,6 +18,7 @@ from radar.monitors.spread.models import (
     SpreadCandidate,
     SpreadPairKey,
     parse_price_source,
+    spread_by_size,
 )
 from radar.state import RadarState
 
@@ -379,6 +380,7 @@ class AnomalyV2Lifecycle:
             "observed_at_skew_seconds": candidate.observed_at_skew_seconds,
             "long_price_source": candidate.long_price_source,
             "short_price_source": candidate.short_price_source,
+            "spread_by_size_bps": spread_by_size(state.markets, candidate.key),
             "funding_context": {
                 "long": _funding_payload(state, candidate.key, "long"),
                 "short": _funding_payload(state, candidate.key, "short"),

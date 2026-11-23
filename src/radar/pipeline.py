@@ -110,6 +110,16 @@ def merge_batches(batches: Iterable[CollectorBatch]) -> CollectorBatch:
     )
 
 
+def _storage_cadence(
+    markets: Iterable[MarketConfig],
+) -> dict[tuple[str, str], int]:
+    return {
+        (market.venue, market.venue_symbol): market.sample_seconds
+        for market in markets
+        if market.enabled
+    }
+
+
 class MarketDataPipeline:
     def __init__(
         self,
@@ -127,6 +137,7 @@ class MarketDataPipeline:
         quoted_market_poll_interval_seconds: float = 30.0,
         context_poll_seconds: int = 3600,
         rfq_stale_after_seconds: int = 120,
+        quoted_markets: Sequence[MarketConfig] = (),
     ) -> None:
         if sampling_seconds != SAMPLE_INTERVAL_SECONDS:
             raise ValueError("sampling_seconds must be a 10-second interval")
@@ -145,6 +156,7 @@ class MarketDataPipeline:
             raise ValueError("rfq_stale_after_seconds must be positive")
         self._rfq_stale_after_seconds = rfq_stale_after_seconds
         self._latest_quotes: dict[str, QuotedMarketSnapshot] = {}
+        self._storage_cadence = _storage_cadence((*markets, *quoted_markets))
         self._collectors = tuple(collectors)
         self.state = state
         self._markets = tuple(markets)
@@ -312,6 +324,7 @@ class MarketDataPipeline:
             quoted_market_collector=quoted_market_collector,
             context_poll_seconds=config.context_poll_seconds,
             rfq_stale_after_seconds=config.monitors.spread.rfq_stale_after_seconds,
+            quoted_markets=config.quoted_markets,
         )
 
     @property
@@ -438,8 +451,23 @@ class MarketDataPipeline:
         )
         self.state.apply_market_batch(batch)
         if self.storage is not None:
-            self.storage.append(batch)
+            self.storage.append(self._on_storage_cadence(batch, resolved_sample_time))
         return batch
+
+    def _on_storage_cadence(
+        self, batch: CollectorBatch, sample_time: datetime
+    ) -> CollectorBatch:
+        """Long-tail feeds keep every sample live but persist only on cadence."""
+        epoch_seconds = int(sample_time.timestamp())
+        return CollectorBatch(
+            market_snapshots=tuple(
+                snapshot
+                for snapshot in batch.market_snapshots
+                if epoch_seconds
+                % self._storage_cadence.get((snapshot.venue, snapshot.venue_symbol), 1)
+                == 0
+            )
+        )
 
     async def set_universe(
         self,
@@ -448,6 +476,7 @@ class MarketDataPipeline:
     ) -> None:
         """Swap the collected market universe without restarting the pipeline."""
         self._markets = tuple(markets)
+        self._storage_cadence = _storage_cadence((*markets, *quoted_markets))
         for collector in self._collectors:
             set_markets = getattr(collector, "set_markets", None)
             if not callable(set_markets):

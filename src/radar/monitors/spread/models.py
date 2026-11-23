@@ -242,6 +242,31 @@ def build_spread_candidates(
     return tuple(candidates)
 
 
+def spread_by_size(
+    snapshots: Iterable[MarketSnapshot],
+    key: SpreadPairKey,
+    sizes: Iterable[int] = (1_000, 5_000, 10_000),
+) -> dict[str, float | None]:
+    """Raw long-buy/short-sell spread per size; None where either book is too thin."""
+    long_snapshot = short_snapshot = None
+    for snapshot in snapshots:
+        identity = (snapshot.venue, snapshot.venue_symbol, snapshot.canonical_symbol)
+        if identity == (key.long_venue, key.long_venue_symbol, key.canonical_symbol):
+            long_snapshot = snapshot
+        elif identity == (key.short_venue, key.short_venue_symbol, key.canonical_symbol):
+            short_snapshot = snapshot
+    result: dict[str, float | None] = {}
+    for size in sizes:
+        spread = None
+        if long_snapshot is not None and short_snapshot is not None:
+            long_price = selected_vwap(long_snapshot, "buy", size)
+            short_price = selected_vwap(short_snapshot, "sell", size)
+            if long_price is not None and short_price is not None:
+                spread = calculate_raw_spread_bps(long_price, short_price)
+        result[str(size)] = spread
+    return result
+
+
 def calculate_raw_spread_bps(long_buy_price: float, short_sell_price: float) -> float:
     long_price = _positive_number(long_buy_price, "long_buy_price")
     short_price = _positive_number(short_sell_price, "short_sell_price")
