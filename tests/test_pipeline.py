@@ -1296,3 +1296,23 @@ def test_from_config_creates_collectors_for_discovery_venues_without_yaml_market
     venues = {collector.venue for collector in pipeline.collectors}
     assert {"lighter", "lighter_robinhood", "hyperliquid", "trade_xyz"} <= venues
     assert pipeline._quoted_market_collector is not None
+
+
+def test_from_config_passes_lighter_funding_spacing_to_both_lighter_venues():
+    config = RadarConfig(
+        fees_bps={"lighter_robinhood": 0.0},
+        lighter_funding_request_spacing_seconds=3.0,
+        markets=[
+            MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),
+            MarketConfig(venue="lighter_robinhood", venue_symbol="SPY", canonical_symbol="SPY"),
+        ],
+    )
+    pipeline = MarketDataPipeline.from_config(config)
+
+    spacings = {
+        collector.venue: collector._funding_request_spacing_seconds
+        for collector in pipeline.collectors
+        if isinstance(collector, LighterCollector)
+    }
+    assert spacings == {"lighter": 3.0, "lighter_robinhood": 3.0}
+    assert RadarConfig().lighter_funding_request_spacing_seconds == 1.5

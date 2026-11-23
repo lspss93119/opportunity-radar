@@ -177,6 +177,11 @@ class RadarConfig(BaseModel):
     sampling_seconds: int = Field(default=10, gt=0)
     # Funding/OI/volume refresh period; venues settle hourly, so it must divide 1h.
     context_poll_seconds: int = Field(default=300, ge=60, le=3600)
+    # Pause between per-market Lighter /fundings calls. Lighter allows 60 REST
+    # requests per minute per IP; raise this when another process shares the IP.
+    lighter_funding_request_spacing_seconds: float = Field(
+        default=1.5, ge=0, le=10, allow_inf_nan=False
+    )
     fees_bps: dict[str, float] = Field(default_factory=dict)
     maker_fees_bps: dict[str, float] = Field(default_factory=dict)
     markets: list[MarketConfig] = Field(default_factory=list)

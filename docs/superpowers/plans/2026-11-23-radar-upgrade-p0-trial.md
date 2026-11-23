@@ -40,15 +40,11 @@
 
 **Telegram 重複告警**：試跑也會發價差和資金費告警。如果用同一個 chat，正式環境和試跑會各發一份價差告警，分不出是哪一邊發的。要你決定（§4-B）。
 
-## 4. 試跑前要決定或完成的事
+## 4. 試跑前的決定（2026-11-23 使用者已確認）
 
-- **A. Lighter 請求間隔設定**（程式修改，很小）：新增 `RadarConfig` 欄位，傳給 Lighter collector。預設維持 1.5 秒，試跑設 3 秒。要加測試，跑完整的 non-live 測試。
-- **B. Telegram 去重**，二選一：
-  - B1（建議）：同一個 bot、另外開一個試跑用的 chat。只要換 `RADAR_TELEGRAM_CHAT_ID`，不用改程式。你需要先建好 chat，並把 bot 加進去。
-  - B2：同一個 chat，訊息前面加上「［試跑］」。需要小幅修改程式（用環境變數設定前綴）。
-- **C. 分支怎麼送到 Mac mini**，二選一：
-  - C1（建議）：push `feature/radar-upgrade-p0` 到 `origin`（GitHub），再在 Mac mini 上 clone。push 屬於對外操作，要你同意。
-  - C2：用 `git bundle` 打包，再用 scp 傳過去，不經過 GitHub。
+- **A. Lighter 請求間隔**：已完成。新增設定 `lighter_funding_request_spacing_seconds`（預設 1.5 秒），試跑設為 `3.0`。
+- **B. Telegram**：同一個 bot、另外開一個試跑用的 chat。不用改程式，只換 `RADAR_TELEGRAM_CHAT_ID`。**你要先建好 chat、把 bot 加進去，並提供 chat id。**
+- **C. 分支傳送方式**：push `feature/radar-upgrade-p0` 到 `origin`（GitHub），再在 Mac mini 上 clone。
 
 ## 5. 試跑步驟（取得同意後才執行）
 
@@ -70,13 +66,13 @@
    - 新增 `discovery:`，`enabled: true`，其他用預設值（$100k 成交量門檻、每 6 小時重掃）
    - 新增 `monitors.funding:`，`enabled: true`，其他用預設值（飆升 100% / 2 次採樣、carry 15% / 24h、持有 7 天）
    - `manual_opportunity.enabled: false`（正式環境已經在跑，試跑不重複發）
-   - Lighter 請求間隔設 3 秒（§4-A）
+   - `lighter_funding_request_spacing_seconds: 3.0`（§4-A）
    - 確認 `fees_bps` 有包含 `variational`（可以設 0，或填查證過的值）
 3. **用新的 tmux session 啟動**（不碰 `radar` 這個 session）
    ```bash
    tmux new-session -d -s radar-trial-p0 -c ~/Projects/opportunity-radar-trial-p0
    ```
-   在這個 session 裡載入 Telegram 環境變數（照 §4-B 的決定換 chat id），然後執行：
+   在這個 session 裡載入 `telegram.env`，再把 `RADAR_TELEGRAM_CHAT_ID` 換成試跑 chat 的 id（§4-B），然後執行：
    ```bash
    uv run python -m radar.app run --config ~/.config/opportunity-radar/radar.trial-p0.yaml
    ```
