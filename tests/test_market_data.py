@@ -345,3 +345,34 @@ def test_build_batch_with_diagnostics_preserves_candidate_snapshot_for_depth_omi
     assert diagnostics[0].reason == "insufficient_buy_10k_depth"
     assert batch.market_snapshots[0].buy_10k_vwap is None
     assert batch.market_snapshots[0].sell_10k_vwap == pytest.approx(99.0)
+
+
+def test_fresh_non_live_book_is_kept_for_archive_but_not_ready_for_live_signals(
+    markets: tuple[MarketConfig, ...],
+):
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="BTC",
+        bids=(BookLevel(price=99.0, base_size=200.0),),
+        asks=(BookLevel(price=101.0, base_size=200.0),),
+        observed_at=OBSERVED_AT,
+        live_signal_eligible=False,
+    )
+
+    candidate_batch, diagnostics = latest.build_batch_with_diagnostics(
+        markets,
+        sample_time=SAMPLE_TIME,
+        now=NOW,
+        stale_after_seconds=30,
+    )
+
+    assert len(candidate_batch.market_snapshots) == 1
+    assert diagnostics[0].reason == "included"
+    assert diagnostics[0].live_signal_eligible is False
+    assert latest.ready_venues(
+        markets=markets,
+        canonical_symbol="BTC",
+        now=NOW,
+        stale_after_seconds=30,
+    ) == frozenset()

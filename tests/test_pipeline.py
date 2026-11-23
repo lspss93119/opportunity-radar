@@ -435,6 +435,39 @@ async def test_collect_once_reads_latest_cache_without_invoking_collectors():
 
 
 @pytest.mark.asyncio
+async def test_collect_once_archives_rest_fallback_but_excludes_it_from_live_state():
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="arcus",
+        venue_symbol="SNDK-USD",
+        bids=(BookLevel(price=99.0, base_size=200.0),),
+        asks=(BookLevel(price=101.0, base_size=200.0),),
+        observed_at=NOW,
+        live_signal_eligible=False,
+    )
+    state = RadarState()
+    storage = RecordingBatchStorage()
+    pipeline = MarketDataPipeline(
+        [],
+        state,
+        markets=(
+            MarketConfig(
+                venue="arcus", venue_symbol="SNDK-USD", canonical_symbol="SNDK"
+            ),
+        ),
+        latest_market_data=latest,
+        storage=storage,  # type: ignore[arg-type]
+    )
+
+    batch = await pipeline.collect_once(now=NOW)
+
+    assert batch.market_snapshots == ()
+    assert state.markets == ()
+    assert len(storage.batches) == 1
+    assert len(storage.batches[0].market_snapshots) == 1
+
+
+@pytest.mark.asyncio
 async def test_collect_once_prepares_cache_before_building_sample():
     events: list[str] = []
     latest = RecordingLatestMarketData(events)
@@ -854,6 +887,26 @@ def test_pipeline_from_config_builds_entropy_and_arcus_collectors_when_enabled()
     assert isinstance(pipeline.collectors[4], ArcusCollector)
 
 
+def test_pipeline_from_config_passes_arcus_source_selection():
+    config = RadarConfig(
+        fees_bps={"arcus": 2.25},
+        markets=[
+            MarketConfig(
+                venue="arcus", venue_symbol="SNDK-USD", canonical_symbol="SNDK"
+            )
+        ],
+        arcus={"source": "ws"},
+    )
+
+    pipeline = MarketDataPipeline.from_config(config)
+
+    arcus_collector = next(
+        collector for collector in pipeline.collectors if collector.venue == "arcus"
+    )
+    assert isinstance(arcus_collector, ArcusCollector)
+    assert arcus_collector.source == "ws"
+
+
 def test_pipeline_from_config_builds_backpack_collector_when_enabled():
     config = RadarConfig(
         sampling_seconds=10,
@@ -1168,6 +1221,32 @@ async def test_pipeline_hands_collected_batch_to_optional_storage(tmp_path):
     assert storage.pending_count == 1
     assert pipeline.flush_storage(now=NOW) == 1
     assert storage.pending_count == 0
+
+
+@pytest.mark.asyncio
+async def test_archive_keeps_smaller_vwap_tiers_without_weakening_live_gate(tmp_path):
+    latest = LatestMarketData()
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="BTC",
+        bids=(BookLevel(price=99.0, base_size=50.0),),
+        asks=(BookLevel(price=101.0, base_size=50.0),),
+        observed_at=NOW,
+    )
+    storage = ParquetStorage(tmp_path / "data")
+    pipeline = MarketDataPipeline(
+        [],
+        RadarState(),
+        markets=(MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),),
+        latest_market_data=latest,
+        storage=storage,
+    )
+
+    live_batch = await pipeline.collect_once(now=NOW)
+
+    assert live_batch.market_snapshots == ()
+    assert storage.pending_count == 1
+    assert pipeline.flush_storage(now=NOW) == 1
 
 
 @pytest.mark.asyncio

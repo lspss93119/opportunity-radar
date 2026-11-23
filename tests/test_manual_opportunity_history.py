@@ -44,6 +44,59 @@ def test_bbo_history_marks_insufficient_coverage_unavailable():
     assert stats["3d"].available is False
 
 
+def test_bbo_history_hydrate_bounds_each_window_to_latest_point():
+    history = BboRollingHistory(
+        windows_seconds={"2h": 20, "24h": 40, "3d": 60},
+        expected_interval_seconds=10,
+        minimum_coverage=0.0,
+    )
+    points = [
+        (START + timedelta(seconds=offset), float(offset))
+        for offset in range(0, 70, 10)
+    ]
+
+    history.hydrate(points)
+
+    assert [timestamp for timestamp, _value in history._points["2h"]] == [
+        START + timedelta(seconds=offset) for offset in (40, 50, 60)
+    ]
+    assert [timestamp for timestamp, _value in history._points["24h"]] == [
+        START + timedelta(seconds=offset) for offset in (20, 30, 40, 50, 60)
+    ]
+    assert [timestamp for timestamp, _value in history._points["3d"]] == [
+        START + timedelta(seconds=offset) for offset in range(0, 70, 10)
+    ]
+
+
+def test_bbo_history_bounded_hydration_matches_legacy_after_first_observation():
+    points = [
+        (START + timedelta(seconds=offset), float(offset * 2))
+        for offset in range(0, 70, 10)
+    ]
+    legacy = BboRollingHistory(
+        windows_seconds={"2h": 20, "24h": 40, "3d": 60},
+        expected_interval_seconds=10,
+        minimum_coverage=0.8,
+    )
+    optimized = BboRollingHistory(
+        windows_seconds={"2h": 20, "24h": 40, "3d": 60},
+        expected_interval_seconds=10,
+        minimum_coverage=0.8,
+    )
+    values = {timestamp: value for timestamp, value in points}
+    for timestamp, value in sorted(values.items()):
+        legacy._append(timestamp, value)
+    optimized.hydrate(points)
+
+    expected = legacy.observe(START + timedelta(seconds=70), 140.0)
+    actual = optimized.observe(START + timedelta(seconds=70), 140.0)
+
+    assert actual == expected
+    assert optimized._points == legacy._points
+    assert optimized._sums == pytest.approx(legacy._sums)
+    assert optimized._last_sample_time == legacy._last_sample_time
+
+
 def test_bbo_history_mutation_can_restore_the_exact_previous_state():
     history = BboRollingHistory(
         windows_seconds={"2h": 20, "24h": 30, "3d": 40},

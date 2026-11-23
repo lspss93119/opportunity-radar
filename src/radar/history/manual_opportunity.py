@@ -211,8 +211,19 @@ class BboRollingHistory:
             values[_as_utc(timestamp, "sample_time")] = _finite(
                 value, "raw_spread_bps"
             )
-        for timestamp in sorted(values):
-            self._append(timestamp, values[timestamp])
+        ordered = sorted(values.items())
+        if not ordered:
+            return
+        latest_timestamp = ordered[-1][0]
+        for name, window_seconds in self.windows_seconds.items():
+            cutoff = latest_timestamp - timedelta(seconds=window_seconds)
+            points_for_window = self._points[name]
+            for timestamp, value in ordered:
+                if timestamp < cutoff:
+                    continue
+                points_for_window.append((timestamp, value))
+                self._sums[name] += value
+        self._last_sample_time = latest_timestamp
 
     def _append(self, timestamp: datetime, value: float) -> None:
         for name in self.windows_seconds:

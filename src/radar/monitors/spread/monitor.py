@@ -29,6 +29,8 @@ from radar.monitors.spread.models import (
     build_spread_candidates,
     parse_price_source,
     spread_by_size,
+    LIVE_QUOTE_MAX_AGE_SECONDS,
+    LIVE_QUOTE_MAX_SKEW_SECONDS,
 )
 
 UTC = timezone.utc
@@ -101,6 +103,8 @@ class SpreadMonitor:
         basis_window_seconds: int = ROLLING_WINDOW_SECONDS,
         basis_min_observations: int = MIN_HISTORY_OBSERVATIONS,
         basis_expected_interval_seconds: int = EXPECTED_INTERVAL_SECONDS,
+        live_quote_max_age_seconds: float = LIVE_QUOTE_MAX_AGE_SECONDS,
+        live_quote_max_skew_seconds: float = LIVE_QUOTE_MAX_SKEW_SECONDS,
     ) -> None:
         self.interval_seconds = config.interval_seconds
         self.config = config
@@ -115,6 +119,15 @@ class SpreadMonitor:
         self._basis_min_observations = basis_min_observations
         self._basis_expected_interval_seconds = basis_expected_interval_seconds
         self._market_sample_seconds = dict(market_sample_seconds or {})
+        if (
+            not math.isfinite(live_quote_max_age_seconds)
+            or live_quote_max_age_seconds <= 0
+            or not math.isfinite(live_quote_max_skew_seconds)
+            or live_quote_max_skew_seconds < 0
+        ):
+            raise ValueError("invalid live quote age/skew limits")
+        self._live_quote_max_age_seconds = live_quote_max_age_seconds
+        self._live_quote_max_skew_seconds = live_quote_max_skew_seconds
         self._episodes: dict[SpreadPairKey, SpreadEpisode] = {}
         self._basis_by_key: dict[SpreadPairKey, RollingBasis] = {}
         self._anomaly_v2 = (
@@ -296,6 +309,8 @@ class SpreadMonitor:
             rfq_stale_after_seconds=self.config.rfq_stale_after_seconds,
             fees_bps=self._fees_bps,
             require_fees=False,
+            live_quote_max_age_seconds=self._live_quote_max_age_seconds,
+            live_quote_max_skew_seconds=self._live_quote_max_skew_seconds,
         )
         candidate_build_ms = _elapsed_ms(candidate_build_started)
         previous_episodes = (
@@ -463,6 +478,8 @@ class SpreadMonitor:
             rfq_stale_after_seconds=self.config.rfq_stale_after_seconds,
             fees_bps=self._fees_bps,
             require_fees=False,
+            live_quote_max_age_seconds=self._live_quote_max_age_seconds,
+            live_quote_max_skew_seconds=self._live_quote_max_skew_seconds,
         )
         candidate_build_ms = _elapsed_ms(candidate_build_started)
         candidate_by_key = {candidate.key: candidate for candidate in candidates}

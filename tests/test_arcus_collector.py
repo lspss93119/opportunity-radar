@@ -123,6 +123,60 @@ class FixtureTransport:
         raise AssertionError(f"unexpected request: {url} {params}")
 
 
+class FixtureArcusWebSocket:
+    def __init__(self, messages: list[dict] | None = None) -> None:
+        self.sent: list[dict] = []
+        self.closed = False
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        for message in messages or []:
+            self.push(message)
+
+    def push(self, message: dict) -> None:
+        self._queue.put_nowait(json.dumps(message))
+
+    async def send(self, message: str) -> None:
+        self.sent.append(json.loads(message))
+
+    async def recv(self) -> str:
+        message = await self._queue.get()
+        if message is None:
+            raise ConnectionError("fixture websocket closed")
+        return message
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._queue.put_nowait(None)
+
+    async def __aenter__(self) -> "FixtureArcusWebSocket":
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        await self.close()
+
+
+def ws_book(
+    market: str,
+    *,
+    last_sequence_id: int = 10,
+    global_sequence_id: int = 20,
+    bid: float = 1880.0,
+    ask: float = 1881.0,
+) -> dict:
+    return {
+        "type": "channel_data",
+        "channel": "l2Orderbook",
+        "id": market,
+        "contents": {
+            "timestamp": 1770000000000,
+            "lastSequenceId": last_sequence_id,
+            "globalSequenceId": global_sequence_id,
+            "bids": [[str(bid), "100"]],
+            "asks": [[str(ask), "100"]],
+        },
+    }
+
+
 class BlockingMetadataTransport(FixtureTransport):
     def __init__(self) -> None:
         super().__init__()
@@ -322,6 +376,152 @@ async def test_arcus_refresh_limits_l2_concurrency_and_attempts_every_configured
         latest._views[(market.venue, market.venue_symbol)].ready
         for market in markets
     )
+
+
+@pytest.mark.asyncio
+async def test_arcus_ws_snapshot_is_live_and_not_overwritten_by_rest_fallback():
+    transport = FixtureTransport()
+    websocket = FixtureArcusWebSocket([ws_book("SNDK-USD")])
+    latest = LatestMarketData()
+    market = configured_markets()[:1]
+    collector = ArcusCollector(
+        market,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        latest_market_data=latest,
+        source="ws",
+        ws_connect=lambda _url, **_kwargs: websocket,
+        refresh_interval_seconds=60.0,
+    )
+    pipeline = cache_pipeline(collector, market, latest)
+
+    await collector.start()
+    try:
+        for _ in range(100):
+            view = latest._views.get(("arcus", "SNDK-USD"))
+            if view is not None and view.live_signal_eligible:
+                break
+            await asyncio.sleep(0)
+        view = latest._views[("arcus", "SNDK-USD")]
+        batch = await pipeline.collect_once(now=OBSERVED_AT)
+    finally:
+        await collector.stop()
+
+    assert view.live_signal_eligible is True
+    assert batch.market_snapshots[0].best_bid == 1880.0
+    assert websocket.sent == [
+        {
+            "type": "subscribe",
+            "channel": "l2Orderbook",
+            "id": "SNDK-USD",
+            "nLevels": 20,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_arcus_ws_rest_fallback_is_archival_only_until_ws_recovers():
+    transport = FixtureTransport()
+    websocket = FixtureArcusWebSocket()
+    latest = LatestMarketData()
+    market = configured_markets()[:1]
+    collector = ArcusCollector(
+        market,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        latest_market_data=latest,
+        source="ws",
+        ws_connect=lambda _url, **_kwargs: websocket,
+        refresh_interval_seconds=60.0,
+    )
+    pipeline = cache_pipeline(collector, market, latest)
+
+    await collector.start()
+    try:
+        for _ in range(100):
+            view = latest._views.get(("arcus", "SNDK-USD"))
+            if view is not None and view.ready:
+                break
+            await asyncio.sleep(0)
+        view = latest._views[("arcus", "SNDK-USD")]
+        fallback_batch = await pipeline.collect_once(now=OBSERVED_AT)
+        websocket.push(ws_book("SNDK-USD", last_sequence_id=11, global_sequence_id=21))
+        for _ in range(100):
+            view = latest._views[("arcus", "SNDK-USD")]
+            if view.live_signal_eligible:
+                break
+            await asyncio.sleep(0)
+        recovered_batch = await pipeline.collect_once(now=OBSERVED_AT)
+    finally:
+        await collector.stop()
+
+    assert view.live_signal_eligible is True
+    assert fallback_batch.market_snapshots == ()
+    assert recovered_batch.market_snapshots[0].best_bid == 1880.0
+
+
+@pytest.mark.asyncio
+async def test_arcus_ws_direct_collect_is_fail_closed_for_rest_fallback():
+    transport = FixtureTransport()
+    websocket = FixtureArcusWebSocket()
+    latest = LatestMarketData()
+    market = configured_markets()[:1]
+    collector = ArcusCollector(
+        market,
+        request_json=transport,
+        clock=lambda: OBSERVED_AT,
+        latest_market_data=latest,
+        source="ws",
+        ws_connect=lambda _url, **_kwargs: websocket,
+        refresh_interval_seconds=60.0,
+    )
+
+    await collector.start()
+    try:
+        await wait_for_ready_cache(latest, market)
+        fallback_batch = await collector.collect(
+            sample_time=SAMPLE_TIME,
+            include_hourly_context=False,
+        )
+        websocket.push(ws_book("SNDK-USD", last_sequence_id=12, global_sequence_id=22))
+        for _ in range(100):
+            view = latest._views[("arcus", "SNDK-USD")]
+            if view.live_signal_eligible:
+                break
+            await asyncio.sleep(0)
+        recovered_batch = await collector.collect(
+            sample_time=SAMPLE_TIME,
+            include_hourly_context=False,
+        )
+    finally:
+        await collector.stop()
+
+    assert fallback_batch.market_snapshots == ()
+    assert recovered_batch.market_snapshots[0].best_bid == 1880.0
+
+
+@pytest.mark.asyncio
+async def test_arcus_rest_mode_does_not_open_a_websocket():
+    websocket_opened = False
+
+    def unexpected_connect(_url: str, **_kwargs: object):
+        nonlocal websocket_opened
+        websocket_opened = True
+        raise AssertionError("REST mode must not open Arcus websocket")
+
+    collector = ArcusCollector(
+        configured_markets()[:1],
+        request_json=FixtureTransport(),
+        latest_market_data=LatestMarketData(),
+        source="rest",
+        ws_connect=unexpected_connect,
+    )
+
+    await collector.start()
+    await asyncio.sleep(0)
+    await collector.stop()
+
+    assert websocket_opened is False
 
 
 @pytest.mark.asyncio

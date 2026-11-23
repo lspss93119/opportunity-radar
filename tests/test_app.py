@@ -4,6 +4,7 @@ import asyncio
 import logging
 import threading
 from datetime import UTC, datetime, timedelta
+import weakref
 
 import pytest
 
@@ -1047,6 +1048,94 @@ def test_build_application_hydrates_manual_history_before_pipeline_start(
         assert key in manual._histories
         asyncio.run(app.pipeline.start())
         assert events[-1] == "pipeline.start"
+    finally:
+        app.runtime_store.close()
+
+
+def test_build_application_releases_manual_history_before_runner_construction(
+    monkeypatch, tmp_path
+):
+    import radar.app as app_module
+    from radar.monitors.spread.models import SpreadPairKey
+
+    now = NOW
+    key = SpreadPairKey("QQQ", "arcus", "QQQ-USD", "lighter_robinhood", "QQQ")
+    history_ref: weakref.ReferenceType[dict[object, object]] | None = None
+
+    class TrackingHistory(dict):
+        pass
+
+    class FakePipeline:
+        sampling_seconds = 10
+        state = RadarState()
+
+        async def start(self):
+            return None
+
+    class FakeRunner:
+        def __init__(self, monitors, state, queue, *, error_handler):
+            del error_handler
+            assert history_ref is not None
+            assert history_ref() is None
+            self.monitors = monitors
+            self.state = state
+            self.queue = queue
+
+    def fake_from_config(*args, **kwargs):
+        del args, kwargs
+        return FakePipeline()
+
+    class FakeSpreadHistory:
+        def __init__(self, root):
+            del root
+
+        def load_recent_pair_points(self, **kwargs):
+            del kwargs
+            return {}
+
+    def fake_load_recent_bbo_history(*args, **kwargs):
+        del args, kwargs
+        nonlocal history_ref
+        history = TrackingHistory({key: ((now - timedelta(seconds=10), 0.0),)})
+        history_ref = weakref.ref(history)
+        return history
+
+    monkeypatch.setattr(
+        app_module.MarketDataPipeline,
+        "from_config",
+        staticmethod(fake_from_config),
+    )
+    monkeypatch.setattr(app_module, "SpreadHistory", FakeSpreadHistory)
+    monkeypatch.setattr(app_module, "MonitorRunner", FakeRunner)
+    monkeypatch.setattr(
+        app_module,
+        "load_recent_bbo_history",
+        fake_load_recent_bbo_history,
+        raising=False,
+    )
+    config = RadarConfig(
+        fees_bps={"arcus": 0.0, "lighter_robinhood": 0.0},
+        markets=[
+            MarketConfig(
+                venue="arcus", venue_symbol="QQQ-USD", canonical_symbol="QQQ"
+            ),
+            MarketConfig(
+                venue="lighter_robinhood", venue_symbol="QQQ", canonical_symbol="QQQ"
+            ),
+        ],
+        manual_opportunity={"enabled": True},
+    )
+
+    app = app_module.build_application(
+        config,
+        data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime" / "radar.sqlite3",
+        telegram_credentials=("token-not-logged", "chat-id"),
+        clock=lambda: now,
+    )
+    try:
+        assert history_ref is not None
+        assert history_ref() is None
     finally:
         app.runtime_store.close()
 
