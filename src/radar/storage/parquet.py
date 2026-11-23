@@ -64,6 +64,8 @@ FUNDING_SCHEMA = pa.schema(
         pa.field("venue_symbol", pa.string(), nullable=False),
         pa.field("canonical_symbol", pa.string(), nullable=False),
         pa.field("funding_rate", pa.float64(), nullable=False),
+        # Nullable only because partitions written before P0-1 lack the column.
+        pa.field("interval_seconds", pa.int64()),
         pa.field("next_funding_time", UTC_TIMESTAMP),
     ]
 )

@@ -1,4 +1,6 @@
 sampling_seconds: 10
+# Funding, OI and 24h-volume refresh period (must divide 3600).
+context_poll_seconds: 300
 
 fees_bps:
   lighter: 0.0

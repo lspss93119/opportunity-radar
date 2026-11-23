@@ -230,6 +230,10 @@ async def test_hyperliquid_collector_normalizes_market_funding_and_hourly_contex
     assert len(batch.funding_snapshots) == 3
     btc_funding = batch.funding_snapshots[0]
     assert btc_funding.funding_rate == pytest.approx(0.0002)
+    # fundingHistory.fundingRate is already an hourly decimal; positive = longs pay.
+    assert btc_funding.interval_seconds == 3600
+    assert btc_funding.rate_per_hour == pytest.approx(0.0002)
+    assert btc_funding.apr == pytest.approx(0.0002 * 8760)
     assert btc_funding.effective_time == datetime.fromtimestamp(
         1789470000, tz=UTC
     )
@@ -449,6 +453,8 @@ async def test_trade_xyz_collector_adds_dex_only_to_metadata_and_normalizes_hip3
     assert funding.venue_symbol == "xyz:TSLA"
     assert funding.canonical_symbol == "TSLA"
     assert funding.funding_rate == pytest.approx(0.0002)
+    assert funding.interval_seconds == 3600
+    assert funding.apr == pytest.approx(0.0002 * 8760)
     assert funding.effective_time == datetime.fromtimestamp(1789470000, tz=UTC)
 
     context = batch.hourly_contexts[0]
@@ -512,6 +518,10 @@ async def test_entropy_collector_uses_io_namespace_and_maps_sndk():
     assert batch.funding_snapshots[0].effective_time == datetime.fromtimestamp(
         1790128800, tz=UTC
     )
+    entropy_funding = batch.funding_snapshots[0]
+    assert entropy_funding.funding_rate == pytest.approx(0.0000016101)
+    assert entropy_funding.interval_seconds == 3600
+    assert entropy_funding.apr == pytest.approx(0.0000016101 * 8760)
     assert batch.hourly_contexts[0].canonical_symbol == "SNDK"
 
     assert [

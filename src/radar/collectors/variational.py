@@ -14,7 +14,7 @@ from radar.collectors.base import (
 )
 from radar.collectors.http import request_json as default_request_json
 from radar.config import MarketConfig
-from radar.models import QuotedMarketSnapshot
+from radar.models import FundingSnapshot, QuotedMarketSnapshot
 
 VARIATIONAL_VENUE = "variational"
 VARIATIONAL_STATS_URL = (
@@ -23,6 +23,11 @@ VARIATIONAL_STATS_URL = (
 VARIATIONAL_POLL_INTERVAL_SECONDS = 30.0
 VARIATIONAL_STALE_AFTER_SECONDS = 120.0
 US500_SPY_NAME = "State Street SPDR S&P 500 ETF Trust"
+# /metadata/stats ``funding_rate`` is the annualized decimal rate (v2 maps it to
+# ``funding.last.annualized_rate``); one interval pays
+# annualized * funding_interval_s / 365 days. Positive means longs pay.
+# Verified against v2 ``interval_rate`` on every live perp (1h, 4h, 8h).
+VARIATIONAL_FUNDING_YEAR_SECONDS = 365 * 24 * 60 * 60
 
 
 def _require_utc(value: datetime, field_name: str) -> datetime:
@@ -239,3 +244,18 @@ class VariationalCollector:
             self._last_quote_times[snapshot.venue_symbol] = snapshot.quote_time
             published.append(snapshot)
         return tuple(published)
+
+
+def variational_funding_snapshot(quote: QuotedMarketSnapshot) -> FundingSnapshot:
+    """Normalize a Variational annualized funding quote to one interval's rate."""
+    return FundingSnapshot(
+        effective_time=quote.quote_time,
+        observed_at=quote.fetched_at,
+        venue=quote.venue,
+        venue_symbol=quote.venue_symbol,
+        canonical_symbol=quote.canonical_symbol,
+        funding_rate=quote.funding_rate
+        * quote.funding_interval_seconds
+        / VARIATIONAL_FUNDING_YEAR_SECONDS,
+        interval_seconds=quote.funding_interval_seconds,
+    )

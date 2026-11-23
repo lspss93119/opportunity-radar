@@ -459,6 +459,10 @@ async def test_backpack_collector_normalizes_market_funding_context_and_vwap():
     assert len(hourly_batch.funding_snapshots) == 1
     funding = hourly_batch.funding_snapshots[0]
     assert funding.canonical_symbol == "SNDK"
+    # markets.fundingInterval is milliseconds; fundingRate is per interval.
+    assert funding.interval_seconds == 3600
+    assert funding.funding_rate == pytest.approx(0.0000125)
+    assert funding.apr == pytest.approx(0.1095)
     assert funding.effective_time == datetime(2026, 9, 23, 6, 0, tzinfo=UTC)
     assert funding.next_funding_time == datetime(2026, 9, 23, 5, 0, tzinfo=UTC)
     assert funding.observed_at == OBSERVED_AT
@@ -631,3 +635,31 @@ async def test_backpack_collector_marks_unfilled_vwap_targets_unavailable():
         await collector.stop()
 
     assert batch.market_snapshots == ()
+
+
+def test_backpack_markets_parse_funding_interval_milliseconds_or_fail_closed():
+    payload = [
+        {
+            "symbol": symbol,
+            "baseSymbol": "BTC",
+            "marketType": "PERP",
+            "orderBookState": "Open",
+            "visible": True,
+            **({} if raw is None else {"fundingInterval": raw}),
+        }
+        for symbol, raw in (
+            ("A_USDC_PERP", 3_600_000),
+            ("B_USDC_PERP", "28800000"),
+            ("C_USDC_PERP", None),
+            ("D_USDC_PERP", 0),
+            ("E_USDC_PERP", 1500),
+        )
+    ]
+
+    markets = parse_backpack_markets(payload)
+
+    assert markets["A_USDC_PERP"].funding_interval_seconds == 3600
+    assert markets["B_USDC_PERP"].funding_interval_seconds == 28_800
+    assert markets["C_USDC_PERP"].funding_interval_seconds is None
+    assert markets["D_USDC_PERP"].funding_interval_seconds is None
+    assert markets["E_USDC_PERP"].funding_interval_seconds is None

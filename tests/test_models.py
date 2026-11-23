@@ -67,6 +67,7 @@ def test_funding_snapshot_requires_utc_times():
         venue_symbol="BTC",
         canonical_symbol="BTC",
         funding_rate=0.0001,
+        interval_seconds=3600,
         next_funding_time=NOW,
     )
     assert snap.funding_rate == pytest.approx(0.0001)
@@ -79,6 +80,7 @@ def test_funding_snapshot_requires_utc_times():
             venue_symbol="BTC",
             canonical_symbol="BTC",
             funding_rate=0.0001,
+            interval_seconds=3600,
         )
 
     for invalid_rate in (float("nan"), float("inf"), -float("inf")):
@@ -90,6 +92,7 @@ def test_funding_snapshot_requires_utc_times():
                 venue_symbol="BTC",
                 canonical_symbol="BTC",
                 funding_rate=invalid_rate,
+                interval_seconds=3600,
             )
 
 
@@ -128,3 +131,39 @@ def test_quoted_market_snapshot_keeps_quote_and_fetch_times_separate():
     assert snapshot.quote_time == NOW
     assert snapshot.fetched_at != snapshot.quote_time
     assert snapshot.bid_1m is None
+
+
+def make_funding(**overrides):
+    data = {
+        "effective_time": NOW,
+        "observed_at": NOW,
+        "venue": "backpack",
+        "venue_symbol": "BTC_USDC_PERP",
+        "canonical_symbol": "BTC",
+        "funding_rate": 0.0001,
+        "interval_seconds": 8 * 3600,
+    }
+    data.update(overrides)
+    return FundingSnapshot(**data)
+
+
+def test_funding_snapshot_normalizes_interval_rate_to_hourly_and_apr():
+    eight_hour = make_funding()
+    assert eight_hour.rate_per_hour == pytest.approx(0.0000125)
+    assert eight_hour.apr == pytest.approx(0.1095)
+
+    hourly = make_funding(funding_rate=0.0000125, interval_seconds=3600)
+    assert hourly.rate_per_hour == pytest.approx(eight_hour.rate_per_hour)
+    assert hourly.apr == pytest.approx(eight_hour.apr)
+
+
+def test_funding_snapshot_keeps_sign_where_positive_means_longs_pay():
+    shorts_pay = make_funding(funding_rate=-0.02, interval_seconds=3600)
+    assert shorts_pay.rate_per_hour == pytest.approx(-0.02)
+    assert shorts_pay.apr == pytest.approx(-0.02 * 8760)
+
+
+@pytest.mark.parametrize("interval", [0, -3600, None])
+def test_funding_snapshot_requires_positive_interval(interval):
+    with pytest.raises(ValidationError):
+        make_funding(interval_seconds=interval)

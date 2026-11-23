@@ -83,6 +83,8 @@ class RadarConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sampling_seconds: int = Field(default=10, gt=0)
+    # Funding/OI/volume refresh period; venues settle hourly, so it must divide 1h.
+    context_poll_seconds: int = Field(default=300, ge=60, le=3600)
     fees_bps: dict[str, float] = Field(default_factory=dict)
     maker_fees_bps: dict[str, float] = Field(default_factory=dict)
     markets: list[MarketConfig] = Field(default_factory=list)
@@ -105,6 +107,13 @@ class RadarConfig(BaseModel):
     def sampling_must_be_ten_seconds(cls, value: int) -> int:
         if value != 10:
             raise ValueError("sampling_seconds must be a 10-second interval")
+        return value
+
+    @field_validator("context_poll_seconds")
+    @classmethod
+    def context_poll_must_divide_hour(cls, value: int) -> int:
+        if 3600 % value:
+            raise ValueError("context_poll_seconds must evenly divide 3600")
         return value
 
     @field_validator("fees_bps")

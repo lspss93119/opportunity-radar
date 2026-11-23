@@ -55,6 +55,7 @@ def make_funding(
         venue_symbol=symbol,
         canonical_symbol=symbol,
         funding_rate=0.000123,
+        interval_seconds=3600,
         next_funding_time=next_funding_time,
     )
 
@@ -262,11 +263,11 @@ def test_batch_append_flushes_separate_queryable_datasets_without_tiny_files(tmp
     funding_rows = query_dataset(
         root,
         "funding",
-        "effective_time, observed_at, venue, venue_symbol, funding_rate",
+        "effective_time, observed_at, venue, venue_symbol, funding_rate, interval_seconds",
     )
     assert len(funding_rows) == 2
     assert funding_rows[0][0].astimezone(UTC) == first_time
-    assert funding_rows[0][2:] == ("lighter", "BTC", pytest.approx(0.000123))
+    assert funding_rows[0][2:] == ("lighter", "BTC", pytest.approx(0.000123), 3600)
 
     hourly_rows = query_dataset(
         root,

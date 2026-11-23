@@ -1016,6 +1016,7 @@ async def test_alert_payload_contains_spread_and_available_funding_context():
             venue_symbol="BTC",
             canonical_symbol="BTC",
             funding_rate=0.001,
+            interval_seconds=3600,
             next_funding_time=NOW + timedelta(hours=1),
         ),
     )
@@ -1081,6 +1082,7 @@ async def test_funding_context_matches_canonical_symbol_as_well_as_venue_symbol(
             venue_symbol="BTC",
             canonical_symbol="ETH",
             funding_rate=0.001,
+            interval_seconds=3600,
         ),
     )
     state = make_state(

@@ -11,6 +11,7 @@ from radar.collectors.variational import (
     VARIATIONAL_STATS_URL,
     VariationalCollector,
     parse_variational_stats,
+    variational_funding_snapshot,
 )
 from radar.config import MarketConfig
 from radar.models import QuotedMarketSnapshot
@@ -199,3 +200,39 @@ def test_quoted_snapshot_is_not_an_existing_market_snapshot():
     )
 
     assert all(isinstance(snapshot, QuotedMarketSnapshot) for snapshot in snapshots)
+
+
+@pytest.mark.parametrize(
+    ("annualized_rate", "interval_seconds", "live_interval_rate"),
+    [
+        # Live /metadata/v2/stats rows (2026-11-23): v1 funding_rate equals v2
+        # funding.last.annualized_rate, and v2 interval_rate is per interval.
+        (0.09482, 28_800, 0.00008659),  # BTC, 8h
+        (0.1095, 14_400, 0.000050),  # VVV, 4h
+        (-87.3054, 3_600, -0.009966),  # ACE, 1h, shorts pay longs
+    ],
+)
+def test_variational_funding_rate_is_annualized_and_converts_per_interval(
+    annualized_rate, interval_seconds, live_interval_rate
+):
+    quote = QuotedMarketSnapshot(
+        quote_time=FETCHED_AT,
+        fetched_at=FETCHED_AT,
+        venue="variational",
+        venue_symbol="X",
+        canonical_symbol="X",
+        mark_price=1.0,
+        bid_1k=0.99,
+        ask_1k=1.01,
+        bid_100k=0.98,
+        ask_100k=1.02,
+        funding_rate=annualized_rate,
+        funding_interval_seconds=interval_seconds,
+    )
+
+    funding = variational_funding_snapshot(quote)
+
+    assert funding.interval_seconds == interval_seconds
+    assert funding.funding_rate == pytest.approx(live_interval_rate, rel=1e-3)
+    assert funding.apr == pytest.approx(annualized_rate)
+    assert funding.effective_time == FETCHED_AT

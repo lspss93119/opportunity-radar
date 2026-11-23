@@ -20,6 +20,9 @@ from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
+# Funding settles hourly; fundingRates is an hourly decimal, positive = longs pay
+# (docs.arcus.xyz/concepts/perpetuals/funding).
+FUNDING_INTERVAL_SECONDS = 3600
 ARCUS_L2_CONCURRENCY = 4
 
 
@@ -451,6 +454,7 @@ class ArcusCollector:
                 venue_symbol=market.venue_symbol,
                 canonical_symbol=market.canonical_symbol,
                 funding_rate=point.funding_rate,
+                interval_seconds=FUNDING_INTERVAL_SECONDS,
                 next_funding_time=detail.next_funding_time,
             )
         except Exception as error:  # noqa: BLE001

@@ -6,7 +6,8 @@
     "quoteSymbol": "USDC",
     "rwaMarketType": "STOCK",
     "symbol": "SNDK.US_USDC_PERP",
-    "visible": true
+    "visible": true,
+    "fundingInterval": 3600000
   },
   {
     "baseSymbol": "NVDA.US",
@@ -15,7 +16,8 @@
     "quoteSymbol": "USDC",
     "rwaMarketType": "STOCK",
     "symbol": "NVDA.US_USDC_PERP",
-    "visible": true
+    "visible": true,
+    "fundingInterval": 3600000
   },
   {
     "baseSymbol": "BTC",
@@ -24,7 +26,8 @@
     "quoteSymbol": "USDC",
     "rwaMarketType": null,
     "symbol": "BTC_USDC_PERP",
-    "visible": true
+    "visible": true,
+    "fundingInterval": 3600000
   },
   {
     "baseSymbol": "AAPL.US",
@@ -42,7 +45,8 @@
     "quoteSymbol": "USDC",
     "rwaMarketType": "STOCK",
     "symbol": "META.US_USDC_PERP",
-    "visible": true
+    "visible": true,
+    "fundingInterval": 3600000
   },
   {
     "baseSymbol": "MU.US",
@@ -51,6 +55,7 @@
     "quoteSymbol": "USDC",
     "rwaMarketType": "STOCK",
     "symbol": "MU.US_USDC_PERP",
-    "visible": false
+    "visible": false,
+    "fundingInterval": 3600000
   }
 ]

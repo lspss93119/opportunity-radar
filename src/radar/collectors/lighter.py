@@ -25,6 +25,13 @@ from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
+# Funding settles every hour; /api/v1/fundings reports rate in percent with a
+# separate paying-side direction (docs.lighter.xyz/trading/funding).
+FUNDING_INTERVAL_SECONDS = 3600
+# Standard Lighter REST access is 60 requests per rolling minute per IP and a
+# breach triggers a 60s firewall cooldown, so per-market /fundings calls are
+# paced to at most 40/min, leaving room for the 1/min metadata refresh.
+FUNDING_REQUEST_SPACING_SECONDS = 1.5
 LIGHTER_ROBINHOOD_BASE_URL = "https://api.rh.lighter.xyz"
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_ROBINHOOD_WS_URL = "wss://api.rh.lighter.xyz/stream"
@@ -480,9 +487,13 @@ class LighterCollector:
         ws_url: str | None = None,
         latest_market_data: LatestMarketData | None = None,
         metadata_refresh_seconds: float = METADATA_REFRESH_SECONDS,
+        funding_request_spacing_seconds: float = FUNDING_REQUEST_SPACING_SECONDS,
     ) -> None:
         if metadata_refresh_seconds < 0:
             raise ValueError("metadata_refresh_seconds must be non-negative")
+        if funding_request_spacing_seconds < 0:
+            raise ValueError("funding_request_spacing_seconds must be non-negative")
+        self._funding_request_spacing_seconds = funding_request_spacing_seconds
         self.venue = venue
         self.base_url = (self.BASE_URL if base_url is None else base_url).rstrip("/")
         if ws_url is None:
@@ -672,12 +683,11 @@ class LighterCollector:
             for market in self._markets
             if market.venue_symbol in self._details
         )
-        funding_results = await asyncio.gather(
-            *(
-                self._collect_funding(market, detail)
-                for market, detail in configured_details
-            )
-        )
+        funding_results = []
+        for index, (market, detail) in enumerate(configured_details):
+            if index and self._funding_request_spacing_seconds:
+                await asyncio.sleep(self._funding_request_spacing_seconds)
+            funding_results.append(await self._collect_funding(market, detail))
         funding_snapshots = tuple(
             funding for funding in funding_results if funding is not None
         )
@@ -767,6 +777,7 @@ class LighterCollector:
                 venue_symbol=market.venue_symbol,
                 canonical_symbol=market.canonical_symbol,
                 funding_rate=point.funding_rate,
+                interval_seconds=FUNDING_INTERVAL_SECONDS,
                 next_funding_time=None,
             )
         except Exception as error:  # noqa: BLE001

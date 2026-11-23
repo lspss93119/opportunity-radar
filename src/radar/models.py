@@ -47,7 +47,17 @@ class MarketSnapshot(BaseModel):
         return self
 
 
+SECONDS_PER_HOUR = 3600
+HOURS_PER_YEAR = 365 * 24
+
+
 class FundingSnapshot(BaseModel):
+    """One venue funding rate in a single normalized convention.
+
+    ``funding_rate`` is a decimal rate for one settlement interval of
+    ``interval_seconds``; positive means longs pay shorts.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     effective_time: datetime
@@ -56,6 +66,7 @@ class FundingSnapshot(BaseModel):
     venue_symbol: str = Field(min_length=1)
     canonical_symbol: str = Field(min_length=1)
     funding_rate: float = Field(allow_inf_nan=False)
+    interval_seconds: int = Field(gt=0)
     next_funding_time: datetime | None = None
 
     _effective_time_utc = field_validator("effective_time")(_require_utc)
@@ -65,6 +76,14 @@ class FundingSnapshot(BaseModel):
     @classmethod
     def next_funding_must_be_utc(cls, value: datetime | None) -> datetime | None:
         return None if value is None else _require_utc(value)
+
+    @property
+    def rate_per_hour(self) -> float:
+        return self.funding_rate * SECONDS_PER_HOUR / self.interval_seconds
+
+    @property
+    def apr(self) -> float:
+        return self.rate_per_hour * HOURS_PER_YEAR
 
 
 class HourlyContext(BaseModel):

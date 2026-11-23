@@ -1255,3 +1255,31 @@ def test_state_clears_context_when_a_context_collection_round_has_no_data():
 
     assert state.funding == ()
     assert state.hourly_context == ()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_repeats_funding_context_every_configured_period():
+    collector = CadenceCollector()
+    pipeline = MarketDataPipeline(
+        [collector], RadarState(), sampling_seconds=10, context_poll_seconds=300
+    )
+
+    for minute, second in ((10, 30), (11, 0), (11, 30), (14, 59), (15, 0), (16, 0)):
+        await pipeline.collect_hourly_once(
+            now=datetime(2026, 9, 15, 10, minute, second, tzinfo=UTC)
+        )
+
+    # Periods start at :10 and :15; each is polled once after the 60s grace.
+    assert collector.include_hourly_context_values == [True, True]
+
+
+def test_pipeline_from_config_uses_configured_context_period():
+    config = RadarConfig(context_poll_seconds=600)
+    pipeline = MarketDataPipeline.from_config(config)
+    assert pipeline._context_poll_seconds == 600
+
+
+@pytest.mark.parametrize("period", [0, 7, 3601, True])
+def test_pipeline_rejects_context_period_that_does_not_divide_hour(period):
+    with pytest.raises(ValueError):
+        MarketDataPipeline([], RadarState(), context_poll_seconds=period)

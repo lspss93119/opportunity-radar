@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ LOGGER = logging.getLogger(__name__)
 class BackpackMarketDetail:
     symbol: str
     base_symbol: str
+    funding_interval_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,19 @@ def _timestamp_iso_utc(value: object, field_name: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _funding_interval_seconds(raw_interval_ms: object) -> int | None:
+    """Convert markets.fundingInterval (milliseconds) or fail closed with None."""
+    if isinstance(raw_interval_ms, bool):
+        return None
+    try:
+        interval_ms = float(raw_interval_ms)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(interval_ms) or interval_ms <= 0 or interval_ms % 1000:
+        return None
+    return int(interval_ms // 1000)
+
+
 def parse_backpack_markets(payload: object) -> dict[str, BackpackMarketDetail]:
     if not isinstance(payload, list):
         raise ValueError("markets response must be a list")
@@ -134,6 +149,9 @@ def parse_backpack_markets(payload: object) -> dict[str, BackpackMarketDetail]:
         markets[symbol] = BackpackMarketDetail(
             symbol=symbol,
             base_symbol=base_symbol,
+            funding_interval_seconds=_funding_interval_seconds(
+                raw_market.get("fundingInterval")
+            ),
         )
     return markets
 
@@ -1224,6 +1242,9 @@ class BackpackCollector:
         market: MarketConfig,
         mark_price: BackpackMarkPrice | None,
     ) -> FundingSnapshot | None:
+        detail = self._details.get(market.venue_symbol)
+        if detail is None or detail.funding_interval_seconds is None:
+            return None
         try:
             payload = await self._request_json(
                 self.FUNDING_RATES_URL,
@@ -1243,6 +1264,7 @@ class BackpackCollector:
                 venue_symbol=market.venue_symbol,
                 canonical_symbol=market.canonical_symbol,
                 funding_rate=point.funding_rate,
+                interval_seconds=detail.funding_interval_seconds,
                 next_funding_time=(
                     None if mark_price is None else mark_price.next_funding_time
                 ),

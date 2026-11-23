@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -139,6 +140,7 @@ def test_lighter_funding_parser_rejects_unknown_or_malformed_direction(
 class FixtureTransport:
     def __init__(self, base_url: str = LighterCollector.BASE_URL):
         self.calls: list[tuple[str, str, dict | None]] = []
+        self.funding_call_times: list[float] = []
         normalized_base_url = base_url.rstrip("/")
         self.order_book_details_url = f"{normalized_base_url}/api/v1/orderBookDetails"
         self.order_book_orders_url = f"{normalized_base_url}/api/v1/orderBookOrders"
@@ -153,6 +155,7 @@ class FixtureTransport:
             symbol = {1: "btc", 0: "eth", 2: "sol"}[market_id]
             return load_fixture(f"order_book_{symbol}.json")
         if url == self.fundings_url:
+            self.funding_call_times.append(time.monotonic())
             market_id = params["market_id"]
             symbol = {1: "btc", 0: "eth", 2: "sol"}[market_id]
             return load_fixture(f"fundings_{symbol}.json")
@@ -404,6 +407,7 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
         clock=lambda: OBSERVED_AT,
         websocket_connect=websocket_connect,
         latest_market_data=latest,
+        funding_request_spacing_seconds=0.05,
     )
 
     markets = configured_markets(venue)
@@ -448,6 +452,10 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
 
     assert len(batch.funding_snapshots) == 3
     assert batch.funding_snapshots[0].funding_rate == pytest.approx(0.000011)
+    # Fixture rate "0.0011" is a percent per hour paid by longs.
+    assert batch.funding_snapshots[0].interval_seconds == 3600
+    assert batch.funding_snapshots[0].rate_per_hour == pytest.approx(0.000011)
+    assert batch.funding_snapshots[0].apr == pytest.approx(0.000011 * 8760)
     assert batch.funding_snapshots[0].effective_time == datetime.fromtimestamp(
         1789470000, tz=UTC
     )
@@ -463,6 +471,15 @@ async def test_lighter_collector_normalizes_market_funding_and_hourly_context(
     assert sum(url == transport.order_book_details_url for url, _, _ in transport.calls) == 1
     assert sum(url == transport.order_book_orders_url for url, _, _ in transport.calls) == 0
     assert sum(url == transport.fundings_url for url, _, _ in transport.calls) == 3
+    # Per-market /fundings calls are paced sequentially to respect the IP limit.
+    gaps = [
+        later - earlier
+        for earlier, later in zip(
+            transport.funding_call_times, transport.funding_call_times[1:]
+        )
+    ]
+    assert len(gaps) == 2
+    assert all(gap >= 0.045 for gap in gaps)
 
 
 @pytest.mark.parametrize(

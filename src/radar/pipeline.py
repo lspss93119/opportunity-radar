@@ -58,6 +58,18 @@ def hourly_sample_time(sample_time: datetime) -> datetime:
     return sample_time.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
 
 
+def context_sample_time(sample_time: datetime, period_seconds: int) -> datetime:
+    """Floor a UTC sample time to the start of its context polling period."""
+    if sample_time.tzinfo is None or sample_time.utcoffset() is None:
+        raise ValueError("sample_time must be timezone-aware")
+    if period_seconds <= 0 or 3600 % period_seconds:
+        raise ValueError("period_seconds must evenly divide 3600")
+    epoch_seconds = int(sample_time.astimezone(UTC).timestamp())
+    return datetime.fromtimestamp(
+        epoch_seconds - epoch_seconds % period_seconds, tz=UTC
+    )
+
+
 def should_collect_hourly_context(
     now: datetime,
     hour: datetime,
@@ -108,6 +120,7 @@ class MarketDataPipeline:
         stale_after_seconds: int = 30,
         quoted_market_collector: VariationalCollector | None = None,
         quoted_market_poll_interval_seconds: float = 30.0,
+        context_poll_seconds: int = 3600,
     ) -> None:
         if sampling_seconds != SAMPLE_INTERVAL_SECONDS:
             raise ValueError("sampling_seconds must be a 10-second interval")
@@ -115,6 +128,13 @@ class MarketDataPipeline:
             raise ValueError("stale_after_seconds must be non-negative")
         if quoted_market_poll_interval_seconds <= 0:
             raise ValueError("quoted_market_poll_interval_seconds must be positive")
+        if (
+            isinstance(context_poll_seconds, bool)
+            or context_poll_seconds <= 0
+            or 3600 % context_poll_seconds
+        ):
+            raise ValueError("context_poll_seconds must evenly divide 3600")
+        self._context_poll_seconds = context_poll_seconds
         self._collectors = tuple(collectors)
         self.state = state
         self._markets = tuple(markets)
@@ -271,6 +291,7 @@ class MarketDataPipeline:
             collector_error_handler=collector_error_handler,
             stale_after_seconds=config.monitors.spread.stale_after_seconds,
             quoted_market_collector=quoted_market_collector,
+            context_poll_seconds=config.context_poll_seconds,
         )
 
     @property
@@ -473,7 +494,7 @@ class MarketDataPipeline:
     ) -> CollectorBatch | None:
         current_time = self._clock() if now is None else now
         sample_time = aligned_sample_time(current_time, self.sampling_seconds)
-        hour = hourly_sample_time(sample_time)
+        hour = context_sample_time(sample_time, self._context_poll_seconds)
         if not should_collect_hourly_context(
             current_time, hour, self._last_hourly_sample
         ):
@@ -596,7 +617,7 @@ class MarketDataPipeline:
         while not stop_event.is_set():
             now = self._clock()
             sample_time = aligned_sample_time(now, self.sampling_seconds)
-            hour = hourly_sample_time(sample_time)
+            hour = context_sample_time(sample_time, self._context_poll_seconds)
             if should_collect_hourly_context(
                 now, hour, self._last_hourly_sample
             ):
@@ -605,7 +626,7 @@ class MarketDataPipeline:
 
             next_due = hour + timedelta(seconds=HOURLY_CONTEXT_GRACE_SECONDS)
             if self._last_hourly_sample == hour:
-                next_due += timedelta(hours=1)
+                next_due += timedelta(seconds=self._context_poll_seconds)
             delay = max(0.0, (next_due - now.astimezone(UTC)).total_seconds())
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=delay)

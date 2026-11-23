@@ -529,6 +529,10 @@ async def test_arcus_collector_normalizes_market_funding_context_and_executable_
     assert len(hourly_batch.funding_snapshots) == 1
     funding = hourly_batch.funding_snapshots[0]
     assert funding.canonical_symbol == "SNDK"
+    # Arcus fundingRates is an hourly decimal; positive = longs pay.
+    assert funding.interval_seconds == 3600
+    assert funding.rate_per_hour == pytest.approx(funding.funding_rate)
+    assert funding.apr == pytest.approx(funding.funding_rate * 8760)
     assert funding.effective_time == datetime.fromtimestamp(1790128800, tz=UTC)
     assert funding.next_funding_time == datetime.fromtimestamp(1790132400, tz=UTC)
     assert funding.observed_at == OBSERVED_AT

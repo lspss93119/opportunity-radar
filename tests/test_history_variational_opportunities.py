@@ -102,6 +102,7 @@ def make_funding(
         venue_symbol=venue if venue_symbol is None else venue_symbol,
         canonical_symbol=canonical_symbol,
         funding_rate=funding_rate,
+        interval_seconds=3600,
     )
 
 
@@ -392,6 +393,45 @@ quoted_markets:
     assert "5. SUMMARY" in output
     assert "INDICATIVE NET SPREAD" in output
     assert "public metadata $1k quote" in output
-    assert "0.001/28800s" in output
-    assert "0.002/stored" in output
+    # Var stores an annualized rate; the other venue stores 0.002 per hour.
+    assert "0.10% APR" in output
+    assert "1752.00% APR" in output
     assert not (tmp_path / "runtime.db").exists()
+
+
+def test_report_reads_legacy_funding_partitions_without_interval(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    write_data(
+        tmp_path,
+        quotes=[make_quote(AS_OF)],
+        markets=[make_market("arcus", AS_OF - timedelta(seconds=10))],
+        # A newer-schema partition alongside the legacy one exercises union_by_name.
+        fundings=[make_funding("arcus", AS_OF - timedelta(hours=2), funding_rate=0.001)],
+    )
+    legacy_time = AS_OF - timedelta(hours=1)
+    legacy_dir = tmp_path / "data" / "funding" / f"date={legacy_time.date()}"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {
+                "effective_time": [legacy_time],
+                "observed_at": [legacy_time],
+                "venue": ["arcus"],
+                "venue_symbol": ["arcus"],
+                "canonical_symbol": ["BTC"],
+                "funding_rate": [0.002],
+                "next_funding_time": pa.array([None], pa.timestamp("us", "UTC")),
+            }
+        ),
+        legacy_dir / "part-legacy.parquet",
+    )
+
+    report = build_report(tmp_path, make_config(fees={"arcus": 0.0}))
+
+    observation = next(
+        item for item in report.observations if item.direction == "variational_long"
+    )
+    assert observation.other_funding_rate == pytest.approx(0.002)
+    assert observation.other_funding_interval_seconds is None

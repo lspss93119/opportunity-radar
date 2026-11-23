@@ -14,6 +14,9 @@ from radar.models import MarketSnapshot, FundingSnapshot, HourlyContext
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
+# funding_rates reports the current hourly interval (intervalEnds on the hour);
+# observed baseline 0.0000125 matches the usual 0.00125%/h hourly decimal.
+FUNDING_INTERVAL_SECONDS = 3600
 
 
 def _result(payload: object) -> object:
@@ -259,6 +262,7 @@ class OndoCollector:
                     effective_time=effective, observed_at=self._clock(), venue=self.venue,
                     venue_symbol=market.venue_symbol, canonical_symbol=market.canonical_symbol,
                     funding_rate=rate,
+                    interval_seconds=FUNDING_INTERVAL_SECONDS,
                     next_funding_time=effective if effective > now else None,
                 ))
             except Exception as error:

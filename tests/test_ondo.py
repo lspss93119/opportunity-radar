@@ -116,6 +116,8 @@ async def test_ondo_collects_radar_snapshots_with_injected_public_rest():
     assert row.sell_10k_vwap is not None
     assert len(batch.funding_snapshots) == 1
     assert batch.funding_snapshots[0].funding_rate == 0.0001
+    assert batch.funding_snapshots[0].interval_seconds == 3600
+    assert batch.funding_snapshots[0].apr == pytest.approx(0.0001 * 8760)
     assert batch.funding_snapshots[0].effective_time == datetime(
         2026, 10, 28, 9, 0, tzinfo=timezone.utc
     )

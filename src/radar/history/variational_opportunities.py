@@ -60,6 +60,7 @@ class _FundingRow:
     canonical_symbol: str
     funding_rate: float
     next_funding_time: datetime | None
+    interval_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -386,20 +387,29 @@ def _read_funding_rows(data_root: Path) -> tuple[_FundingRow, ...]:
     if not _dataset_files(data_root, "funding"):
         return ()
     funding_glob = _parquet_glob(data_root, "funding")
+    # Partitions written before interval_seconds existed lack that column.
     query = f"""
-        SELECT
-            effective_time,
-            observed_at,
-            venue,
-            venue_symbol,
-            canonical_symbol,
-            funding_rate,
-            next_funding_time
-        FROM read_parquet('{funding_glob}')
+        SELECT *
+        FROM read_parquet('{funding_glob}', union_by_name=true)
         ORDER BY observed_at, venue, venue_symbol
     """
     with duckdb.connect() as connection:
-        raw_rows = connection.execute(query).fetchall()
+        cursor = connection.execute(query)
+        names = [column[0] for column in cursor.description]
+        raw_records = [dict(zip(names, row)) for row in cursor.fetchall()]
+    raw_rows = [
+        (
+            record.get("effective_time"),
+            record.get("observed_at"),
+            record.get("venue"),
+            record.get("venue_symbol"),
+            record.get("canonical_symbol"),
+            record.get("funding_rate"),
+            record.get("next_funding_time"),
+            record.get("interval_seconds"),
+        )
+        for record in raw_records
+    ]
 
     rows: list[_FundingRow] = []
     for raw_row in raw_rows:
@@ -412,6 +422,14 @@ def _read_funding_rows(data_root: Path) -> tuple[_FundingRow, ...]:
                 None
                 if raw_row[6] is None
                 else _as_utc(raw_row[6], "next_funding_time")
+            )
+            raw_interval = raw_row[7]
+            interval_seconds = (
+                int(raw_interval)
+                if isinstance(raw_interval, int)
+                and not isinstance(raw_interval, bool)
+                and raw_interval > 0
+                else None
             )
         except (IndexError, TypeError, ValueError):
             continue
@@ -431,6 +449,7 @@ def _read_funding_rows(data_root: Path) -> tuple[_FundingRow, ...]:
                 canonical_symbol=canonical_symbol,
                 funding_rate=funding_rate,
                 next_funding_time=next_funding_time,
+                interval_seconds=interval_seconds,
             )
         )
     return tuple(rows)
@@ -554,6 +573,9 @@ def _make_observation(
         other_funding_effective_time=None
         if funding is None
         else funding.effective_time,
+        other_funding_interval_seconds=None
+        if funding is None
+        else funding.interval_seconds,
     )
 
 
@@ -883,12 +905,17 @@ def _format_bps(value: float) -> str:
     return f"{value:.2f}"
 
 
-def _format_rate(rate: float | None, interval_seconds: int | None) -> str:
+def _format_apr(apr: float) -> str:
+    return f"{apr * 100:.2f}% APR"
+
+
+def _format_interval_rate(rate: float | None, interval_seconds: int | None) -> str:
+    """Format a per-interval decimal rate; legacy rows without an interval stay raw."""
     if rate is None:
         return "—"
     if interval_seconds is None:
-        return f"{rate:.6g}/stored"
-    return f"{rate:.6g}/{interval_seconds}s"
+        return f"{rate:.6g}/unknown interval"
+    return _format_apr(rate * 3600 / interval_seconds * 24 * 365)
 
 
 def _direction_label(key: VariationalPairKey) -> str:
@@ -980,11 +1007,9 @@ def format_variational_opportunity_report(
                         _format_bps(observation.other_venue_fee_bps),
                         _format_bps(observation.indicative_net_bps),
                         f"{observation.observed_skew_ms:.0f}ms",
-                        _format_rate(
-                            observation.variational_funding_rate,
-                            observation.variational_funding_interval_seconds,
-                        ),
-                        _format_rate(
+                        # Variational stores its annualized rate directly.
+                        _format_apr(observation.variational_funding_rate),
+                        _format_interval_rate(
                             observation.other_funding_rate,
                             observation.other_funding_interval_seconds,
                         ),

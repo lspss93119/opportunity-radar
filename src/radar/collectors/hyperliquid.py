@@ -28,6 +28,9 @@ from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
+# Core and HIP-3 perps pay funding every hour; fundingRate is an hourly decimal,
+# positive = longs pay (hyperliquid-docs/trading/funding).
+FUNDING_INTERVAL_SECONDS = 3600
 HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
 HYPERLIQUID_HEARTBEAT_INTERVAL_SECONDS = 50.0
 HYPERLIQUID_RECONNECT_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
@@ -973,6 +976,7 @@ class HyperliquidCollector:
                 venue_symbol=market.venue_symbol,
                 canonical_symbol=market.canonical_symbol,
                 funding_rate=point.funding_rate,
+                interval_seconds=FUNDING_INTERVAL_SECONDS,
                 next_funding_time=None,
             )
         except Exception as error:  # noqa: BLE001
