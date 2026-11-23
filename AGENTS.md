@@ -16,7 +16,6 @@ This repository is a **read-only market monitoring system**.
 ## Engineering rules
 - Keep the implementation simple; YAGNI.
 - Do not add frameworks or abstractions that are not required by the current task.
-- Follow `docs/superpowers/plans/2026-09-15-opportunity-radar-macbook-v1.md`.
 - Use tests for deterministic calculations, validation, lifecycle/state logic, and historical alignment.
 - Use fixtures plus limited live smoke tests for collectors.
 - Work on one approved task at a time.
