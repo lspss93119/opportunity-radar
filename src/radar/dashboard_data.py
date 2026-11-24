@@ -24,6 +24,7 @@ from radar.monitors.spread.basis import (
     RollingBasisStats,
 )
 from radar.monitors.spread.models import SpreadPairKey, calculate_raw_spread_bps
+from radar.storage.parquet import duckdb_read_parquet
 
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_DB = Path("runtime/radar.sqlite3")
@@ -1157,7 +1158,7 @@ class DashboardQueryService:
                         PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
                         ORDER BY observed_at DESC
                     ) AS row_number
-                FROM read_parquet([{path_list}])
+                FROM {duckdb_read_parquet(f"[{path_list}]")}
                 WHERE sample_time >= ? AND sample_time <= ?
                   AND ({predicates})
             )
@@ -1268,7 +1269,7 @@ class DashboardQueryService:
         try:
             with duckdb.connect() as connection:
                 data_as_of_row = connection.execute(
-                    f"SELECT max(sample_time) FROM read_parquet([{path_list}]) "
+                    f"SELECT max(sample_time) FROM {duckdb_read_parquet(f'[{path_list}]')} "
                     "WHERE sample_time >= ? AND sample_time <= ?",
                     [start, end],
                 ).fetchone()

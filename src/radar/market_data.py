@@ -324,9 +324,12 @@ class LatestMarketData:
         canonical_symbol: str,
         now: datetime,
         stale_after_seconds: int,
+        primary_size_usd: int = 10_000,
     ) -> frozenset[str]:
         now = _require_utc(now, "now")
         self._validate_stale_after(stale_after_seconds)
+        if primary_size_usd not in (1_000, 5_000, 10_000):
+            raise ValueError("primary_size_usd must be 1000, 5000, or 10000")
         venues: set[str] = set()
         for market in markets:
             if not market.enabled or market.canonical_symbol != canonical_symbol:
@@ -335,8 +338,8 @@ class LatestMarketData:
             if view is None or not self._is_fresh(view, now, stale_after_seconds):
                 continue
             if (
-                buy_vwap(list(view.asks), 10_000) is not None
-                and sell_vwap(list(view.bids), 10_000) is not None
+                buy_vwap(list(view.asks), primary_size_usd) is not None
+                and sell_vwap(list(view.bids), primary_size_usd) is not None
             ):
                 venues.add(market.venue)
         return frozenset(venues)

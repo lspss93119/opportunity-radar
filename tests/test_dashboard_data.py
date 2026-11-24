@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from radar.config import MarketConfig, MonitorConfig, RadarConfig, SpreadMonitorConfig
 from radar.dashboard_data import (
@@ -74,6 +76,19 @@ def write_markets(
     for snapshot in snapshots:
         storage.append(snapshot)
     storage.flush(now=now)
+
+
+def write_legacy_markets(data_root: Path, snapshots: list[MarketSnapshot]) -> None:
+    partition = data_root / "market" / f"date={snapshots[0].sample_time.date()}"
+    partition.mkdir(parents=True)
+    rows = []
+    for snapshot in snapshots:
+        row = snapshot.model_dump(mode="python")
+        row.pop("buy_1k_vwap")
+        row.pop("sell_1k_vwap")
+        row.pop("price_source")
+        rows.append(row)
+    pq.write_table(pa.Table.from_pylist(rows), partition / "part-legacy.parquet")
 
 
 def write_episodes(
@@ -203,6 +218,40 @@ def write_prior_pair_history(
 def full_window_times(*, count: int = MIN_HISTORY_OBSERVATIONS) -> list[datetime]:
     all_times = [NOW - timedelta(days=1) + timedelta(seconds=10 * index) for index in range(8640)]
     return [sample_time for index, sample_time in enumerate(all_times) if index % 5 != 1][:count]
+
+
+def test_dashboard_market_query_unions_old_and_new_schema_partitions(tmp_path):
+    old_time = NOW - timedelta(days=1)
+    old_snapshots = pair_markets(sample_time=old_time)
+    new_snapshots = [
+        snapshot.model_copy(
+            update={"buy_1k_vwap": 99.0, "sell_1k_vwap": 101.0}
+        )
+        for snapshot in pair_markets(sample_time=NOW)
+    ]
+    write_legacy_markets(tmp_path / "data", old_snapshots)
+    write_markets(tmp_path / "data", new_snapshots)
+
+    service = DashboardQueryService(
+        pair_config(),
+        data_root=tmp_path / "data",
+        runtime_db=tmp_path / "runtime.sqlite3",
+        clock=lambda: NOW,
+    )
+    rows, errors, data_as_of = service._read_market_rows(
+        old_time - timedelta(hours=1),
+        NOW,
+        identities=(
+            (LONG_VENUE, "BTC", "BTC"),
+            (SHORT_VENUE, "BTC", "BTC"),
+        ),
+    )
+
+    assert errors == []
+    assert data_as_of == NOW
+    assert len(rows) == 4
+    assert all(row.buy_1k_vwap is None for row in rows if row.sample_time == old_time)
+    assert all(row.buy_1k_vwap == pytest.approx(99.0) for row in rows if row.sample_time == NOW)
 
 
 def make_episode(

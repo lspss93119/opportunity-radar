@@ -9,6 +9,7 @@ from statistics import median
 import duckdb  # type: ignore[import-untyped]
 
 from radar.monitors.spread.models import SpreadPairKey
+from radar.storage.parquet import duckdb_read_parquet
 
 VWAP_COLUMNS = {
     1_000: ("buy_1k_vwap", "sell_1k_vwap"),
@@ -141,7 +142,7 @@ class SpreadHistory:
                     canonical_symbol,
                     {buy_column} AS buy_vwap,
                     {sell_column} AS sell_vwap
-                FROM read_parquet('{market_glob}')
+                FROM {duckdb_read_parquet(f"'{market_glob}'")}
                 WHERE sample_time >= ?
                   AND sample_time <= ?
                   AND canonical_symbol = ?
@@ -298,7 +299,7 @@ class SpreadHistory:
                 {buy_column} AS buy_vwap,
                 {sell_column} AS sell_vwap,
                 price_source
-            FROM read_parquet('{market_glob}', union_by_name=true)
+            FROM {duckdb_read_parquet(f"'{market_glob}'")}
             WHERE sample_time >= ?
               AND sample_time < ?
         """
@@ -423,7 +424,7 @@ class SpreadHistory:
                     {buy_column} AS buy_vwap,
                     {sell_column} AS sell_vwap,
                     price_source
-                FROM read_parquet('{market_glob}', union_by_name=true)
+                FROM {duckdb_read_parquet(f"'{market_glob}'")}
                 WHERE sample_time >= ?
                   AND sample_time < ?
                   AND canonical_symbol = ?

@@ -808,6 +808,58 @@ async def test_already_alerted_episode_restores_without_duplicate_alert(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_rescan_removes_alerted_episode_before_feed_reentry():
+    monitor = make_monitor(candidate_duration_seconds=0, alert_duration_seconds=0)
+    state = make_state(
+        make_market("long", buy_10k_vwap=100.0, sell_10k_vwap=99.0),
+        make_market("short", buy_10k_vwap=102.0, sell_10k_vwap=101.0),
+    )
+    identities = {
+        ("long", "BTC", "BTC"),
+        ("short", "BTC", "BTC"),
+    }
+    monitor.set_market_identities(identities)
+    prime_triggering_monitor(monitor, state)
+
+    for offset in range(0, 60, 10):
+        assert await monitor.evaluate(NOW + timedelta(seconds=offset), state) == []
+    assert len(await monitor.evaluate(NOW + timedelta(seconds=60), state)) == 1
+    first_episode_id = monitor.active_episodes[0].episode_id
+
+    monitor.set_market_identities({("long", "BTC", "BTC")})
+    assert monitor.active_episodes == ()
+
+    monitor.set_market_identities(identities)
+    reentry_time = NOW + timedelta(seconds=70)
+    reentry_state = make_state(
+        make_market(
+            "long",
+            buy_10k_vwap=100.0,
+            sell_10k_vwap=99.0,
+            sample_time=reentry_time,
+            observed_at=reentry_time,
+        ),
+        make_market(
+            "short",
+            buy_10k_vwap=102.0,
+            sell_10k_vwap=101.0,
+            sample_time=reentry_time,
+            observed_at=reentry_time,
+        ),
+    )
+    prime_triggering_monitor(monitor, reentry_state, when=reentry_time)
+    for offset in range(70, 130, 10):
+        assert (
+            await monitor.evaluate(NOW + timedelta(seconds=offset), reentry_state)
+            == []
+        )
+    assert (
+        len(await monitor.evaluate(NOW + timedelta(seconds=130), reentry_state)) == 1
+    )
+    assert monitor.active_episodes[0].episode_id != first_episode_id
+
+
+@pytest.mark.asyncio
 async def test_alert_persistence_failure_restores_unalerted_episode_for_retry(
     tmp_path,
     monkeypatch,

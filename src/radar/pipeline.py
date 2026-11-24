@@ -702,6 +702,7 @@ class MarketDataPipeline:
                     canonical_symbol=canonical_symbol,
                     now=now,
                     stale_after_seconds=self._stale_after_seconds,
+                    primary_size_usd=self._live_depth_usd,
                 )
                 if len(ready_venues) >= required_venues:
                     return

@@ -287,7 +287,7 @@ class SpreadMonitor:
         market_identities: Collection[tuple[str, str, str]],
         market_sample_seconds: Mapping[tuple[str, str, str], int] | None = None,
     ) -> None:
-        """Adopt a rescanned universe and drop basis state for removed feeds."""
+        """Adopt a rescanned universe and drop state for removed feeds."""
         identities = frozenset(market_identities)
         self._market_identities = identities
         if market_sample_seconds is not None:
@@ -305,6 +305,14 @@ class SpreadMonitor:
                 not in identities
             ):
                 del self._basis_by_key[key]
+        for key in tuple(self._episodes):
+            if (
+                (key.long_venue, key.long_venue_symbol, key.canonical_symbol)
+                not in identities
+                or (key.short_venue, key.short_venue_symbol, key.canonical_symbol)
+                not in identities
+            ):
+                del self._episodes[key]
         for key in tuple(self._median_by_key):
             if key not in self._basis_by_key:
                 del self._median_by_key[key]

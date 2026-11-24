@@ -131,6 +131,11 @@ DATASET_SCHEMAS = {
 }
 
 
+def duckdb_read_parquet(source: str) -> str:
+    """Build a DuckDB read over Parquet partitions with schema unioning."""
+    return f"read_parquet({source}, union_by_name=true)"
+
+
 def _as_utc(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")

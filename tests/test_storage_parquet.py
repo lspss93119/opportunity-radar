@@ -12,7 +12,7 @@ import pytest
 
 from radar.collectors.base import CollectorBatch
 from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot, QuotedMarketSnapshot
-from radar.storage.parquet import ParquetStorage
+from radar.storage.parquet import ParquetStorage, duckdb_read_parquet
 
 UTC = timezone.utc
 
@@ -127,6 +127,31 @@ def storage_telemetry_payload(caplog, flush_id: str) -> dict[str, object]:
         "message": message,
         "payload": json.loads(payload_text),
     }
+
+
+def test_duckdb_read_parquet_unions_schemas_and_fills_missing_columns(tmp_path):
+    root = tmp_path / "data" / "market"
+    old_partition = root / "date=2026-09-15"
+    new_partition = root / "date=2026-09-16"
+    old_partition.mkdir(parents=True)
+    new_partition.mkdir(parents=True)
+    pq.write_table(
+        pa.table({"venue_symbol": ["OLD"]}),
+        old_partition / "part-old.parquet",
+    )
+    pq.write_table(
+        pa.table({"venue_symbol": ["NEW"], "price_source": ["order_book"]}),
+        new_partition / "part-new.parquet",
+    )
+
+    glob = str(root / "date=*" / "part-*.parquet").replace("'", "''")
+    with duckdb.connect() as connection:
+        rows = connection.execute(
+            f"SELECT venue_symbol, price_source FROM "
+            f"{duckdb_read_parquet(f"'{glob}'")} ORDER BY venue_symbol"
+        ).fetchall()
+
+    assert rows == [("NEW", "order_book"), ("OLD", None)]
 
 
 def test_flush_emits_correlated_machine_readable_phase_telemetry(

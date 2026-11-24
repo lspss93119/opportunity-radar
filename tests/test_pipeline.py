@@ -750,6 +750,33 @@ async def test_wait_for_market_feeds_polls_only_latest_cache():
 
 
 @pytest.mark.asyncio
+async def test_wait_for_market_feeds_uses_live_primary_depth():
+    latest = LatestMarketData()
+    market = MarketConfig(
+        venue="lighter", venue_symbol="VVV", canonical_symbol="VVV"
+    )
+    pipeline = MarketDataPipeline(
+        [],
+        RadarState(),
+        markets=(market,),
+        latest_market_data=latest,
+        live_depth_usd=1_000,
+        clock=lambda: NOW,
+    )
+    latest.update_book(
+        venue="lighter",
+        venue_symbol="VVV",
+        bids=(BookLevel(price=25.0, base_size=100.0),),
+        asks=(BookLevel(price=25.1, base_size=100.0),),
+        observed_at=NOW,
+    )
+
+    await pipeline.wait_for_market_feeds(
+        "VVV", required_venues=1, timeout_seconds=0.01
+    )
+
+
+@pytest.mark.asyncio
 async def test_wait_for_market_feeds_times_out_without_ready_cache_data():
     pipeline = MarketDataPipeline(
         [],

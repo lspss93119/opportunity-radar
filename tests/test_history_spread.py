@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from radar.history.spread import HistoricalSpreadContext, SpreadHistory
@@ -76,6 +79,17 @@ def write_markets(tmp_path, snapshots: list[MarketSnapshot]) -> None:
     store.flush(now=AS_OF)
 
 
+def write_legacy_markets(data_root: Path, snapshots: list[MarketSnapshot]) -> None:
+    partition = data_root / "market" / f"date={snapshots[0].sample_time.date()}"
+    partition.mkdir(parents=True)
+    rows = []
+    for snapshot in snapshots:
+        row = snapshot.model_dump(mode="python")
+        row.pop("price_source")
+        rows.append(row)
+    pq.write_table(pa.Table.from_pylist(rows), partition / "part-legacy.parquet")
+
+
 def query_context(tmp_path, *, as_of: datetime = AS_OF, size: int = 10_000):
     return SpreadHistory(tmp_path / "data").query(
         canonical_symbol="BTC",
@@ -97,6 +111,18 @@ def test_exact_sample_time_join_uses_short_sell_over_long_buy(tmp_path):
     assert len(context.points_7d) == 1
     assert context.points_7d[0].sample_time == AS_OF
     assert context.points_7d[0].raw_spread_bps == pytest.approx(100.0)
+
+
+def test_query_handles_old_and_new_market_schema_partitions(tmp_path):
+    old_time = AS_OF - timedelta(days=1)
+    old_long, old_short = make_pair(old_time, long_buy=100.0, short_sell=101.0)
+    new_long, new_short = make_pair(AS_OF, long_buy=100.0, short_sell=102.0)
+    write_legacy_markets(tmp_path / "data", [old_long, old_short])
+    write_markets(tmp_path, [new_long, new_short])
+
+    context = query_context(tmp_path)
+
+    assert [point.sample_time for point in context.points_7d] == [old_time, AS_OF]
 
 
 def test_offset_sample_times_do_not_form_asof_point(tmp_path):
