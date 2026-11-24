@@ -29,6 +29,7 @@ from radar.monitors.spread.basis import (
     RollingBasis,
 )
 from radar.monitors.spread.models import SpreadPairKey
+from radar.storage.parquet import duckdb_read_parquet
 
 
 QUERY_BATCH_SIZE = 8_192
@@ -574,7 +575,7 @@ def _iter_market_rows(
                     canonical_symbol,
                     buy_10k_vwap,
                     sell_10k_vwap
-                FROM read_parquet([{market_paths}])
+                FROM {duckdb_read_parquet(f"[{market_paths}]")}
                 WHERE sample_time >= ?
                   AND sample_time < ?
                   AND ({predicates})

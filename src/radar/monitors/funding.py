@@ -307,6 +307,11 @@ class FundingMonitor:
             for pair_id, pair in self._pairs.items()
             if pair.alerted[SPIKE]
         }
+        carrying_symbols = {
+            _symbol_of(pair_id)
+            for pair_id, pair in self._pairs.items()
+            if pair.alerted[CARRY]
+        }
         for keys in by_symbol.values():
             for long_key in keys:
                 for short_key in keys:
@@ -342,7 +347,8 @@ class FundingMonitor:
                 del self._pairs[pair_id]
                 changed = True
 
-        alerts = _one_spike_per_symbol(alerts, spiking_symbols)
+        alerts = _one_per_symbol_and_kind(alerts, SPIKE, spiking_symbols)
+        alerts = _one_per_symbol_and_kind(alerts, CARRY, carrying_symbols)
         if changed and self._runtime_store is not None:
             self._runtime_store.set_monitor_state(
                 self.name,
@@ -638,24 +644,25 @@ class FundingMonitor:
         return pairs
 
 
-def _one_spike_per_symbol(
-    alerts: list[AlertRequest], spiking_symbols: set[str]
+def _one_per_symbol_and_kind(
+    alerts: list[AlertRequest], kind: str, active_symbols: set[str]
 ) -> list[AlertRequest]:
-    """Keep one spike alert per symbol; list the other qualifying pairs in it.
+    """Keep one alert per symbol and kind; list other qualifying pairs in it.
 
-    Symbols that already had an active spike alert get none: their newly
-    qualifying pairs are marked alerted (so they stay quiet) by the caller.
+    Symbols that already had an active alert of this kind get none: their
+    newly qualifying pairs are marked alerted (so they stay quiet) by the
+    caller. Different kinds are aggregated independently.
     """
-    spikes: dict[str, list[AlertRequest]] = defaultdict(list)
+    matching: dict[str, list[AlertRequest]] = defaultdict(list)
     others: list[AlertRequest] = []
     for alert in alerts:
-        if alert.payload["kind"] == SPIKE:
-            spikes[str(alert.payload["canonical_symbol"])].append(alert)
+        if alert.payload["kind"] == kind:
+            matching[str(alert.payload["canonical_symbol"])].append(alert)
         else:
             others.append(alert)
     kept: list[AlertRequest] = []
-    for symbol, group in spikes.items():
-        if symbol in spiking_symbols:
+    for symbol, group in matching.items():
+        if symbol in active_symbols:
             continue
         group.sort(key=lambda alert: float(alert.payload["net_apr"]), reverse=True)
         lead, rest = group[0], group[1:]

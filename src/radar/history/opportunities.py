@@ -16,6 +16,7 @@ from radar.monitors.spread.models import (
     calculate_net_spread_bps,
     calculate_raw_spread_bps,
 )
+from radar.storage.parquet import duckdb_read_parquet
 
 UTC_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
 VWAP_COLUMNS = {
@@ -189,7 +190,7 @@ def _read_market_rows(data_root: Path, primary_size_usd: int) -> tuple[_MarketRo
                     PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
                     ORDER BY observed_at DESC
                 ) AS row_number
-            FROM read_parquet('{market_glob}')
+            FROM {duckdb_read_parquet(f"'{market_glob}'")}
         )
         SELECT
             sample_time,

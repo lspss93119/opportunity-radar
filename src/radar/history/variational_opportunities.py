@@ -13,6 +13,7 @@ import duckdb  # type: ignore[import-untyped]
 
 from radar.config import MarketConfig, RadarConfig
 from radar.monitors.spread.models import calculate_raw_spread_bps
+from radar.storage.parquet import duckdb_read_parquet
 
 MAX_MARKET_AGE_SECONDS = 20.0
 PERSISTENCE_THRESHOLDS_BPS = (10.0, 20.0, 50.0)
@@ -261,7 +262,7 @@ def _read_quote_rows(
                     PARTITION BY venue_symbol, canonical_symbol, quote_time
                     ORDER BY fetched_at DESC
                 ) AS row_number
-            FROM read_parquet('{quote_glob}')
+            FROM {duckdb_read_parquet(f"'{quote_glob}'")}
             WHERE lower(venue) = 'variational'
         )
         SELECT
@@ -339,7 +340,7 @@ def _read_market_rows(data_root: Path) -> tuple[_MarketRow, ...]:
                     PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
                     ORDER BY observed_at DESC
                 ) AS row_number
-            FROM read_parquet('{market_glob}')
+            FROM {duckdb_read_parquet(f"'{market_glob}'")}
         )
         SELECT
             sample_time,

@@ -19,6 +19,7 @@ from radar.monitors.manual_opportunity import (
     manual_opportunity_temporal_rejection_reason,
 )
 from radar.monitors.spread.models import SpreadPairKey
+from radar.storage.parquet import duckdb_read_parquet
 
 
 @dataclass(frozen=True)
@@ -646,7 +647,7 @@ class ManualOpportunityHistory:
                         PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
                         ORDER BY observed_at DESC
                     ) AS row_number
-                FROM read_parquet('{market_glob}')
+                FROM {duckdb_read_parquet(f"'{market_glob}'")}
                 WHERE sample_time >= ?
                   AND sample_time <= ?
                   AND observed_at <= ?
@@ -763,7 +764,7 @@ def load_recent_bbo_history(
                     PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
                     ORDER BY observed_at DESC
                 ) AS row_number
-            FROM read_parquet('{market_glob}')
+            FROM {duckdb_read_parquet(f"'{market_glob}'")}
             WHERE sample_time >= ?
               AND sample_time < ?
               AND observed_at <= ?
@@ -868,7 +869,7 @@ def _stream_market_rows(
                             PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
                             ORDER BY observed_at DESC
                         ) AS row_number
-                    FROM read_parquet('{path_glob}')
+                    FROM {duckdb_read_parquet(f"'{path_glob}'")}
                     WHERE sample_time >= ? AND sample_time < ?
                 )
                 SELECT sample_time, observed_at, venue, venue_symbol, canonical_symbol,
@@ -959,7 +960,7 @@ def _load_volume_index(
     query = f"""
         SELECT sample_time, observed_at, venue, venue_symbol, canonical_symbol,
                volume_24h
-        FROM read_parquet('{context_glob}')
+        FROM {duckdb_read_parquet(f"'{context_glob}'")}
         WHERE sample_time >= ? AND sample_time < ?
         ORDER BY observed_at, sample_time
     """

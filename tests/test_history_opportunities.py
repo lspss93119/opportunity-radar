@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from radar.config import MonitorConfig, RadarConfig, SpreadMonitorConfig
@@ -131,6 +133,64 @@ def test_report_deduplicates_and_evaluates_all_directional_pairs_with_fees(tmp_p
     assert long_to_a.long_buy_vwap == 101.0
     assert long_to_a.net_spread_bps == pytest.approx(
         (102.0 / 101.0 - 1.0) * 10_000 - 1.0 - 2.0
+    )
+
+
+def test_report_reads_old_and_new_market_schemas_together(tmp_path):
+    data_root = tmp_path / "data"
+    old_partition = data_root / "market" / f"date={AS_OF.date()}"
+    old_partition.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "sample_time": [AS_OF],
+                "observed_at": [AS_OF],
+                "venue": ["old_long"],
+                "venue_symbol": ["old_long"],
+                "canonical_symbol": ["BTC"],
+                "best_bid": [99.0],
+                "best_bid_size": [10.0],
+                "best_ask": [100.0],
+                "best_ask_size": [10.0],
+                "mark_price": [100.0],
+                "index_price": [100.0],
+                "buy_1k_vwap": [100.0],
+                "sell_1k_vwap": [99.0],
+                "buy_5k_vwap": [100.0],
+                "sell_5k_vwap": [99.0],
+                "buy_10k_vwap": [100.0],
+                "sell_10k_vwap": [99.0],
+            }
+        ),
+        old_partition / "part-old.parquet",
+    )
+    store = ParquetStorage(data_root)
+    store.append(
+        make_market(
+            "new_short",
+            AS_OF,
+            canonical_symbol="BTC",
+            venue_symbol="new_short",
+            buy_10k_vwap=102.0,
+            sell_10k_vwap=101.0,
+        )
+    )
+    store.flush(now=AS_OF + timedelta(days=1))
+
+    report = build_report(
+        tmp_path,
+        make_config(
+            fees={"old_long": 0.0, "new_short": 0.0},
+            candidate_net_bps=0.0,
+            candidate_duration_seconds=0,
+        ),
+        hours=6,
+    )
+
+    assert any(
+        sample.key.long_venue == "old_long"
+        and sample.key.short_venue == "new_short"
+        for sample in report.pair_samples
     )
 
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Mapping
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any
 
 import httpx
 
@@ -16,6 +19,8 @@ TELEGRAM_HTTP_TIMEOUT = httpx.Timeout(
 # httpx logs every request URL at INFO, and Telegram puts the bot token in the
 # URL path. Request logging is raised to WARNING wherever a transport exists.
 _REQUEST_LOGGERS = ("httpx", "httpcore")
+MAX_RETRIES = 3
+MIN_SEND_INTERVAL_SECONDS = 3.0
 
 
 def _silence_request_logging() -> None:
@@ -40,6 +45,8 @@ class TelegramTransport:
         chat_id: str | int,
         *,
         client: httpx.AsyncClient | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not bot_token:
             raise ValueError("bot_token must be non-empty")
@@ -53,6 +60,9 @@ class TelegramTransport:
             else client
         )
         self._closed = False
+        self._sleep = sleep
+        self._clock = clock
+        self._last_send_at: float | None = None
 
     async def aclose(self) -> None:
         if self._closed:
@@ -79,47 +89,98 @@ class TelegramTransport:
         files: Mapping[str, tuple[str, bytes, str]] | None = None,
     ) -> None:
         url = f"https://api.telegram.org/bot{self._bot_token}/{method}"
-        try:
-            response = await self._client.post(url, data=data, files=files)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            raise TelegramTransportError(
-                error_kind="http_status",
-                status_code=error.response.status_code,
-            ) from None
-        except httpx.ConnectTimeout:
-            raise TelegramTransportError(
-                error_kind="connect_timeout", status_code=None
-            ) from None
-        except httpx.ReadTimeout:
-            raise TelegramTransportError(
-                error_kind="read_timeout", status_code=None
-            ) from None
-        except httpx.WriteTimeout:
-            raise TelegramTransportError(
-                error_kind="write_timeout", status_code=None
-            ) from None
-        except httpx.PoolTimeout:
-            raise TelegramTransportError(
-                error_kind="pool_timeout", status_code=None
-            ) from None
-        except httpx.ConnectError:
-            raise TelegramTransportError(
-                error_kind="connect_error", status_code=None
-            ) from None
-        except httpx.RemoteProtocolError:
-            raise TelegramTransportError(
-                error_kind="remote_protocol_error", status_code=None
-            ) from None
-        except httpx.ReadError:
-            raise TelegramTransportError(
-                error_kind="read_error", status_code=None
-            ) from None
-        except httpx.WriteError:
-            raise TelegramTransportError(
-                error_kind="write_error", status_code=None
-            ) from None
-        except httpx.HTTPError:
-            raise TelegramTransportError(
-                error_kind="other_httpx_error", status_code=None
-            ) from None
+        wait_for_send_slot = True
+        for retry_number in range(MAX_RETRIES + 1):
+            if wait_for_send_slot:
+                await self._wait_for_send_slot()
+            wait_for_send_slot = True
+            try:
+                response = await self._client.post(url, data=data, files=files)
+                if response.status_code == 429:
+                    if retry_number >= MAX_RETRIES:
+                        raise TelegramTransportError(
+                            error_kind="http_status", status_code=429
+                        )
+                    retry_after = _retry_after_seconds(response)
+                    delay = (
+                        retry_after
+                        if retry_after is not None
+                        else float(2**retry_number)
+                    )
+                    await self._sleep(min(delay, 60.0))
+                    # The retry delay itself separates this attempt from the
+                    # next one; keep the injected clock and rate limiter in
+                    # sync without adding a second wait.
+                    self._last_send_at = self._clock()
+                    wait_for_send_slot = False
+                    continue
+                response.raise_for_status()
+                return
+            except TelegramTransportError:
+                raise
+            except httpx.HTTPStatusError as error:
+                raise TelegramTransportError(
+                    error_kind="http_status",
+                    status_code=error.response.status_code,
+                ) from None
+            except httpx.ConnectTimeout:
+                raise TelegramTransportError(
+                    error_kind="connect_timeout", status_code=None
+                ) from None
+            except httpx.ReadTimeout:
+                raise TelegramTransportError(
+                    error_kind="read_timeout", status_code=None
+                ) from None
+            except httpx.WriteTimeout:
+                raise TelegramTransportError(
+                    error_kind="write_timeout", status_code=None
+                ) from None
+            except httpx.PoolTimeout:
+                raise TelegramTransportError(
+                    error_kind="pool_timeout", status_code=None
+                ) from None
+            except httpx.ConnectError:
+                raise TelegramTransportError(
+                    error_kind="connect_error", status_code=None
+                ) from None
+            except httpx.RemoteProtocolError:
+                raise TelegramTransportError(
+                    error_kind="remote_protocol_error", status_code=None
+                ) from None
+            except httpx.ReadError:
+                raise TelegramTransportError(
+                    error_kind="read_error", status_code=None
+                ) from None
+            except httpx.WriteError:
+                raise TelegramTransportError(
+                    error_kind="write_error", status_code=None
+                ) from None
+            except httpx.HTTPError:
+                raise TelegramTransportError(
+                    error_kind="other_httpx_error", status_code=None
+                ) from None
+
+    async def _wait_for_send_slot(self) -> None:
+        now = self._clock()
+        if self._last_send_at is not None:
+            delay = MIN_SEND_INTERVAL_SECONDS - (now - self._last_send_at)
+            if delay > 0:
+                await self._sleep(delay)
+                now = self._clock()
+        self._last_send_at = now
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    try:
+        payload = response.json()
+    except (AttributeError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    parameters = payload.get("parameters")
+    if not isinstance(parameters, Mapping):
+        return None
+    retry_after = parameters.get("retry_after")
+    if isinstance(retry_after, bool) or not isinstance(retry_after, (int, float)):
+        return None
+    return retry_after if retry_after >= 0 else None

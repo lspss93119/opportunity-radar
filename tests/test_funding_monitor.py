@@ -238,6 +238,19 @@ def funding_state(at, *snapshots):
     return state
 
 
+def carry_state(at: datetime, aprs: dict[str, float]) -> RadarState:
+    state = funding_state(
+        at,
+        *(snapshot(venue, apr, at) for venue, apr in aprs.items()),
+    )
+    state.apply_market_batch(
+        CollectorBatch(
+            market_snapshots=tuple(book(venue, at) for venue in aprs),
+        )
+    )
+    return state
+
+
 @pytest.mark.asyncio
 async def test_longer_interval_leg_sets_the_settlement_period():
     """Hyperliquid pays hourly but Variational every 8h: only 8h settlements count."""
@@ -326,6 +339,64 @@ def seeded(funding_monitor: FundingMonitor, long_apr: float, short_apr: float, h
     }
     funding_monitor.hydrate_history(points)
     return funding_monitor
+
+
+@pytest.mark.asyncio
+async def test_one_carry_alert_per_symbol_lists_other_pairs_and_stays_in_cooldown():
+    funding_monitor = monitor(carry_avg_net_apr=0.1)
+    aprs = {"hyperliquid": 0.0, "variational": 0.3, "lighter": 0.5}
+    funding_monitor.hydrate_history(
+        {
+            (venue, "ACE", "ACE"): tuple(
+                (NOW - timedelta(minutes=5 * step), apr)
+                for step in range(1, 24 * 12 + 1)
+            )
+            for venue, apr in aprs.items()
+        }
+    )
+
+    alerts = await funding_monitor.evaluate(NOW, carry_state(NOW, aprs))
+    carries = [alert for alert in alerts if alert.payload["kind"] == CARRY]
+
+    assert len(carries) == 1
+    payload = carries[0].payload
+    assert (payload["long_venue"], payload["short_venue"]) == (
+        "hyperliquid",
+        "lighter",
+    )
+    assert sorted(pair["net_apr"] for pair in payload["other_pairs"]) == pytest.approx(
+        [0.2, 0.3]
+    )
+    message = format_funding_alert(carries[0])
+    assert "同時達標的其他配對（2）" in message
+    assert "做多 Hyperliquid / 做空 Variational: 淨 APR +30.00%" in message
+
+    later_alerts = await funding_monitor.evaluate(
+        NOW + timedelta(minutes=5), carry_state(NOW + timedelta(minutes=5), aprs)
+    )
+    assert [alert for alert in later_alerts if alert.payload["kind"] == CARRY] == []
+
+
+@pytest.mark.asyncio
+async def test_spike_and_carry_aggregate_independently():
+    at = settling(0)
+    funding_monitor = monitor(carry_avg_net_apr=0.1, spike_min_periods=1)
+    funding_monitor.hydrate_history(
+        {
+            key: tuple(
+                (at - timedelta(minutes=5 * step), apr)
+                for step in range(1, 24 * 12 + 1)
+            )
+            for key, apr in (
+                (("hyperliquid", "ACE", "ACE"), -20.0),
+                (("variational", "ACE", "ACE"), 5.0),
+            )
+        }
+    )
+
+    alerts = await funding_monitor.evaluate(at, state_at(at, -20.0, 5.0))
+
+    assert {alert.payload["kind"] for alert in alerts} == {SPIKE, CARRY}
 
 
 @pytest.mark.asyncio

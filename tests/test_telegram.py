@@ -11,6 +11,10 @@ from radar.alerts.telegram import TelegramTransport, TelegramTransportError
 @dataclass
 class FakeResponse:
     status_code: int = 200
+    json_payload: object | None = None
+
+    def json(self) -> object:
+        return {} if self.json_payload is None else self.json_payload
 
     def raise_for_status(self) -> None:
         if self.status_code < 400:
@@ -29,9 +33,11 @@ class FakeClient:
         self,
         response: FakeResponse | None = None,
         error: Exception | None = None,
+        responses: list[FakeResponse] | None = None,
     ) -> None:
         self.response = FakeResponse() if response is None else response
         self.error = error
+        self.responses = [] if responses is None else list(responses)
         self.calls: list[dict[str, object]] = []
         self.close_calls = 0
 
@@ -39,16 +45,22 @@ class FakeClient:
         self.calls.append({"url": url, **kwargs})
         if self.error is not None:
             raise self.error
-        return self.response
+        return self.responses.pop(0) if self.responses else self.response
 
     async def aclose(self) -> None:
         self.close_calls += 1
 
 
+async def no_sleep(_: float) -> None:
+    return None
+
+
 @pytest.mark.asyncio
 async def test_send_text_and_chart_use_expected_telegram_payloads():
     client = FakeClient()
-    transport = TelegramTransport("secret-token", "chat", client=client)  # type: ignore[arg-type]
+    transport = TelegramTransport(
+        "secret-token", "chat", client=client, sleep=no_sleep  # type: ignore[arg-type]
+    )
 
     await transport.send_text("alert")
     await transport.send_chart(b"png", "caption")
@@ -65,7 +77,9 @@ async def test_send_text_and_chart_use_expected_telegram_payloads():
 @pytest.mark.asyncio
 async def test_http_status_failure_is_observable_without_token_leak():
     client = FakeClient(FakeResponse(status_code=500))
-    transport = TelegramTransport("secret-token", "chat", client=client)  # type: ignore[arg-type]
+    transport = TelegramTransport(
+        "secret-token", "chat", client=client, sleep=no_sleep  # type: ignore[arg-type]
+    )
 
     with pytest.raises(TelegramTransportError) as caught:
         await transport.send_text("alert")
@@ -79,7 +93,9 @@ async def test_http_status_failure_is_observable_without_token_leak():
 @pytest.mark.asyncio
 async def test_request_failure_is_observable_without_token_leak():
     client = FakeClient(error=httpx.ConnectError("secret-token transport detail"))
-    transport = TelegramTransport("secret-token", "chat", client=client)  # type: ignore[arg-type]
+    transport = TelegramTransport(
+        "secret-token", "chat", client=client, sleep=no_sleep  # type: ignore[arg-type]
+    )
 
     with pytest.raises(TelegramTransportError) as caught:
         await transport.send_text("alert")
@@ -101,7 +117,7 @@ async def test_owned_client_is_reused_and_closed_once(monkeypatch):
         return client
 
     monkeypatch.setattr("radar.alerts.telegram.httpx.AsyncClient", factory)
-    transport = TelegramTransport("secret-token", "chat")
+    transport = TelegramTransport("secret-token", "chat", sleep=no_sleep)
 
     await transport.send_text("alert")
     await transport.send_chart(b"png", "caption")
@@ -117,7 +133,9 @@ async def test_owned_client_is_reused_and_closed_once(monkeypatch):
 @pytest.mark.asyncio
 async def test_injected_client_is_reused_but_not_closed():
     client = FakeClient()
-    transport = TelegramTransport("secret-token", "chat", client=client)  # type: ignore[arg-type]
+    transport = TelegramTransport(
+        "secret-token", "chat", client=client, sleep=no_sleep  # type: ignore[arg-type]
+    )
 
     await transport.send_text("alert")
     await transport.send_chart(b"png", "caption")
@@ -179,3 +197,85 @@ async def test_sent_requests_never_log_the_bot_token(caplog):
     assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
     assert token not in caplog.text
     assert "/bot" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_429_retry_after_is_waited_before_retrying():
+    now = 0.0
+    waits: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal now
+        waits.append(seconds)
+        now += seconds
+
+    client = FakeClient(
+        responses=[
+            FakeResponse(429, {"parameters": {"retry_after": 7}}),
+            FakeResponse(),
+        ]
+    )
+    transport = TelegramTransport(
+        "secret-token",
+        "chat",
+        client=client,  # type: ignore[arg-type]
+        sleep=fake_sleep,
+        clock=lambda: now,
+    )
+
+    await transport.send_text("alert")
+
+    assert len(client.calls) == 2
+    assert waits == [7]
+
+
+@pytest.mark.asyncio
+async def test_429_without_retry_after_uses_exponential_backoff_and_exhausts():
+    now = 0.0
+    waits: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal now
+        waits.append(seconds)
+        now += seconds
+
+    client = FakeClient(responses=[FakeResponse(429)] * 4)
+    transport = TelegramTransport(
+        "secret-token",
+        "chat",
+        client=client,  # type: ignore[arg-type]
+        sleep=fake_sleep,
+        clock=lambda: now,
+    )
+
+    with pytest.raises(TelegramTransportError) as caught:
+        await transport.send_text("alert")
+
+    assert caught.value.status_code == 429
+    assert len(client.calls) == 4
+    assert waits == [1, 2, 4]
+
+
+@pytest.mark.asyncio
+async def test_consecutive_sends_wait_for_minimum_interval():
+    now = 0.0
+    waits: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal now
+        waits.append(seconds)
+        now += seconds
+
+    client = FakeClient()
+    transport = TelegramTransport(
+        "secret-token",
+        "chat",
+        client=client,  # type: ignore[arg-type]
+        sleep=fake_sleep,
+        clock=lambda: now,
+    )
+
+    await transport.send_text("first")
+    await transport.send_text("second")
+
+    assert waits == [3]
