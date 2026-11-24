@@ -152,3 +152,30 @@ async def test_httpx_failures_have_sanitized_error_kinds(error, error_kind):
     assert caught.value.status_code is None
     assert "secret" not in str(caught.value)
     assert "api.telegram.org" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_sent_requests_never_log_the_bot_token(caplog):
+    import logging
+
+    import httpx
+
+    from radar.alerts.telegram import TelegramTransport
+
+    token = "123456:SECRET-token-value"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    logging.getLogger("httpx").setLevel(logging.NOTSET)
+    caplog.set_level(logging.DEBUG)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = TelegramTransport(token, "42", client=client)
+    try:
+        await transport.send_text("hello")
+    finally:
+        await client.aclose()
+
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+    assert token not in caplog.text
+    assert "/bot" not in caplog.text

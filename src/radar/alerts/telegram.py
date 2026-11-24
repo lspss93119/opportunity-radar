@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 
 import httpx
@@ -10,6 +11,18 @@ TELEGRAM_HTTP_TIMEOUT = httpx.Timeout(
     write=30.0,
     pool=10.0,
 )
+
+
+# httpx logs every request URL at INFO, and Telegram puts the bot token in the
+# URL path. Request logging is raised to WARNING wherever a transport exists.
+_REQUEST_LOGGERS = ("httpx", "httpcore")
+
+
+def _silence_request_logging() -> None:
+    for name in _REQUEST_LOGGERS:
+        logger = logging.getLogger(name)
+        if logger.getEffectiveLevel() < logging.WARNING:
+            logger.setLevel(logging.WARNING)
 
 
 class TelegramTransportError(RuntimeError):
@@ -30,6 +43,7 @@ class TelegramTransport:
     ) -> None:
         if not bot_token:
             raise ValueError("bot_token must be non-empty")
+        _silence_request_logging()
         self._bot_token = bot_token
         self._chat_id = str(chat_id)
         self._owns_client = client is None
