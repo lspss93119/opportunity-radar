@@ -15,9 +15,6 @@ from radar.state import RadarState
 from radar.storage.sqlite import SQLiteRuntimeStore
 
 from radar.monitors.spread.basis import (
-    EXPECTED_INTERVAL_SECONDS,
-    MIN_HISTORY_OBSERVATIONS,
-    ROLLING_WINDOW_SECONDS,
     RollingBasis,
     RollingBasisMutation,
     RollingBasisStats,
@@ -29,13 +26,12 @@ from radar.monitors.spread.models import (
     build_spread_candidates,
     parse_price_source,
     spread_by_size,
-    LIVE_QUOTE_MAX_AGE_SECONDS,
-    LIVE_QUOTE_MAX_SKEW_SECONDS,
 )
 
 UTC = timezone.utc
 OpportunityEvent = tuple[str, str, object, datetime]
 
+# Defaults for monitors.spread.basis (kept for callers that import them).
 BASIS_STD_MAX_BPS = 3.0
 BASIS_DEVIATION_MIN_BPS = 15.0
 BASIS_PERSISTENCE_SECONDS = 60
@@ -100,12 +96,37 @@ class SpreadMonitor:
         runtime_store: SQLiteRuntimeStore | None = None,
         market_identities: Collection[tuple[str, str, str]] | None = None,
         market_sample_seconds: Mapping[tuple[str, str, str], int] | None = None,
-        basis_window_seconds: int = ROLLING_WINDOW_SECONDS,
-        basis_min_observations: int = MIN_HISTORY_OBSERVATIONS,
-        basis_expected_interval_seconds: int = EXPECTED_INTERVAL_SECONDS,
-        live_quote_max_age_seconds: float = LIVE_QUOTE_MAX_AGE_SECONDS,
-        live_quote_max_skew_seconds: float = LIVE_QUOTE_MAX_SKEW_SECONDS,
+        basis_window_seconds: int | None = None,
+        basis_min_observations: int | None = None,
+        basis_expected_interval_seconds: int | None = None,
+        live_quote_max_age_seconds: float | None = None,
+        live_quote_max_skew_seconds: float | None = None,
     ) -> None:
+        # Explicit arguments win (tests, replays); otherwise the config applies.
+        basis = config.basis
+        basis_window_seconds = (
+            basis.window_seconds if basis_window_seconds is None else basis_window_seconds
+        )
+        basis_min_observations = (
+            basis.min_observations
+            if basis_min_observations is None
+            else basis_min_observations
+        )
+        basis_expected_interval_seconds = (
+            basis.expected_interval_seconds
+            if basis_expected_interval_seconds is None
+            else basis_expected_interval_seconds
+        )
+        live_quote_max_age_seconds = (
+            config.live_quote_max_age_seconds
+            if live_quote_max_age_seconds is None
+            else live_quote_max_age_seconds
+        )
+        live_quote_max_skew_seconds = (
+            config.live_quote_max_skew_seconds
+            if live_quote_max_skew_seconds is None
+            else live_quote_max_skew_seconds
+        )
         self.interval_seconds = config.interval_seconds
         self.config = config
         self._fees_bps = dict(fees_bps)
@@ -366,7 +387,7 @@ class SpreadMonitor:
                 if episode_stats.mean_bps is None or episode_stats.std_bps is None:
                     continue
                 deviation = current_candidate.raw_spread_bps - episode_stats.mean_bps
-                if deviation < BASIS_DEVIATION_MIN_BPS:
+                if deviation < self.config.basis.deviation_min_bps:
                     self._resolve_episode(
                         key,
                         current_time,
@@ -381,8 +402,8 @@ class SpreadMonitor:
                     continue
                 deviation = candidate.raw_spread_bps - stats.mean_bps
                 stable_condition = (
-                    stats.std_bps <= BASIS_STD_MAX_BPS
-                    and deviation >= BASIS_DEVIATION_MIN_BPS
+                    stats.std_bps <= self.config.basis.std_max_bps
+                    and deviation >= self.config.basis.deviation_min_bps
                 )
                 episode = self._episodes.get(key)
                 if episode is None:
@@ -578,7 +599,7 @@ class SpreadMonitor:
             return False
         return (
             now - episode.alert_condition_since
-            >= timedelta(seconds=BASIS_PERSISTENCE_SECONDS)
+            >= timedelta(seconds=self.config.basis.persistence_seconds)
         )
 
     @staticmethod

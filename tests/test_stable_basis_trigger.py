@@ -305,3 +305,65 @@ async def test_alerted_episode_survives_restart_without_duplicate_alert(tmp_path
         )
 
     assert alerts == []
+
+
+def test_basis_config_defaults_equal_previous_constants():
+    from radar.monitors.spread import basis as basis_module
+    from radar.monitors.spread import models as models_module
+    from radar.monitors.spread import monitor as monitor_module
+
+    config = SpreadMonitorConfig()
+    assert config.basis.window_seconds == basis_module.ROLLING_WINDOW_SECONDS
+    assert config.basis.min_observations == basis_module.MIN_HISTORY_OBSERVATIONS
+    assert config.basis.expected_interval_seconds == basis_module.EXPECTED_INTERVAL_SECONDS
+    assert config.basis.deviation_min_bps == monitor_module.BASIS_DEVIATION_MIN_BPS
+    assert config.basis.std_max_bps == monitor_module.BASIS_STD_MAX_BPS
+    assert config.basis.persistence_seconds == monitor_module.BASIS_PERSISTENCE_SECONDS
+    assert config.live_quote_max_age_seconds == models_module.LIVE_QUOTE_MAX_AGE_SECONDS
+    assert config.live_quote_max_skew_seconds == models_module.LIVE_QUOTE_MAX_SKEW_SECONDS
+
+
+def test_monitor_reads_basis_and_live_limits_from_config_when_not_overridden():
+    config = SpreadMonitorConfig.model_validate(
+        {
+            "basis": {"window_seconds": 7200, "min_observations": 576},
+            "live_quote_max_age_seconds": 1.5,
+            "live_quote_max_skew_seconds": 0.8,
+        }
+    )
+    instance = SpreadMonitor(config, {})
+    basis = instance._new_basis()
+
+    assert (basis.window_seconds, basis.min_observations) == (7200, 576)
+    assert instance._live_quote_max_age_seconds == 1.5
+    assert instance._live_quote_max_skew_seconds == 0.8
+
+
+@pytest.mark.asyncio
+async def test_configured_deviation_threshold_controls_the_trigger():
+    # The default 15 bps alerts on this ~20.8 bps deviation (see above).
+    instance = monitor(basis={"deviation_min_bps": 25.0})
+    seed(instance, [9.0] * 600)
+
+    for offset in range(0, 130, 10):
+        assert await instance.evaluate(
+            NOW + timedelta(seconds=offset),
+            state_for(NOW + timedelta(seconds=offset), 30.0),
+        ) == []
+
+
+@pytest.mark.asyncio
+async def test_configured_persistence_controls_alert_timing():
+    instance = monitor(basis={"persistence_seconds": 30})
+    seed(instance, [9.0] * 600)
+
+    for offset in range(0, 30, 10):
+        assert await instance.evaluate(
+            NOW + timedelta(seconds=offset),
+            state_for(NOW + timedelta(seconds=offset), 30.0),
+        ) == []
+    alerts = await instance.evaluate(
+        NOW + timedelta(seconds=30), state_for(NOW + timedelta(seconds=30), 30.0)
+    )
+    assert len(alerts) == 1
+    assert alerts[0].payload["signal_duration_seconds"] == 30

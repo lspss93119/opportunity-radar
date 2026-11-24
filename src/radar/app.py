@@ -883,6 +883,7 @@ def build_application(
         history_points = history.load_recent_pair_points(
             primary_size_usd=config.monitors.spread.primary_size_usd,
             as_of=clock(),
+            window=timedelta(seconds=config.monitors.spread.basis.window_seconds),
             stale_after_seconds=config.monitors.spread.stale_after_seconds,
             rfq_stale_after_seconds=config.monitors.spread.rfq_stale_after_seconds,
         )
@@ -890,6 +891,7 @@ def build_application(
         history_points = history.load_recent_pair_points(
             primary_size_usd=config.monitors.spread.primary_size_usd,
             as_of=clock(),
+            window=timedelta(seconds=config.monitors.spread.basis.window_seconds),
         )
     for monitor in monitors:
         if monitor.name != "spread":

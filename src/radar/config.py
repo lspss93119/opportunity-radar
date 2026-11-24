@@ -142,6 +142,23 @@ class ManualOpportunityConfig(BaseModel):
     telegram_rearm_quiet_seconds: int = Field(default=300, ge=0)
 
 
+class BasisConfig(BaseModel):
+    """Rolling-basis trigger for the legacy spread episode lifecycle.
+
+    Defaults equal the previous hard-coded values, so omitting this block
+    keeps behaviour unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    window_seconds: int = Field(default=24 * 60 * 60, gt=0)
+    min_observations: int = Field(default=6_912, gt=0)
+    expected_interval_seconds: int = Field(default=10, gt=0)
+    deviation_min_bps: float = Field(default=15.0, ge=0, allow_inf_nan=False)
+    std_max_bps: float = Field(default=3.0, ge=0, allow_inf_nan=False)
+    persistence_seconds: int = Field(default=60, ge=0)
+
+
 class SpreadMonitorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -158,6 +175,10 @@ class SpreadMonitorConfig(BaseModel):
     stale_after_seconds: int = Field(default=30, gt=0)
     # RFQ venues (Variational) refresh quotes about once a minute.
     rfq_stale_after_seconds: int = Field(default=120, gt=0)
+    # Live pairs need both book legs this fresh and this close in time.
+    live_quote_max_age_seconds: float = Field(default=3.0, gt=0, allow_inf_nan=False)
+    live_quote_max_skew_seconds: float = Field(default=3.0, ge=0, allow_inf_nan=False)
+    basis: BasisConfig = Field(default_factory=BasisConfig)
     anomaly_v2: AnomalyV2Config = Field(default_factory=AnomalyV2Config)
 
 
