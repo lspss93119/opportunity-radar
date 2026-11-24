@@ -1364,7 +1364,13 @@ def test_main_configures_info_logging(monkeypatch, tmp_path):
             str(tmp_path / "radar.yaml"),
         ]
     ) == 0
-    assert logging_calls == [{"level": logging.INFO}]
+    assert logging_calls == [
+        {
+            "level": logging.INFO,
+            "format": app_module.LOG_FORMAT,
+            "datefmt": app_module.LOG_DATE_FORMAT,
+        }
+    ]
 
 
 def test_current_rss_bytes_reads_lightweight_process_rss(monkeypatch):

@@ -210,10 +210,14 @@ class FundingMonitorConfig(BaseModel):
     enabled: bool = False
     interval_seconds: int = Field(default=60, gt=0)
     primary_size_usd: Literal[1000, 5000, 10000] = 1000
-    # Funding older than this is not compared (context polls run every ~5 min).
-    stale_after_seconds: int = Field(default=900, gt=0)
+    # Funding older than this is not compared (context polls run every 15 min).
+    stale_after_seconds: int = Field(default=1800, gt=0)
     spike_net_apr: float = Field(default=1.0, gt=0, allow_inf_nan=False)
-    spike_min_samples: int = Field(default=2, ge=1)
+    # Only what is paid counts: a spike period is judged on rates observed in
+    # the last ``spike_settlement_window_seconds`` before the pair settles, and
+    # must hold for ``spike_min_periods`` consecutive settlements.
+    spike_min_periods: int = Field(default=2, ge=1)
+    spike_settlement_window_seconds: int = Field(default=1200, gt=0, le=3600)
     carry_avg_net_apr: float = Field(default=0.15, gt=0, allow_inf_nan=False)
     carry_window_hours: float = Field(default=24, gt=0, le=72, allow_inf_nan=False)
     # Carry is held for days: expected funding over this holding period must
@@ -236,7 +240,7 @@ class RadarConfig(BaseModel):
 
     sampling_seconds: int = Field(default=10, gt=0)
     # Funding/OI/volume refresh period; venues settle hourly, so it must divide 1h.
-    context_poll_seconds: int = Field(default=300, ge=60, le=3600)
+    context_poll_seconds: int = Field(default=900, ge=60, le=3600)
     # Minimum gap between Hyperliquid websocket reconnects across all of this
     # process's HL feeds; Hyperliquid refuses new sockets past a per-IP limit.
     hyperliquid_reconnect_spacing_seconds: float = Field(

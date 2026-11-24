@@ -1096,3 +1096,88 @@ async def test_feed_waits_for_shared_budget_before_reconnecting():
         await feed.stop()
     # 1s backoff, then the second reconnect waits out the 10s spacing.
     assert delays[:3] == [1.0, 1.0, pytest.approx(9.0)]
+
+
+class NoCloseFrameWebSocket(FixtureWebSocket):
+    """Closing locally ends reads with ConnectionClosedError, as when the peer
+    never answers the close frame (``sent 1000 (OK); no close frame received``)."""
+
+    async def __anext__(self) -> str:
+        self.read_calls += 1
+        message = await self._queue.get()
+        if message is None:
+            import websockets
+
+            raise websockets.exceptions.ConnectionClosedError(None, None)
+        return message
+
+
+@pytest.mark.asyncio
+async def test_watchdog_close_without_close_frame_is_not_a_collector_error(caplog):
+    first = NoCloseFrameWebSocket(
+        [l2_book_message("BTC", bids=((99.0, 1.0),), asks=((101.0, 1.0),))]
+    )
+    second = FixtureWebSocket([])
+    connections = [first, second]
+    second_connected = asyncio.Event()
+    failures: list[tuple[str, Exception]] = []
+
+    def connect(_url: str, **_kwargs: object):
+        websocket = connections.pop(0)
+        if websocket is second:
+            second_connected.set()
+        return websocket
+
+    feed = HyperliquidOrderBookFeed(
+        "wss://test.invalid/ws",
+        ["BTC"],
+        connect=connect,
+        l2_silence_timeout_seconds=0.01,
+        reconnect_delay_seconds=0,
+        error_handler=lambda venue, error: failures.append((venue, error)),
+    )
+    caplog.set_level("INFO", logger="radar.collectors.hyperliquid")
+    await feed.start()
+    try:
+        await asyncio.wait_for(second_connected.wait(), timeout=1)
+    finally:
+        await feed.stop()
+
+    assert failures == []
+    assert "reason=l2_silence_timeout" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unexpected_connection_close_is_still_reported():
+    class DroppedWebSocket(FixtureWebSocket):
+        async def __anext__(self) -> str:
+            import websockets
+
+            raise websockets.exceptions.ConnectionClosedError(None, None)
+
+    second = FixtureWebSocket([])
+    connections = [DroppedWebSocket([]), second]
+    second_connected = asyncio.Event()
+    failures: list[tuple[str, Exception]] = []
+
+    def connect(_url: str, **_kwargs: object):
+        websocket = connections.pop(0)
+        if websocket is second:
+            second_connected.set()
+        return websocket
+
+    feed = HyperliquidOrderBookFeed(
+        "wss://test.invalid/ws",
+        ["BTC"],
+        connect=connect,
+        reconnect_delay_seconds=0,
+        error_handler=lambda venue, error: failures.append((venue, error)),
+    )
+    await feed.start()
+    try:
+        await asyncio.wait_for(second_connected.wait(), timeout=1)
+    finally:
+        await feed.stop()
+    assert [type(error).__name__ for _venue, error in failures] == [
+        "ConnectionClosedError"
+    ]

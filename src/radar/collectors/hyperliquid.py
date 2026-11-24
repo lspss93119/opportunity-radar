@@ -116,6 +116,9 @@ class _HyperliquidSession:
     )
     coin_silent: set[str] = field(default_factory=set)
     resubscribed_at_monotonic: float | None = None
+    # Set when the silence watchdog closes the socket itself: the peer often
+    # never answers the close frame, which is expected rather than an error.
+    closed_by_watchdog: bool = False
 
 
 def parse_hyperliquid_meta_and_asset_ctxs(
@@ -391,8 +394,13 @@ class HyperliquidOrderBookFeed:
             session.disconnect_reason = "shutdown"
             raise
         except Exception as error:  # noqa: BLE001
-            session.disconnect_reason = f"{type(error).__name__}: {error}"
-            report_collector_error(self._error_handler, self._venue, error)
+            if session.closed_by_watchdog and isinstance(
+                error, websockets.exceptions.ConnectionClosed
+            ):
+                session.disconnect_reason = "l2_silence_timeout"
+            else:
+                session.disconnect_reason = f"{type(error).__name__}: {error}"
+                report_collector_error(self._error_handler, self._venue, error)
         finally:
             tasks = tuple(
                 task
@@ -515,6 +523,7 @@ class HyperliquidOrderBookFeed:
                     elapsed,
                 )
                 assert websocket is not None
+                session.closed_by_watchdog = True
                 await websocket.close()
                 return
             activity_event.clear()

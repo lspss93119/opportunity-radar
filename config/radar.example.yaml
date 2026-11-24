@@ -1,6 +1,6 @@
 sampling_seconds: 10
 # Funding, OI and 24h-volume refresh period (must divide 3600).
-context_poll_seconds: 300
+context_poll_seconds: 900
 
 fees_bps:
   lighter: 0.0
@@ -763,9 +763,12 @@ monitors:
     enabled: true
     interval_seconds: 60
     primary_size_usd: 1000
-    stale_after_seconds: 900
+    stale_after_seconds: 1800
     spike_net_apr: 1.0
-    spike_min_samples: 2
+    # Spikes are judged on rates seen in the last 20 min before settlement and
+    # must hold for 2 consecutive settlements; one alert per symbol at a time.
+    spike_min_periods: 2
+    spike_settlement_window_seconds: 1200
     carry_avg_net_apr: 0.15
     carry_window_hours: 24
     carry_horizon_hours: 168

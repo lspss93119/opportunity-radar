@@ -544,8 +544,9 @@ def test_disabled_ondo_market_does_not_require_fee():
     assert RadarConfig(markets=[market]).fees_bps == {}
 
 
-def test_context_poll_defaults_to_five_minutes_and_must_divide_hour():
-    assert RadarConfig().context_poll_seconds == 300
+def test_context_poll_defaults_to_fifteen_minutes_and_must_divide_hour():
+    # Funding settles hourly at most; 15 min still lands a :45 pre-settlement poll.
+    assert RadarConfig().context_poll_seconds == 900
     assert RadarConfig(context_poll_seconds=600).context_poll_seconds == 600
     for invalid in (30, 420, 7200):
         with pytest.raises(ValidationError):

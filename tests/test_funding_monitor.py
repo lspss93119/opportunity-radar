@@ -10,7 +10,13 @@ from radar.collectors.base import CollectorBatch
 from radar.collectors.variational import variational_funding_snapshot
 from radar.config import FundingMonitorConfig
 from radar.history.funding import load_recent_funding_points
-from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot, QuotedMarketSnapshot
+from radar.models import (
+    FundingSnapshot,
+    HourlyContext,
+    MarketSnapshot,
+    QuotedMarketSnapshot,
+)
+from radar.monitors.base import AlertRequest
 from radar.monitors.funding import CARRY, SPIKE, FeedHistory, FundingMonitor
 from radar.pipeline import MarketDataPipeline
 from radar.state import RadarState
@@ -117,42 +123,195 @@ def test_feed_window_is_time_weighted_and_counts_gaps():
     assert window.mean_apr == pytest.approx((0.10 + 0.30 * 2) / 3)
 
 
-@pytest.mark.asyncio
-async def test_spike_needs_consecutive_new_samples_and_alerts_once():
-    funding_monitor = monitor(carry_avg_net_apr=10.0)  # isolate the spike rule
-    first = NOW
-    # Long Hyperliquid pays -20 APR (longs receive), short Var pays +5: net +25.
-    assert kinds(await funding_monitor.evaluate(first, state_at(first, -20.0, 5.0))) == []
-    # Re-evaluating the same funding sample is not a new sample.
-    assert kinds(await funding_monitor.evaluate(first + timedelta(seconds=60), state_at(first, -20.0, 5.0))) == []
+def settling(hour: int, minute: int = 45) -> datetime:
+    """A moment ``hour`` hours after NOW, inside the pre-settlement window by default."""
+    return NOW + timedelta(hours=hour, minutes=minute)
 
-    second = NOW + timedelta(minutes=5)
+
+@pytest.mark.asyncio
+async def test_spike_counts_consecutive_settlements_and_alerts_once():
+    funding_monitor = monitor(carry_avg_net_apr=10.0)  # isolate the spike rule
+    # Long Hyperliquid pays -20 APR (longs receive), short Var pays +5: net +25.
+    first = settling(0)  # 12:45, settles 13:00
+    assert (
+        kinds(await funding_monitor.evaluate(first, state_at(first, -20.0, 5.0))) == []
+    )
+    # Another sample in the same window is the same settlement, not a new period.
+    again = first + timedelta(minutes=10)
+    assert (
+        kinds(await funding_monitor.evaluate(again, state_at(again, -20.0, 5.0))) == []
+    )
+
+    second = settling(1)  # 13:45, settles 14:00
     alerts = await funding_monitor.evaluate(second, state_at(second, -20.0, 5.0))
     assert kinds(alerts) == [SPIKE]
     payload = next(a.payload for a in alerts if a.payload["long_venue"] == "hyperliquid")
     assert payload["net_apr"] == pytest.approx(25.0)
-    assert payload["spike_samples"] == 2
+    assert payload["spike_periods"] == 2
+    assert alerts[0].event_id.endswith(":funding_spike:2026-11-23T14:00:00+00:00")
 
-    third = NOW + timedelta(minutes=10)
-    assert kinds(await funding_monitor.evaluate(third, state_at(third, -20.0, 5.0))) == []
+    third = settling(2)
+    assert (
+        kinds(await funding_monitor.evaluate(third, state_at(third, -20.0, 5.0))) == []
+    )
     # The reverse direction pays the spread, so it never alerts.
     assert kinds(alerts, long_venue="variational") == []
 
 
 @pytest.mark.asyncio
+async def test_spike_ignores_intra_interval_estimates():
+    funding_monitor = monitor(carry_avg_net_apr=10.0)
+    for hour in range(3):
+        # Huge mid-hour estimates, but back to normal right before settlement.
+        for minute in (0, 15, 30):
+            at = settling(hour, minute)
+            assert (
+                kinds(await funding_monitor.evaluate(at, state_at(at, -20.0, 5.0)))
+                == []
+            )
+        at = settling(hour)
+        assert kinds(await funding_monitor.evaluate(at, state_at(at, 0.0, 0.0))) == []
+    assert all(pair.streak == 0 for pair in funding_monitor._pairs.values())
+
+
+@pytest.mark.asyncio
+async def test_spike_streak_resets_on_a_skipped_or_low_settlement():
+    funding_monitor = monitor(carry_avg_net_apr=10.0)
+    await funding_monitor.evaluate(settling(0), state_at(settling(0), -20.0, 5.0))
+    # No pre-settlement sample for 14:00; the next one seen is mid-hour 14:10.
+    mid = settling(2, 10)
+    await funding_monitor.evaluate(mid, state_at(mid, -20.0, 5.0))
+    assert (
+        kinds(
+            await funding_monitor.evaluate(
+                settling(2), state_at(settling(2), -20.0, 5.0)
+            )
+        )
+        == []
+    )
+
+    low = monitor(carry_avg_net_apr=10.0)
+    for hour, net in enumerate((25.0, 0.0, 25.0)):
+        at = settling(hour)
+        assert kinds(await low.evaluate(at, state_at(at, -net, 0.0))) == []
+
+
+@pytest.mark.asyncio
 async def test_spike_rearms_only_after_staying_below_threshold():
-    funding_monitor = monitor(carry_avg_net_apr=10.0, rearm_seconds=600)
-    times = [NOW + timedelta(minutes=5 * step) for step in range(8)]
-    aprs = [25, 25, 0, 25, 0, 0, 0, 25]  # net APR per sample (alert at step 1 and 7 only)
+    quiet = monitor(carry_avg_net_apr=10.0, rearm_seconds=7_200)
     fired = []
-    for at, net in zip(times, aprs):
-        alerts = await funding_monitor.evaluate(at, state_at(at, -float(net), 0.0))
-        fired.append(SPIKE in kinds(alerts))
-    # Step 3's spike follows only 5 min below threshold: still inside rearm.
-    assert fired == [False, True, False, False, False, False, False, False]
-    eighth = NOW + timedelta(minutes=40)
-    alerts = await funding_monitor.evaluate(eighth, state_at(eighth, -25.0, 0.0))
-    assert SPIKE in kinds(alerts)
+    for hour, net in enumerate((25, 25, 0, 25, 25)):
+        at = settling(hour)
+        fired.append(
+            SPIKE in kinds(await quiet.evaluate(at, state_at(at, -float(net), 0.0)))
+        )
+    # One hour below threshold is shorter than the 2h rearm: no second alert.
+    assert fired == [False, True, False, False, False]
+
+    rearmed = monitor(carry_avg_net_apr=10.0, rearm_seconds=3_600)
+    fired = []
+    for hour, net in enumerate((25, 25, 0, 0, 25, 25)):
+        at = settling(hour)
+        fired.append(
+            SPIKE in kinds(await rearmed.evaluate(at, state_at(at, -float(net), 0.0)))
+        )
+    assert fired == [False, True, False, False, False, True]
+
+
+def snapshot(venue, apr, at, *, interval=3600, settles=None, symbol="ACE"):
+    return FundingSnapshot(
+        effective_time=at,
+        observed_at=at,
+        venue=venue,
+        venue_symbol=symbol,
+        canonical_symbol=symbol,
+        funding_rate=apr * interval / (365 * 24 * 3600),
+        interval_seconds=interval,
+        next_funding_time=settles,
+        rate_kind="predicted",
+    )
+
+
+def funding_state(at, *snapshots):
+    state = RadarState()
+    state.apply_context_batch(CollectorBatch(funding_snapshots=snapshots))
+    return state
+
+
+@pytest.mark.asyncio
+async def test_longer_interval_leg_sets_the_settlement_period():
+    """Hyperliquid pays hourly but Variational every 8h: only 8h settlements count."""
+    funding_monitor = monitor(carry_avg_net_apr=10.0)
+    eight_hourly = [
+        datetime(2026, 11, 23, 16, tzinfo=UTC),
+        datetime(2026, 11, 24, 0, tzinfo=UTC),
+    ]
+
+    def state(at, var_settles):
+        hl_settles = at.replace(minute=0, second=0) + timedelta(hours=1)
+        return funding_state(
+            at,
+            snapshot("hyperliquid", -20.0, at, settles=hl_settles),
+            snapshot("variational", 5.0, at, interval=28_800, settles=var_settles),
+        )
+
+    fired = []
+    for at, var_settles in (
+        (datetime(2026, 11, 23, 15, 45, tzinfo=UTC), eight_hourly[0]),
+        # Hourly pre-settlement samples between Var settlements do not count.
+        *(
+            (datetime(2026, 11, 23, hour, 45, tzinfo=UTC), eight_hourly[1])
+            for hour in range(16, 23)
+        ),
+        (datetime(2026, 11, 23, 23, 45, tzinfo=UTC), eight_hourly[1]),
+    ):
+        fired.append(
+            SPIKE in kinds(await funding_monitor.evaluate(at, state(at, var_settles)))
+        )
+    assert fired == [False] * 8 + [True]
+
+
+@pytest.mark.asyncio
+async def test_one_spike_alert_per_symbol_lists_other_pairs():
+    funding_monitor = FundingMonitor(
+        FundingMonitorConfig(enabled=True, carry_avg_net_apr=10.0),
+        FEES,
+        spread_stale_after_seconds=30,
+        rfq_stale_after_seconds=120,
+    )
+
+    def state(at, hl_apr):
+        settles = at.replace(minute=0, second=0) + timedelta(hours=1)
+        return funding_state(
+            at,
+            snapshot("hyperliquid", hl_apr, at, settles=settles),
+            snapshot("variational", 5.0, at, settles=settles),
+            snapshot("lighter", 10.0, at, settles=settles),
+        )
+
+    await funding_monitor.evaluate(settling(0), state(settling(0), -20.0))
+    alerts = await funding_monitor.evaluate(settling(1), state(settling(1), -20.0))
+
+    spikes = [a for a in alerts if a.payload["kind"] == SPIKE]
+    assert len(spikes) == 1
+    lead = spikes[0].payload
+    # HL->lighter (+30) leads; HL->Var (+25) and Var->lighter (+5) are listed.
+    assert (lead["long_venue"], lead["short_venue"]) == ("hyperliquid", "lighter")
+    assert sorted(o["net_apr"] for o in lead["other_pairs"]) == pytest.approx(
+        [5.0, 25.0]
+    )
+    message = format_funding_alert(spikes[0])
+    assert "同時達標的其他配對（2）" in message
+    assert "做多 Hyperliquid / 做空 Variational: 淨 APR +2500.00%" in message
+
+    # While the symbol's spike is active, a newly qualifying pair stays quiet.
+    hotter = settling(2)
+    await funding_monitor.evaluate(hotter, state(hotter, -40.0))
+    assert [
+        a
+        for a in await funding_monitor.evaluate(settling(3), state(settling(3), -40.0))
+        if a.payload["kind"] == SPIKE
+    ] == []
 
 
 def seeded(funding_monitor: FundingMonitor, long_apr: float, short_apr: float, hours: int = 24):
@@ -241,26 +400,28 @@ async def test_stale_funding_fails_closed():
 async def test_alerted_state_survives_restart(tmp_path):
     store = SQLiteRuntimeStore(tmp_path / "runtime.sqlite3")
     first = monitor(store, carry_avg_net_apr=10.0)
-    for step in range(2):
-        at = NOW + timedelta(minutes=5 * step)
-        await first.evaluate(at, state_at(at, -20.0, 5.0))
+    for hour in range(2):
+        at = settling(hour)
+        alerts = await first.evaluate(at, state_at(at, -20.0, 5.0))
+    assert SPIKE in kinds(alerts)
 
     restarted = monitor(store, carry_avg_net_apr=10.0)
-    at = NOW + timedelta(minutes=10)
+    at = settling(2)
     assert kinds(await restarted.evaluate(at, state_at(at, -20.0, 5.0))) == []
+    assert restarted._pairs["ACE|hyperliquid|ACE|variational|ACE"].streak == 3
     store.close()
 
 
 @pytest.mark.asyncio
 async def test_alert_payload_and_message_cover_required_context():
     funding_monitor = monitor(carry_avg_net_apr=10.0)
-    for step in range(2):
-        at = NOW + timedelta(minutes=5 * step)
+    for hour in range(2):
+        at = settling(hour)
         alerts = await funding_monitor.evaluate(at, state_at(at, -20.0, 5.0))
     alert = next(a for a in alerts if a.payload["long_venue"] == "hyperliquid")
     payload = alert.payload
 
-    assert payload["long_funding"]["next_funding_time"] == "2026-11-23T13:00:00+00:00"
+    assert payload["long_funding"]["next_funding_time"] == "2026-11-23T14:00:00+00:00"
     assert payload["long_market"]["open_interest_usd"] == pytest.approx(100_000.0)
     assert payload["short_market"]["long_open_interest_usd"] == 120_000.0
     assert payload["short_market"]["price_source"] == "rfq"
@@ -269,7 +430,8 @@ async def test_alert_payload_and_message_cover_required_context():
     assert message.startswith("資金費飆升 | ACE")
     assert "做空: Variational ［RFQ 報價］ (ACE)" in message
     assert "淨 APR: +2500.00%" in message
-    assert "下次結算 11-23 13:00 UTC" in message
+    assert "下次結算 11-23 14:00 UTC" in message
+    assert "淨 APR: +2500.00%（結算前，連續 2 個結算期）" in message
     assert "多方 OI $120k / 空方 OI $80k" in message
     assert "來回成本: +28.99 bps" in message
 
@@ -283,8 +445,8 @@ async def test_router_sends_funding_alerts_through_telegram():
             sent.append(text)
 
     funding_monitor = monitor(carry_avg_net_apr=10.0)
-    for step in range(2):
-        at = NOW + timedelta(minutes=5 * step)
+    for hour in range(2):
+        at = settling(hour)
         alerts = await funding_monitor.evaluate(at, state_at(at, -20.0, 5.0))
     router = AlertRouter(object(), object(), FundingAlertProcessor(Telegram()))  # type: ignore[arg-type]
     await router.process(alerts[0])
@@ -382,8 +544,8 @@ async def test_spike_ignores_pairs_with_a_settled_leg():
         )
         return state
 
-    for step in range(3):
-        at = NOW + timedelta(minutes=5 * step)
+    for hour in range(3):
+        at = settling(hour)
         assert kinds(await funding_monitor.evaluate(at, lagged_state(at))) == []
 
 
@@ -401,3 +563,35 @@ async def test_carry_still_uses_settled_legs():
         )
     )
     assert CARRY in kinds(await funding_monitor.evaluate(NOW, state))
+
+
+def test_funding_cadence_defaults_follow_hourly_settlement():
+    from pydantic import ValidationError
+
+    from radar.config import RadarConfig
+
+    config = FundingMonitorConfig()
+    assert (config.stale_after_seconds, config.spike_min_periods) == (1800, 2)
+    assert config.spike_settlement_window_seconds == 1200
+    assert RadarConfig().context_poll_seconds == 900
+    with pytest.raises(ValidationError):
+        FundingMonitorConfig(spike_min_samples=2)
+
+
+def test_legacy_spike_payload_still_formats():
+    alert = AlertRequest(
+        monitor="funding",
+        event_id="legacy",
+        created_at=NOW,
+        payload={
+            "kind": SPIKE,
+            "canonical_symbol": "ACE",
+            "long_venue": "hyperliquid",
+            "long_venue_symbol": "ACE",
+            "short_venue": "variational",
+            "short_venue_symbol": "ACE",
+            "net_apr": 2.0,
+            "spike_samples": 3,
+        },
+    )
+    assert "（連續 3 次採樣）" in format_funding_alert(alert)

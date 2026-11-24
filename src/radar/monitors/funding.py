@@ -3,10 +3,15 @@
 For every canonical symbol and ordered venue pair (long A, short B), the net
 funding APR is ``APR_B - APR_A``: positive means the hedged pair is paid.
 
-* Spike: the current net APR stays at or above ``spike_net_apr`` for at least
-  ``spike_min_samples`` consecutive funding samples. Both legs must report the
-  rate accruing now ("predicted"): a settled rate can lag a moving market by
-  up to an interval, which would show a differential that does not exist.
+* Spike: only funding that is actually paid counts. Intra-interval rates are
+  running estimates, so a settlement period is judged on rates observed in
+  the last ``spike_settlement_window_seconds`` before the pair settles (the
+  later of the two legs' next settlements, i.e. the longer interval). The net
+  APR must be at or above ``spike_net_apr`` for ``spike_min_periods``
+  consecutive settlements. Both legs must report the rate accruing now
+  ("predicted"): a settled rate can lag a moving market by up to an interval,
+  which would show a differential that does not exist. At most one spike
+  alert per symbol is active; pairs that qualify together are listed in it.
 * Carry: the time-weighted net APR over ``carry_window_hours`` is at least
   ``carry_avg_net_apr`` and the expected funding over ``carry_horizon_hours``
   exceeds the current $-sized round-trip cost.
@@ -179,6 +184,32 @@ def _pair_id(long_key: FeedKey, short_key: FeedKey) -> str:
     return "|".join((long_key[2], *long_key[:2], *short_key[:2]))
 
 
+def _symbol_of(pair_id: str) -> str:
+    return pair_id.split("|", 1)[0]
+
+
+def _settlement(snapshot: FundingSnapshot) -> datetime:
+    """Next settlement of one leg; falls back to the next interval boundary."""
+    if snapshot.next_funding_time is not None:
+        return snapshot.next_funding_time.astimezone(UTC)
+    interval = max(1, int(snapshot.interval_seconds or 3600))
+    epoch = int(snapshot.observed_at.timestamp())
+    return datetime.fromtimestamp((epoch // interval + 1) * interval, UTC)
+
+
+def pair_settlement(
+    long_funding: FundingSnapshot, short_funding: FundingSnapshot
+) -> tuple[datetime, timedelta]:
+    """The pair settles when the longer-interval leg pays; period is that interval."""
+    period = max(
+        int(long_funding.interval_seconds or 3600),
+        int(short_funding.interval_seconds or 3600),
+    )
+    return max(_settlement(long_funding), _settlement(short_funding)), timedelta(
+        seconds=period
+    )
+
+
 class FundingMonitor:
     name = "funding"
     state_key = "pairs"
@@ -271,6 +302,11 @@ class FundingMonitor:
         alerts: list[AlertRequest] = []
         seen: set[str] = set()
         changed = False
+        spiking_symbols = {
+            _symbol_of(pair_id)
+            for pair_id, pair in self._pairs.items()
+            if pair.alerted[SPIKE]
+        }
         for keys in by_symbol.values():
             for long_key in keys:
                 for short_key in keys:
@@ -306,6 +342,7 @@ class FundingMonitor:
                 del self._pairs[pair_id]
                 changed = True
 
+        alerts = _one_spike_per_symbol(alerts, spiking_symbols)
         if changed and self._runtime_store is not None:
             self._runtime_store.set_monitor_state(
                 self.name,
@@ -347,26 +384,11 @@ class FundingMonitor:
     ) -> tuple[list[AlertRequest], bool]:
         config = self.config
         net_apr = short_funding.apr - long_funding.apr
-        marker = max(long_funding.observed_at, short_funding.observed_at)
         pair = self._pairs.get(pair_id)
         is_new = pair is None
         if pair is None:
             pair = PairState()
-        changed = False
-        comparable = (
-            long_funding.rate_kind == "predicted"
-            and short_funding.rate_kind == "predicted"
-        )
-        if pair.last_marker != marker:
-            pair.last_marker = marker
-            if comparable and net_apr >= config.spike_net_apr:
-                if pair.streak == 0:
-                    pair.streak_started_at = marker
-                pair.streak += 1
-            else:
-                pair.streak = 0
-                pair.streak_started_at = None
-            changed = True
+        changed = self._update_spike_streak(pair, long_funding, short_funding, net_apr)
 
         long_window = self._feed_window(long_key, now)
         short_window = self._feed_window(short_key, now)
@@ -383,7 +405,7 @@ class FundingMonitor:
         expected_funding_bps = expected_apr * config.carry_horizon_hours / HOURS_PER_YEAR * 10_000
 
         conditions = {
-            SPIKE: pair.streak >= config.spike_min_samples,
+            SPIKE: pair.streak >= config.spike_min_periods,
             CARRY: avg_net_apr is not None
             and avg_net_apr >= config.carry_avg_net_apr
             and cost["round_trip_cost_bps"] is not None
@@ -439,6 +461,52 @@ class FundingMonitor:
             del self._pairs[pair_id]
             return alerts, True
         return alerts, changed
+
+    def _update_spike_streak(
+        self,
+        pair: PairState,
+        long_funding: FundingSnapshot,
+        short_funding: FundingSnapshot,
+        net_apr: float,
+    ) -> bool:
+        """Count consecutive settlements whose pre-settlement net APR is high.
+
+        ``last_marker`` holds the last settlement counted. Rates outside the
+        pre-settlement window leave the streak alone; a skipped settlement or
+        a pre-settlement rate below threshold resets it.
+        """
+        settles_at, period = pair_settlement(long_funding, short_funding)
+        window_start = settles_at - timedelta(
+            seconds=self.config.spike_settlement_window_seconds
+        )
+        in_window = (
+            window_start <= long_funding.observed_at < settles_at
+            and window_start <= short_funding.observed_at < settles_at
+        )
+        last = pair.last_marker
+        if not in_window:
+            if last is not None and settles_at - last > period:
+                pair.streak, pair.streak_started_at, pair.last_marker = 0, None, None
+                return True
+            return False
+        comparable = (
+            long_funding.rate_kind == "predicted"
+            and short_funding.rate_kind == "predicted"
+        )
+        if not comparable or net_apr < self.config.spike_net_apr:
+            if pair.streak or last is not None:
+                pair.streak, pair.streak_started_at, pair.last_marker = 0, None, None
+                return True
+            return False
+        if last == settles_at:
+            return False
+        if last is not None and settles_at - last == period:
+            pair.streak += 1
+        else:
+            pair.streak = 1
+            pair.streak_started_at = settles_at
+        pair.last_marker = settles_at
+        return True
 
     def _clear(self, pair: PairState, kind: str, now: datetime) -> bool:
         """Re-arm an alerted condition only after it stays false for rearm_seconds."""
@@ -537,7 +605,7 @@ class FundingMonitor:
             "avg_net_apr": avg_net_apr,
             "window_hours": self.config.carry_window_hours,
             "coverage": coverage,
-            "spike_samples": pair.streak,
+            "spike_periods": pair.streak,
             "condition_seconds": condition_seconds,
             "horizon_hours": self.config.carry_horizon_hours,
             "expected_funding_bps": expected_funding_bps,
@@ -568,6 +636,46 @@ class FundingMonitor:
             except (TypeError, ValueError):
                 continue
         return pairs
+
+
+def _one_spike_per_symbol(
+    alerts: list[AlertRequest], spiking_symbols: set[str]
+) -> list[AlertRequest]:
+    """Keep one spike alert per symbol; list the other qualifying pairs in it.
+
+    Symbols that already had an active spike alert get none: their newly
+    qualifying pairs are marked alerted (so they stay quiet) by the caller.
+    """
+    spikes: dict[str, list[AlertRequest]] = defaultdict(list)
+    others: list[AlertRequest] = []
+    for alert in alerts:
+        if alert.payload["kind"] == SPIKE:
+            spikes[str(alert.payload["canonical_symbol"])].append(alert)
+        else:
+            others.append(alert)
+    kept: list[AlertRequest] = []
+    for symbol, group in spikes.items():
+        if symbol in spiking_symbols:
+            continue
+        group.sort(key=lambda alert: float(alert.payload["net_apr"]), reverse=True)
+        lead, rest = group[0], group[1:]
+        other_pairs: list[JSONValue] = [
+            {
+                "long_venue": alert.payload["long_venue"],
+                "short_venue": alert.payload["short_venue"],
+                "net_apr": alert.payload["net_apr"],
+            }
+            for alert in rest
+        ]
+        kept.append(
+            AlertRequest(
+                monitor=lead.monitor,
+                event_id=lead.event_id,
+                created_at=lead.created_at,
+                payload={**lead.payload, "other_pairs": other_pairs},
+            )
+        )
+    return others + kept
 
 
 def _funding_payload(snapshot: FundingSnapshot) -> dict[str, JSONValue]:

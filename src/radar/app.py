@@ -48,6 +48,19 @@ from radar.storage.parquet import ParquetStorage
 from radar.storage.sqlite import SQLiteRuntimeStore
 
 LOGGER = logging.getLogger(__name__)
+# UTC timestamp first; the rest keeps the old "LEVEL:logger:message" shape
+# so existing grep-based health checks still match.
+LOG_FORMAT = "%(asctime)s %(levelname)s:%(name)s:%(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def configure_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+    for handler in logging.getLogger().handlers:
+        if handler.formatter is not None:
+            handler.formatter.converter = time.gmtime
+
+
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_DB = Path("runtime/radar.sqlite3")
 DEFAULT_DIAGNOSTIC_LOG = Path("runtime/radar-diagnostics.log")
@@ -1041,7 +1054,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

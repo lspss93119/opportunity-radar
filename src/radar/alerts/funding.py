@@ -115,8 +115,7 @@ def format_funding_alert(alert: AlertRequest) -> str:
         f"做多: {_venue_label(long_venue, long_market)} ({payload['long_venue_symbol']})",
         f"做空: {_venue_label(short_venue, short_market)} ({payload['short_venue_symbol']})",
         "",
-        f"淨 APR: {_percent(payload.get('net_apr'))}"
-        f"（連續 {payload.get('spike_samples', 0)} 次採樣）",
+        _net_apr_line(payload),
         f"{window:g}h 平均淨 APR: {_percent(payload.get('avg_net_apr'))}"
         f"（覆蓋 {0 if coverage is None else coverage * 100:.0f}%）"
         if window is not None
@@ -134,7 +133,27 @@ def format_funding_alert(alert: AlertRequest) -> str:
         _market_line(long_venue, long_market),
         _market_line(short_venue, short_market),
     ]
+    other_pairs = payload.get("other_pairs")
+    if isinstance(other_pairs, list) and other_pairs:
+        lines += ["", f"同時達標的其他配對（{len(other_pairs)}）:"]
+        for other in other_pairs:
+            if isinstance(other, dict):
+                lines.append(
+                    f"做多 {_display_venue(str(other.get('long_venue')))}"
+                    f" / 做空 {_display_venue(str(other.get('short_venue')))}:"
+                    f" 淨 APR {_percent(other.get('net_apr'))}"
+                )
     return "\n".join(lines)
+
+
+def _net_apr_line(payload: dict[str, JSONValue]) -> str:
+    net = f"淨 APR: {_percent(payload.get('net_apr'))}"
+    if payload.get("kind") != "funding_spike":
+        return net
+    if "spike_periods" in payload:
+        return f"{net}（結算前，連續 {payload.get('spike_periods')} 個結算期）"
+    # Alerts recorded before settlement-based spikes counted raw samples.
+    return f"{net}（連續 {payload.get('spike_samples', 0)} 次採樣）"
 
 
 class FundingAlertProcessor:
