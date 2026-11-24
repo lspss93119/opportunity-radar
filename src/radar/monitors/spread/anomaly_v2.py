@@ -45,12 +45,22 @@ class AnomalyV2Evaluation:
     events: tuple[OpportunityEvent, ...]
 
 
+DEFAULT_ANCHOR = "mean_24h"
+
+
 class AnomalyV2Lifecycle:
     """Small live adapter around the shared pure AnomalyTracker."""
 
-    def __init__(self, config: AnomalyV2Config, *, primary_size_usd: int = 10_000) -> None:
+    def __init__(
+        self,
+        config: AnomalyV2Config,
+        *,
+        primary_size_usd: int = 10_000,
+        anchor: str = DEFAULT_ANCHOR,
+    ) -> None:
         self.config = config
         self.primary_size_usd = primary_size_usd
+        self.anchor = anchor
         self.parameters = AnomalyParameters(
             anomaly_deviation_bps=config.deviation_bps,
             confirmation_seconds=config.confirmation_seconds,
@@ -343,7 +353,8 @@ class AnomalyV2Lifecycle:
     ) -> AlertRequest:
         payload: dict[str, JSONValue] = {
             "event_kind": event_kind,
-            "episode_id": episode.episode_id,
+            "episode_id": self._public_episode_id(episode),
+            "anchor": self.anchor,
             "canonical_symbol": candidate.key.canonical_symbol,
             "long_venue": candidate.key.long_venue,
             "long_venue_symbol": candidate.key.long_venue_symbol,
@@ -401,8 +412,14 @@ class AnomalyV2Lifecycle:
     ) -> OpportunityEvent:
         return (alert.event_id, event_type, alert.payload, occurred_at)
 
-    @staticmethod
+    def _public_episode_id(self, episode: AnomalyEpisode) -> str:
+        """Episodes of a non-default anchor get distinct ids in logs and alerts."""
+        if self.anchor == DEFAULT_ANCHOR:
+            return episode.episode_id
+        return f"{episode.episode_id}:{self.anchor}"
+
     def _event_id(
+        self,
         event_kind: str,
         episode: AnomalyEpisode,
         candidate: SpreadCandidate,
@@ -417,7 +434,7 @@ class AnomalyV2Lifecycle:
             suffix = "resolved"
         else:
             suffix = "resolved:" + str(episode.resolution_reason)
-        return f"{episode.episode_id}:v2:{suffix}"
+        return f"{self._public_episode_id(episode)}:v2:{suffix}"
 
 
 def _pair_sort_key(key: SpreadPairKey) -> tuple[str, str, str, str, str]:

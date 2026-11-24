@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import bisect
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import math
 from typing import Iterable
@@ -85,6 +86,7 @@ class RollingBasisMutation:
         self.basis._sum = self.previous_sum
         self.basis._sum_squares = self.previous_sum_squares
         self.basis._last_sample_time = self.previous_last_sample_time
+        self.basis._after_rollback()
         self._rolled_back = True
 
 
@@ -258,3 +260,61 @@ class RollingBasis:
             self._sum_squares -= value * value
             removed.append((timestamp, value))
         return tuple(removed)
+
+    def _after_rollback(self) -> None:
+        """Hook for subclasses that keep derived structures in sync."""
+
+
+class RollingMedian(RollingBasis):
+    """Prior-only rolling median anchor (reported in ``mean_bps``).
+
+    Coverage, sample count and standard deviation follow RollingBasis; only
+    the centre statistic differs. A sorted copy of the window is kept so each
+    observation costs O(window) at worst (a few hundred points for 2h).
+    """
+
+    def __init__(self, **kwargs: int) -> None:
+        super().__init__(**kwargs)
+        self._sorted: list[float] = []
+
+    def hydrate(self, points: Iterable[tuple[datetime, float]]) -> None:
+        self._sorted = []
+        super().hydrate(points)
+
+    def _append(self, sample_time: datetime, raw_spread_bps: float) -> None:
+        previous = self._values.get(sample_time)
+        super()._append(sample_time, raw_spread_bps)
+        if previous is not None:
+            self._remove_sorted(previous)
+        bisect.insort(self._sorted, raw_spread_bps)
+
+    def _prune(self, cutoff: datetime) -> tuple[tuple[datetime, float], ...]:
+        removed = super()._prune(cutoff)
+        for _timestamp, value in removed:
+            self._remove_sorted(value)
+        return removed
+
+    def _remove_sorted(self, value: float) -> None:
+        index = bisect.bisect_left(self._sorted, value)
+        if index < len(self._sorted) and self._sorted[index] == value:
+            del self._sorted[index]
+
+    def _after_rollback(self) -> None:
+        self._sorted = sorted(self._values.values())
+
+    def _stats_before_pruned(self, timestamp: datetime) -> RollingBasisStats:
+        stats = super()._stats_before_pruned(timestamp)
+        values = self._sorted
+        excluded = self._values.get(timestamp)
+        if excluded is not None:
+            values = list(values)
+            del values[bisect.bisect_left(values, excluded)]
+        if not values:
+            return replace(stats, mean_bps=None)
+        middle = len(values) // 2
+        median = (
+            values[middle]
+            if len(values) % 2
+            else (values[middle - 1] + values[middle]) / 2.0
+        )
+        return replace(stats, mean_bps=median)

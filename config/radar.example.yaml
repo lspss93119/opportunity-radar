@@ -753,6 +753,11 @@ monitors:
       max_gap_seconds: 20
       mean_alignment_max_bps: 5
       expansion_notify_step_bps: 5
+      # Reference levels for deviations: mean_24h (rolling 24h mean, default)
+      # and optionally median_2h (prior-only rolling median); each anchor has
+      # its own episodes, and alerts name the anchor that fired.
+      anchors: [mean_24h]
+      median_window_seconds: 7200
   # Cross-venue funding differential (APR decimals: 1.0 = 100%/year).
   funding:
     enabled: true

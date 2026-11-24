@@ -84,3 +84,4 @@ class AnomalyAlertDetails:
     long_price_source: str = "order_book"
     short_price_source: str = "order_book"
     spread_by_size_bps: dict[int, float | None] | None = None
+    anchor: str = "mean_24h"

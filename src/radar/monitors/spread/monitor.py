@@ -16,6 +16,7 @@ from radar.storage.sqlite import SQLiteRuntimeStore
 
 from radar.monitors.spread.basis import (
     RollingBasis,
+    RollingMedian,
     RollingBasisMutation,
     RollingBasisStats,
 )
@@ -31,6 +32,11 @@ from radar.monitors.spread.models import (
 UTC = timezone.utc
 OpportunityEvent = tuple[str, str, object, datetime]
 
+# Runtime-state key per anchor; mean_24h keeps the key used before anchors.
+ANOMALY_STATE_KEYS = {
+    "mean_24h": "anomaly_episodes_v2",
+    "median_2h": "anomaly_episodes_v2_median_2h",
+}
 # Defaults for monitors.spread.basis (kept for callers that import them).
 BASIS_STD_MAX_BPS = 3.0
 BASIS_DEVIATION_MIN_BPS = 15.0
@@ -151,18 +157,26 @@ class SpreadMonitor:
         self._live_quote_max_skew_seconds = live_quote_max_skew_seconds
         self._episodes: dict[SpreadPairKey, SpreadEpisode] = {}
         self._basis_by_key: dict[SpreadPairKey, RollingBasis] = {}
-        self._anomaly_v2 = (
-            AnomalyV2Lifecycle(config.anomaly_v2, primary_size_usd=config.primary_size_usd)
+        self._median_by_key: dict[SpreadPairKey, RollingMedian] = {}
+        self._anomaly_lifecycles: dict[str, AnomalyV2Lifecycle] = (
+            {
+                anchor: AnomalyV2Lifecycle(
+                    config.anomaly_v2,
+                    primary_size_usd=config.primary_size_usd,
+                    anchor=anchor,
+                )
+                for anchor in config.anomaly_v2.anchors
+            }
             if config.anomaly_v2.enabled
-            else None
+            else {}
         )
         if runtime_store is not None:
             self._episodes = self._load_episodes(
                 runtime_store.get_monitor_state(self.name, "episodes")
             )
-            if self._anomaly_v2 is not None:
-                self._anomaly_v2.restore(
-                    runtime_store.get_monitor_state(self.name, "anomaly_episodes_v2")
+            for anchor, lifecycle in self._anomaly_lifecycles.items():
+                lifecycle.restore(
+                    runtime_store.get_monitor_state(self.name, ANOMALY_STATE_KEYS[anchor])
                 )
 
     @property
@@ -173,11 +187,22 @@ class SpreadMonitor:
         )
 
     @property
+    def _anomaly_v2(self) -> AnomalyV2Lifecycle | None:
+        """The default (mean_24h) lifecycle, when configured."""
+        return self._anomaly_lifecycles.get("mean_24h")
+
+    @property
+    def _median_lifecycle(self) -> AnomalyV2Lifecycle | None:
+        return self._anomaly_lifecycles.get("median_2h")
+
+    @property
     def active_anomaly_episodes(self) -> tuple[object, ...]:
         """Read-only view of active v2 wrappers for diagnostics/tests."""
-        if self._anomaly_v2 is None:
-            return ()
-        return self._anomaly_v2.active_states
+        return tuple(
+            state
+            for lifecycle in self._anomaly_lifecycles.values()
+            for state in lifecycle.active_states
+        )
 
     def hydrate_history(
         self,
@@ -197,10 +222,17 @@ class SpreadMonitor:
                 points.append((timestamp, float(value)))
             interval = self._pair_interval(key)
             basis = self._new_basis(key)
-            basis.hydrate(
-                point for point in points if _on_cadence(point[0], interval)
-            )
+            on_cadence = [point for point in points if _on_cadence(point[0], interval)]
+            basis.hydrate(on_cadence)
             self._basis_by_key[key] = basis
+            if self._median_lifecycle is not None and on_cadence:
+                latest = max(point[0] for point in on_cadence)
+                cutoff = latest - timedelta(
+                    seconds=self.config.anomaly_v2.median_window_seconds
+                )
+                median = self._new_median(key)
+                median.hydrate(point for point in on_cadence if point[0] >= cutoff)
+                self._median_by_key[key] = median
 
     def _pair_interval(self, key: SpreadPairKey) -> int:
         """A pair keeps history at the slower cadence of its two feeds."""
@@ -227,6 +259,16 @@ class SpreadMonitor:
         return RollingBasis(
             window_seconds=self._basis_window_seconds,
             min_observations=min_observations,
+            expected_interval_seconds=interval,
+        )
+
+    def _new_median(self, key: SpreadPairKey) -> RollingMedian:
+        interval = self._pair_interval(key)
+        window = self.config.anomaly_v2.median_window_seconds
+        # Same 80% coverage requirement as the mean basis, scaled to the window.
+        return RollingMedian(
+            window_seconds=window,
+            min_observations=math.ceil(0.8 * window / interval),
             expected_interval_seconds=interval,
         )
 
@@ -263,6 +305,9 @@ class SpreadMonitor:
                 not in identities
             ):
                 del self._basis_by_key[key]
+        for key in tuple(self._median_by_key):
+            if key not in self._basis_by_key:
+                del self._median_by_key[key]
 
     def _scoped_markets(self, state: RadarState) -> tuple[MarketSnapshot, ...]:
         if self._market_identities is None:
@@ -318,7 +363,7 @@ class SpreadMonitor:
         state: RadarState,
     ) -> list[AlertRequest]:
         current_time = _as_utc(now, "now")
-        if self._anomaly_v2 is not None:
+        if self._anomaly_lifecycles:
             return await self._evaluate_anomaly_v2(current_time, state)
         cycle_started = time.perf_counter()
         candidate_build_started = time.perf_counter()
@@ -504,9 +549,11 @@ class SpreadMonitor:
         )
         candidate_build_ms = _elapsed_ms(candidate_build_started)
         candidate_by_key = {candidate.key: candidate for candidate in candidates}
-        previous_v2 = (
-            deepcopy(self._anomaly_v2) if self._runtime_store is not None else None
+        previous_lifecycles = (
+            deepcopy(self._anomaly_lifecycles) if self._runtime_store is not None else None
         )
+        median_mutations: list[RollingBasisMutation] = []
+        created_median_keys: set[SpreadPairKey] = set()
         basis_stats: dict[SpreadPairKey, RollingBasisStats] = {}
         basis_mutations: list[RollingBasisMutation] = []
         created_basis_keys: set[SpreadPairKey] = set()
@@ -522,21 +569,40 @@ class SpreadMonitor:
                 if mutation is not None:
                     basis_mutations.append(mutation)
                 basis_stats[candidate.key] = stats
+            anchor_stats: dict[str, Mapping[SpreadPairKey, RollingBasisStats]] = {
+                "mean_24h": basis_stats
+            }
+            if self._median_lifecycle is not None:
+                median_stats: dict[SpreadPairKey, RollingBasisStats] = {}
+                for candidate in candidates:
+                    median = self._median_by_key.get(candidate.key)
+                    if median is None:
+                        median = self._new_median(candidate.key)
+                        self._median_by_key[candidate.key] = median
+                        created_median_keys.add(candidate.key)
+                    stats, mutation = self._observe_basis(median, candidate)
+                    if mutation is not None:
+                        median_mutations.append(mutation)
+                    median_stats[candidate.key] = stats
+                anchor_stats["median_2h"] = median_stats
             basis_ms = _elapsed_ms(basis_started)
 
-            assert self._anomaly_v2 is not None
             lifecycle_started = time.perf_counter()
-            result = self._anomaly_v2.evaluate(
-                candidates=candidate_by_key,
-                basis_stats=basis_stats,
-                state=state,
-                now=current_time,
-            )
+            results = {
+                anchor: lifecycle.evaluate(
+                    candidates=candidate_by_key,
+                    basis_stats=anchor_stats[anchor],
+                    state=state,
+                    now=current_time,
+                )
+                for anchor, lifecycle in self._anomaly_lifecycles.items()
+            }
+            all_alerts = [alert for result in results.values() for alert in result.alerts]
             lifecycle_ms = _elapsed_ms(lifecycle_started)
             persistence_started = time.perf_counter()
-            self._persist_anomaly_v2(current_time, result.events)
+            self._persist_anomaly_v2(current_time, results)
             sqlite_persistence_ms = _elapsed_ms(persistence_started)
-            alert_count = len(result.alerts) if self.config.anomaly_v2.telegram_enabled else 0
+            alert_count = len(all_alerts) if self.config.anomaly_v2.telegram_enabled else 0
             self._log_cycle_timing(
                 candidate_build_ms=candidate_build_ms,
                 basis_ms=basis_ms,
@@ -549,12 +615,16 @@ class SpreadMonitor:
         except Exception:
             if self._runtime_store is not None:
                 self._rollback_basis_mutations(basis_mutations, created_basis_keys)
-                if previous_v2 is not None:
-                    self._anomaly_v2 = previous_v2
+                for mutation in reversed(median_mutations):
+                    mutation.rollback()
+                for key in created_median_keys:
+                    self._median_by_key.pop(key, None)
+                if previous_lifecycles is not None:
+                    self._anomaly_lifecycles = previous_lifecycles
             raise
         if not self.config.anomaly_v2.telegram_enabled:
             return []
-        return list(result.alerts)
+        return all_alerts
 
     def _start_episode(
         self,
@@ -780,15 +850,30 @@ class SpreadMonitor:
     def _persist_anomaly_v2(
         self,
         now: datetime,
-        events: tuple[OpportunityEvent, ...],
+        results: Mapping[str, object],
     ) -> None:
-        if self._runtime_store is None or self._anomaly_v2 is None:
+        if self._runtime_store is None or not self._anomaly_lifecycles:
             return
-        self._runtime_store.set_monitor_state_and_append_opportunities(
-            self.name,
-            "anomaly_episodes_v2",
-            self._anomaly_v2.snapshot(),
-            updated_at=now,
+        events = tuple(
+            event for result in results.values() for event in result.events  # type: ignore[attr-defined]
+        )
+        if len(self._anomaly_lifecycles) == 1:
+            ((anchor, lifecycle),) = self._anomaly_lifecycles.items()
+            self._runtime_store.set_monitor_state_and_append_opportunities(
+                self.name,
+                ANOMALY_STATE_KEYS[anchor],
+                lifecycle.snapshot(),
+                updated_at=now,
+                opportunities=events,
+            )
+            return
+        # Several anchors: commit every lifecycle and all events atomically.
+        self._runtime_store.set_monitor_states_and_append_opportunities(
+            [
+                (self.name, ANOMALY_STATE_KEYS[anchor], lifecycle.snapshot(), now)
+                for anchor, lifecycle in self._anomaly_lifecycles.items()
+            ],
+            opportunity_monitor_name=self.name,
             opportunities=events,
         )
 

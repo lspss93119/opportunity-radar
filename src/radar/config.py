@@ -123,6 +123,22 @@ class AnomalyV2Config(BaseModel):
     mean_alignment_max_bps: float = Field(default=5.0, ge=0, allow_inf_nan=False)
     expansion_notify_step_bps: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     notification_symbol_cooldown_seconds: int = Field(default=300, ge=0)
+    # Reference levels a deviation is measured from. mean_24h is the rolling
+    # 24h basis mean (previous behaviour); median_2h adds a prior-only rolling
+    # median over median_window_seconds with its own episodes and alerts.
+    anchors: list[Literal["mean_24h", "median_2h"]] = Field(
+        default_factory=lambda: ["mean_24h"]
+    )
+    median_window_seconds: int = Field(default=2 * 60 * 60, ge=600)
+
+    @field_validator("anchors")
+    @classmethod
+    def anchors_must_be_unique_and_present(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("anchors must name at least one anchor")
+        if len(set(value)) != len(value):
+            raise ValueError("anchors must not repeat")
+        return value
 
 
 class ManualOpportunityConfig(BaseModel):

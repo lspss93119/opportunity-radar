@@ -297,6 +297,7 @@ def parse_anomaly_alert(alert: AlertRequest) -> AnomalyAlertDetails:
         long_price_source=parse_price_source(payload.get("long_price_source")),
         short_price_source=parse_price_source(payload.get("short_price_source")),
         spread_by_size_bps=_parse_spread_by_size(payload.get("spread_by_size_bps")),
+        anchor=_parse_anchor(payload.get("anchor")),
     )
 
 
@@ -342,6 +343,18 @@ def _format_size_context(
         + (unavailable if spreads[size] is None else f"{spreads[size]:+.2f}")
         for size in sorted(spreads)
     )
+
+
+ANCHOR_LABELS = {"mean_24h": "24h 平均", "median_2h": "2h 中位數"}
+
+
+def _parse_anchor(value: JSONValue) -> str:
+    """Alerts written before anchors existed all came from the 24h mean."""
+    if value is None:
+        return "mean_24h"
+    if value not in ANCHOR_LABELS:
+        raise ValueError("unknown anomaly anchor")
+    return str(value)
 
 
 RFQ_LABEL = "［RFQ 報價］"
@@ -410,6 +423,7 @@ def format_spread_alert(
                         f"原始價差: {details.raw_spread_bps:.2f} bps | "
                         f"淨價差: {_format_bps(details.net_spread_bps)} bps"
                     ),
+                    "錨點：24h 平均",
                     (
                         f"24h 均值: {details.rolling_mean_bps:.2f} bps | "
                         f"Std: {details.rolling_std_bps:.2f} bps | "
@@ -561,6 +575,7 @@ def format_anomaly_alert(
             f"Short {short_venue} ({details.short_venue_symbol})"
             f"{_source_label(details.short_price_source)}",
             body,
+            f"錨點：{ANCHOR_LABELS[details.anchor]}\n"
             f"{_price_label('Buy', details.long_price_source)} "
             f"{_format_price(details.long_buy_vwap)} · "
             f"{_price_label('Sell', details.short_price_source)} "
