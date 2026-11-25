@@ -5,6 +5,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from radar.collectors.lighter import (
     LighterOrderBookFeed,
@@ -41,9 +42,7 @@ def snapshot_message(market_id: int, *, nonce: int = 10) -> dict:
     }
 
 
-def update_message(
-    market_id: int, *, begin_nonce: int = 10, nonce: int = 11
-) -> dict:
+def update_message(market_id: int, *, begin_nonce: int = 10, nonce: int = 11) -> dict:
     return {
         "type": "update/order_book",
         "channel": f"order_book:{market_id}",
@@ -115,7 +114,9 @@ def test_lighter_order_book_state_rejects_delta_nonce_gap_and_stays_unready():
 def test_lighter_boundary_model_matches_eager_reference(venue: str):
     del venue  # The shared state machine is used by both logical venues.
     raw_snapshot = snapshot_message(1)
-    for level in raw_snapshot["order_book"]["asks"] + raw_snapshot["order_book"]["bids"]:
+    for level in (
+        raw_snapshot["order_book"]["asks"] + raw_snapshot["order_book"]["bids"]
+    ):
         level["size"] = "200"
     raw_deltas = [
         update_message(1, begin_nonce=10, nonce=11),
@@ -169,6 +170,25 @@ class FakeWebSocket:
 
     async def __anext__(self) -> str:
         message = await self._queue.get()
+        if message is None:
+            raise StopAsyncIteration
+        return message
+
+
+class ClosingWebSocket(FakeWebSocket):
+    def __init__(self, messages: list[dict], close_error: Exception) -> None:
+        super().__init__(messages)
+        self._close_error = close_error
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._queue.put_nowait(self._close_error)
+
+    async def __anext__(self) -> str:
+        message = await self._queue.get()
+        if isinstance(message, Exception):
+            raise message
         if message is None:
             raise StopAsyncIteration
         return message
@@ -234,7 +254,12 @@ async def test_lighter_deltas_wait_for_boundary_and_publish_latest_book_once():
         websocket.push(update_message(1, begin_nonce=10, nonce=11))
         websocket.push(update_message(1, begin_nonce=11, nonce=12))
         websocket.push(update_message(1, begin_nonce=12, nonce=13))
-        await wait_until(lambda: feed.snapshot(1) is not None and feed.snapshot(1).bids[0].base_size == 1.0)
+        await wait_until(
+            lambda: (
+                feed.snapshot(1) is not None
+                and feed.snapshot(1).bids[0].base_size == 1.0
+            )
+        )
 
         assert published == []
 
@@ -324,7 +349,32 @@ async def test_lighter_order_book_feed_isolates_markets_and_resubscribes_after_r
             "order_book/2",
         }
         feed.publish_current_books()
-        assert len(
+        assert (
+            len(
+                latest.build_batch(
+                    [
+                        MarketConfig(
+                            venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
+                        ),
+                        MarketConfig(
+                            venue="lighter", venue_symbol="ETH", canonical_symbol="ETH"
+                        ),
+                    ],
+                    sample_time=OBSERVED_AT,
+                    now=OBSERVED_AT,
+                    stale_after_seconds=30,
+                ).market_snapshots
+            )
+            == 2
+        )
+        invalidations_before_disconnect = len(invalidated)
+
+        await first.close()
+        await wait_until(lambda: len(invalidated) > invalidations_before_disconnect)
+        assert feed.snapshot(1) is None
+        assert feed.snapshot(2) is None
+        assert set(invalidated[invalidations_before_disconnect:]) == {1, 2}
+        assert (
             latest.build_batch(
                 [
                     MarketConfig(
@@ -338,27 +388,8 @@ async def test_lighter_order_book_feed_isolates_markets_and_resubscribes_after_r
                 now=OBSERVED_AT,
                 stale_after_seconds=30,
             ).market_snapshots
-        ) == 2
-        invalidations_before_disconnect = len(invalidated)
-
-        await first.close()
-        await wait_until(lambda: len(invalidated) > invalidations_before_disconnect)
-        assert feed.snapshot(1) is None
-        assert feed.snapshot(2) is None
-        assert set(invalidated[invalidations_before_disconnect:]) == {1, 2}
-        assert latest.build_batch(
-            [
-                MarketConfig(
-                    venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"
-                ),
-                MarketConfig(
-                    venue="lighter", venue_symbol="ETH", canonical_symbol="ETH"
-                ),
-            ],
-            sample_time=OBSERVED_AT,
-            now=OBSERVED_AT,
-            stale_after_seconds=30,
-        ).market_snapshots == ()
+            == ()
+        )
 
         second.push(snapshot_message(1, nonce=30))
         await wait_for_book(feed, 1)
@@ -445,12 +476,63 @@ async def test_lighter_order_book_feed_invalidates_only_market_with_nonce_gap():
 
 
 @pytest.mark.asyncio
+async def test_lighter_market_rescan_updates_live_subscriptions_incrementally():
+    websocket = FakeWebSocket(
+        [
+            {"type": "connected"},
+            snapshot_message(1),
+            snapshot_message(2, nonce=20),
+        ]
+    )
+    invalidated: list[int] = []
+    feed = LighterOrderBookFeed(
+        "wss://example.test/stream",
+        (1, 2),
+        connect=lambda _url: websocket,
+        on_invalidate=invalidated.append,
+    )
+
+    await feed.start()
+    try:
+        original_market_2 = await wait_for_book(feed, 2)
+        invalidated_before_rescan = len(invalidated)
+        sent_before_rescan = len(websocket.sent)
+        await feed.set_market_ids((2, 3))
+
+        assert websocket.closed is False
+        assert feed.reconnect_count == 0
+        assert feed.snapshot(1) is None
+        assert feed.snapshot(2) == original_market_2
+        assert invalidated[invalidated_before_rescan:] == [1]
+        rescan_messages = websocket.sent[sent_before_rescan:]
+        assert [
+            message
+            for message in rescan_messages
+            if message["channel"] == "order_book/1"
+        ] == [{"type": "unsubscribe", "channel": "order_book/1"}]
+        assert [
+            message
+            for message in rescan_messages
+            if message["channel"] == "order_book/3"
+        ] == [{"type": "subscribe", "channel": "order_book/3"}]
+
+        websocket.push(snapshot_message(3, nonce=30))
+        await wait_for_book(feed, 3)
+        assert feed.snapshot(2) == original_market_2
+        assert feed.reconnect_count == 0
+    finally:
+        await feed.stop()
+
+
+@pytest.mark.asyncio
 async def test_lighter_gap_recovery_waits_for_replacement_snapshot_without_reconnect():
-    websocket = FakeWebSocket([
-        {"type": "connected"},
-        snapshot_message(1),
-        snapshot_message(2, nonce=20),
-    ])
+    websocket = FakeWebSocket(
+        [
+            {"type": "connected"},
+            snapshot_message(1),
+            snapshot_message(2, nonce=20),
+        ]
+    )
     feed = LighterOrderBookFeed(
         "wss://example.test/stream",
         (1, 2),
@@ -464,10 +546,13 @@ async def test_lighter_gap_recovery_waits_for_replacement_snapshot_without_recon
 
         websocket.push(update_message(1, begin_nonce=999, nonce=1000))
         await wait_until(lambda: feed.snapshot(1) is None)
-        await wait_until(lambda: any(
-            msg.get("type") == "unsubscribe" and msg.get("channel") == "order_book/1"
-            for msg in websocket.sent
-        ))
+        await wait_until(
+            lambda: any(
+                msg.get("type") == "unsubscribe"
+                and msg.get("channel") == "order_book/1"
+                for msg in websocket.sent
+            )
+        )
         assert feed.snapshot(2) is not None
         assert feed.reconnect_count == 0
         assert websocket.sent[-2:] == [
@@ -482,8 +567,12 @@ async def test_lighter_gap_recovery_waits_for_replacement_snapshot_without_recon
         recovered = await wait_for_book(feed, 1)
         assert recovered.bids[0].price == 99.0
         websocket.push(update_message(1, begin_nonce=50, nonce=51))
-        await wait_until(lambda: feed.snapshot(1) is not None
-                         and feed.snapshot(1).bids[0].base_size == 1.0)
+        await wait_until(
+            lambda: (
+                feed.snapshot(1) is not None
+                and feed.snapshot(1).bids[0].base_size == 1.0
+            )
+        )
         assert feed.snapshot(2) is not None
     finally:
         await feed.stop()
@@ -500,6 +589,7 @@ async def test_lighter_missing_initial_snapshot_retries_subscription():
     )
     await feed.start()
     try:
+
         async def replacement_sent():
             for _ in range(200):
                 if len(websocket.sent) >= 3:
@@ -572,8 +662,7 @@ async def test_lighter_stop_cleans_snapshot_watchdogs():
     await feed.start()
     await wait_until(
         lambda: any(
-            task.get_name() == "lighter-book-snapshot-1"
-            and not task.done()
+            task.get_name() == "lighter-book-snapshot-1" and not task.done()
             for task in asyncio.all_tasks()
         )
     )
@@ -646,6 +735,74 @@ async def test_lighter_shutdown_is_normal_disconnect_and_reconnects(caplog, venu
 
 
 @pytest.mark.asyncio
+async def test_lighter_initiated_shutdown_connection_error_is_not_reported():
+    first = ClosingWebSocket(
+        [{"type": "connected"}, {"type": "shutdown"}],
+        ConnectionClosedError(None, None),
+    )
+    second = FakeWebSocket([{"type": "connected"}])
+    connections = [first, second]
+    failures: list[Exception] = []
+    feed = LighterOrderBookFeed(
+        "wss://example.test/stream",
+        (1,),
+        connect=lambda _url: connections.pop(0),
+        error_handler=lambda _venue, error: failures.append(error),
+        reconnect_delay_seconds=0,
+    )
+
+    await feed.start()
+    try:
+        await wait_until(lambda: feed.reconnect_count >= 1)
+        assert failures == []
+    finally:
+        await feed.stop()
+
+
+@pytest.mark.asyncio
+async def test_lighter_connection_closed_ok_is_not_reported():
+    websocket = ClosingWebSocket([], ConnectionClosedOK(None, None))
+    websocket._queue.put_nowait(ConnectionClosedOK(None, None))
+    failures: list[Exception] = []
+    feed = LighterOrderBookFeed(
+        "wss://example.test/stream",
+        (1,),
+        connect=lambda _url: websocket,
+        error_handler=lambda _venue, error: failures.append(error),
+        reconnect_delay_seconds=60,
+    )
+
+    await feed.start()
+    try:
+        await wait_until(lambda: websocket.closed)
+        await wait_until(lambda: feed.reconnect_count >= 1)
+        assert failures == []
+    finally:
+        await feed.stop()
+
+
+@pytest.mark.asyncio
+async def test_lighter_unexpected_connection_close_is_reported():
+    websocket = ClosingWebSocket([], ConnectionClosedError(None, None))
+    websocket._queue.put_nowait(ConnectionClosedError(None, None))
+    failures: list[Exception] = []
+    feed = LighterOrderBookFeed(
+        "wss://example.test/stream",
+        (1,),
+        connect=lambda _url: websocket,
+        error_handler=lambda _venue, error: failures.append(error),
+        reconnect_delay_seconds=60,
+    )
+
+    await feed.start()
+    try:
+        await wait_until(lambda: bool(failures))
+        assert isinstance(failures[0], ConnectionClosedError)
+    finally:
+        await feed.stop()
+
+
+@pytest.mark.asyncio
 async def test_lighter_unknown_message_type_still_reports_error():
     websocket = FakeWebSocket([{"type": "mystery"}])
     failures: list[Exception] = []
@@ -692,7 +849,9 @@ async def test_lighter_collector_reads_ws_book_without_rest_order_book_requests(
         raise AssertionError(f"unexpected REST request: {url}")
 
     rich_snapshot = snapshot_message(1)
-    for level in rich_snapshot["order_book"]["asks"] + rich_snapshot["order_book"]["bids"]:
+    for level in (
+        rich_snapshot["order_book"]["asks"] + rich_snapshot["order_book"]["bids"]
+    ):
         level["size"] = "200"
     websocket = FakeWebSocket([{"type": "connected"}, rich_snapshot])
 

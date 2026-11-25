@@ -9,6 +9,7 @@ import logging
 from typing import Any, Callable
 
 import websockets
+from websockets.exceptions import ConnectionClosedOK
 
 from radar.collectors.base import (
     CollectorBatch,
@@ -221,6 +222,7 @@ class LighterOrderBookFeed:
         }
         self._task: asyncio.Task[None] | None = None
         self._websocket: Any | None = None
+        self._close_requested = False
         self._stopping = False
         self.reconnect_count = 0
 
@@ -232,14 +234,32 @@ class LighterOrderBookFeed:
         new_market_ids = tuple(sorted(set(market_ids)))
         if new_market_ids == self._market_ids:
             return
-        self._clear_states()
+        old_market_ids = set(self._market_ids)
+        new_market_id_set = set(new_market_ids)
+        removed_market_ids = old_market_ids - new_market_id_set
+        added_market_ids = new_market_id_set - old_market_ids
         self._market_ids = new_market_ids
-        self._states = {
-            market_id: self._states.get(market_id, LighterOrderBookState(market_id))
-            for market_id in new_market_ids
-        }
+        for market_id in removed_market_ids:
+            watchdog = self._snapshot_watchdogs.pop(market_id, None)
+            if watchdog is not None:
+                watchdog.cancel()
+            self._awaiting_snapshot.discard(market_id)
+            state = self._states.pop(market_id, None)
+            if state is not None:
+                state.clear()
+                if self._on_invalidate is not None:
+                    self._on_invalidate(market_id)
+
+        for market_id in added_market_ids:
+            self._states[market_id] = LighterOrderBookState(market_id)
+            if self._websocket is not None:
+                self._awaiting_snapshot.add(market_id)
+                await self._subscribe(self._websocket, market_id)
+                self._start_snapshot_watchdog(self._websocket, market_id)
+
         if self._websocket is not None:
-            await self._websocket.close()
+            for market_id in sorted(removed_market_ids):
+                await self._unsubscribe(self._websocket, market_id)
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -253,6 +273,7 @@ class LighterOrderBookFeed:
     async def stop(self) -> None:
         self._stopping = True
         if self._websocket is not None:
+            self._close_requested = True
             await self._websocket.close()
         task = self._task
         if task is not None:
@@ -294,9 +315,22 @@ class LighterOrderBookFeed:
                 self._on_invalidate(state.market_id)
 
     async def _replace_subscription(self, websocket: Any, market_id: int) -> None:
-        channel = f"order_book/{market_id}"
-        await websocket.send(json.dumps({"type": "unsubscribe", "channel": channel}))
-        await websocket.send(json.dumps({"type": "subscribe", "channel": channel}))
+        await self._unsubscribe(websocket, market_id)
+        await self._subscribe(websocket, market_id)
+
+    @staticmethod
+    async def _subscribe(websocket: Any, market_id: int) -> None:
+        await websocket.send(
+            json.dumps({"type": "subscribe", "channel": f"order_book/{market_id}"})
+        )
+
+    @staticmethod
+    async def _unsubscribe(websocket: Any, market_id: int) -> None:
+        await websocket.send(
+            json.dumps(
+                {"type": "unsubscribe", "channel": f"order_book/{market_id}"}
+            )
+        )
 
     def _start_snapshot_watchdog(self, websocket: Any, market_id: int) -> None:
         if market_id in self._snapshot_watchdogs:
@@ -331,6 +365,7 @@ class LighterOrderBookFeed:
         except Exception as error:  # noqa: BLE001
             report_collector_error(self._error_handler, self._venue, error)
             # A failed replacement means this connection cannot be trusted.
+            self._close_requested = True
             await websocket.close()
         finally:
             if self._snapshot_watchdogs.get(market_id) is asyncio.current_task():
@@ -347,6 +382,7 @@ class LighterOrderBookFeed:
     async def _run(self) -> None:
         while not self._stopping:
             self._clear_states()
+            self._close_requested = False
             try:
                 async with self._connect(self.ws_url) as websocket:
                     self._websocket = websocket
@@ -355,7 +391,14 @@ class LighterOrderBookFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001
-                report_collector_error(self._error_handler, self._venue, error)
+                if self._close_requested or isinstance(error, ConnectionClosedOK):
+                    LOGGER.info(
+                        "%s websocket closed normally error=%s",
+                        self._venue,
+                        error,
+                    )
+                else:
+                    report_collector_error(self._error_handler, self._venue, error)
             finally:
                 self._websocket = None
                 self._clear_states()
@@ -393,6 +436,7 @@ class LighterOrderBookFeed:
             return
         if message_type == "shutdown":
             LOGGER.info("%s websocket received normal shutdown", self._venue)
+            self._close_requested = True
             await websocket.close()
             return
         if message_type not in {"subscribed/order_book", "update/order_book"}:
@@ -401,6 +445,8 @@ class LighterOrderBookFeed:
         market_id = self._market_id_from_channel(message.get("channel"))
         state = self._states.get(market_id)
         if state is None:
+            if market_id not in self._market_ids:
+                return
             raise ValueError(f"websocket market {market_id} is not configured")
         if message_type == "update/order_book" and market_id in self._awaiting_snapshot:
             return

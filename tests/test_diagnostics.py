@@ -142,3 +142,32 @@ def test_diagnostic_log_is_bounded_and_marks_session_boundaries(tmp_path):
 
     text = session.path.read_text()
     assert "diagnostic session end session_id=test-run-1" in text
+
+
+def test_diagnostic_formatter_uses_utc_iso_milliseconds(tmp_path):
+    logger = logging.getLogger("test.diagnostic-formatter")
+    session = install_diagnostic_logging(
+        tmp_path / "diagnostic.log",
+        logger=logger,
+        session_id="test-formatter",
+    )
+    try:
+        record = logging.LogRecord(
+            logger.name,
+            logging.INFO,
+            __file__,
+            1,
+            "payload",
+            (),
+            None,
+        )
+        record.created = datetime(
+            2026, 11, 25, 12, 49, 32, 622000, tzinfo=UTC
+        ).timestamp()
+        record.msecs = 622.0
+        assert session.handler.formatter is not None
+        assert session.handler.formatter.format(record) == (
+            "2026-11-25T12:49:32.622Z INFO test.diagnostic-formatter payload"
+        )
+    finally:
+        session.close()

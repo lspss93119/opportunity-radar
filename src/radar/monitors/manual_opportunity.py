@@ -1244,7 +1244,7 @@ class ManualOpportunityMonitor:
             if isinstance(points, (str, bytes)):
                 raise TypeError("history points must be a sequence of pairs")
             history = BboRollingHistory()
-            history.hydrate(list(points))
+            history.hydrate(points)
             histories[key] = history
         self._histories = histories
 

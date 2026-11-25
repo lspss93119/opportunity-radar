@@ -18,6 +18,16 @@ DIAGNOSTIC_LOG_MAX_BYTES = 20 * 1024 * 1024
 DIAGNOSTIC_LOG_BACKUP_COUNT = 3
 
 
+class _UtcMillisecondsFormatter(logging.Formatter):
+    converter = staticmethod(time.gmtime)
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        del datefmt
+        converted = self.converter(record.created)
+        prefix = time.strftime("%Y-%m-%dT%H:%M:%S", converted)
+        return f"{prefix}.{int(record.msecs):03d}Z"
+
+
 @dataclass(frozen=True)
 class ResourceSnapshot:
     rss_bytes: int | None = None
@@ -369,7 +379,7 @@ def install_diagnostic_logging(
         encoding="utf-8",
     )
     handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        _UtcMillisecondsFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     )
     logger.addHandler(handler)
     logger.info(

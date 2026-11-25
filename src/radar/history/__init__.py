@@ -5,6 +5,7 @@ from radar.history.spread import (
     WindowStats,
 )
 from radar.history.manual_opportunity import (
+    BboHistoryArrays,
     BboRollingHistory,
     BboWindowStats,
     ManualReplayResult,
@@ -17,6 +18,7 @@ __all__ = [
     "SpreadHistory",
     "WindowStats",
     "BboRollingHistory",
+    "BboHistoryArrays",
     "BboWindowStats",
     "ManualReplayResult",
     "replay_manual_opportunity",

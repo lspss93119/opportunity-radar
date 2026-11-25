@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+from array import array
 from bisect import bisect_right
-from collections import deque
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, overload
 
 import duckdb
 
@@ -51,6 +51,89 @@ class ManualOpportunityHistoryContext:
         return cls(())
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _timestamp_to_microseconds(timestamp: datetime) -> int:
+    delta = timestamp - _EPOCH
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+
+
+def _microseconds_to_timestamp(value: int) -> datetime:
+    return _EPOCH + timedelta(microseconds=value)
+
+
+@dataclass
+class BboHistoryArrays:
+    """Compact, ordered timestamps and values for one route."""
+
+    timestamps: array
+    values: array
+
+    def __post_init__(self) -> None:
+        if self.timestamps.typecode != "q" or self.values.typecode != "d":
+            raise ValueError("BBO history arrays must use q timestamps and d values")
+        if len(self.timestamps) != len(self.values):
+            raise ValueError("BBO history arrays must have equal lengths")
+
+    def __len__(self) -> int:
+        return len(self.timestamps)
+
+    @overload
+    def __getitem__(self, index: int) -> tuple[datetime, float]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[tuple[datetime, float], ...]: ...
+
+    def __getitem__(
+        self, index: int | slice
+    ) -> tuple[datetime, float] | tuple[tuple[datetime, float], ...]:
+        if isinstance(index, slice):
+            return tuple(
+                self[position] for position in range(*index.indices(len(self)))
+            )
+        return (
+            _microseconds_to_timestamp(self.timestamps[index]),
+            self.values[index],
+        )
+
+    def __iter__(self) -> Iterator[tuple[datetime, float]]:
+        for timestamp, value in zip(self.timestamps, self.values):
+            yield _microseconds_to_timestamp(timestamp), value
+
+
+class _BboWindowPoints:
+    """Lazy compatibility view for the former per-window deque points."""
+
+    def __init__(self, history: "BboRollingHistory", name: str) -> None:
+        self._history = history
+        self._name = name
+
+    def __len__(self) -> int:
+        return len(self._history._timestamps) - self._history._heads[self._name]
+
+    def __iter__(self) -> Iterator[tuple[datetime, float]]:
+        start = self._history._heads[self._name]
+        for index in range(start, len(self._history._timestamps)):
+            yield (
+                _microseconds_to_timestamp(self._history._timestamps[index]),
+                self._history._values[index],
+            )
+
+    def __getitem__(self, index: int | slice):
+        return tuple(self)[index]
+
+    def clear(self) -> None:
+        self._history._timestamps = array("q")
+        self._history._values = array("d")
+        self._history._heads = {name: 0 for name in self._history.windows_seconds}
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _BboWindowPoints):
+            return NotImplemented
+        return tuple(self) == tuple(other)
+
+
 @dataclass
 class BboHistoryMutation:
     """Minimal inverse operation for one rolling-history observation."""
@@ -59,30 +142,36 @@ class BboHistoryMutation:
     previous_last_sample_time: datetime | None
     appended_timestamp: datetime
     appended_value: float
-    removed_current: dict[str, tuple[datetime, float] | None]
-    pruned_points: dict[str, tuple[tuple[datetime, float], ...]]
+    previous_length: int
+    removed_current: tuple[datetime, float] | None
+    previous_heads: dict[str, int]
+    previous_sums: dict[str, float]
     _rolled_back: bool = False
 
     def rollback(self) -> None:
         if self._rolled_back:
             return
-        for name in self.history.windows_seconds:
-            points = self.history._points[name]
-            if not points or points[-1] != (
-                self.appended_timestamp,
-                self.appended_value,
-            ):
+        history = self.history
+        appended_timestamp = _timestamp_to_microseconds(self.appended_timestamp)
+        if not history._timestamps or history._timestamps[-1] != appended_timestamp:
+            raise RuntimeError("rolling history changed before rollback")
+        if history._values[-1] != self.appended_value:
+            raise RuntimeError("rolling history changed before rollback")
+        if self.removed_current is None:
+            if len(history._timestamps) != self.previous_length + 1:
                 raise RuntimeError("rolling history changed before rollback")
-            points.pop()
-            self.history._sums[name] -= self.appended_value
-            pruned = self.pruned_points[name]
-            points.extendleft(reversed(pruned))
-            self.history._sums[name] += sum(value for _, value in pruned)
-            removed = self.removed_current[name]
-            if removed is not None:
-                points.append(removed)
-                self.history._sums[name] += removed[1]
-        self.history._last_sample_time = self.previous_last_sample_time
+            history._timestamps.pop()
+            history._values.pop()
+        else:
+            if len(history._timestamps) != self.previous_length:
+                raise RuntimeError("rolling history changed before rollback")
+            history._timestamps[-1] = _timestamp_to_microseconds(
+                self.removed_current[0]
+            )
+            history._values[-1] = self.removed_current[1]
+        history._heads = self.previous_heads.copy()
+        history._sums = self.previous_sums.copy()
+        history._last_sample_time = self.previous_last_sample_time
         self._rolled_back = True
 
 
@@ -133,11 +222,16 @@ class BboRollingHistory:
             raise ValueError("minimum_coverage must be between 0 and 1")
         self.expected_interval_seconds = expected_interval_seconds
         self.minimum_coverage = minimum_coverage
-        self._points: dict[str, deque[tuple[datetime, float]]] = {
-            name: deque() for name in self.windows_seconds
-        }
+        self._timestamps = array("q")
+        self._values = array("d")
+        self._heads: dict[str, int] = {name: 0 for name in self.windows_seconds}
         self._sums: dict[str, float] = {name: 0.0 for name in self.windows_seconds}
         self._last_sample_time: datetime | None = None
+
+    @property
+    def _points(self) -> dict[str, _BboWindowPoints]:
+        """Expose the former point shape without retaining duplicate objects."""
+        return {name: _BboWindowPoints(self, name) for name in self.windows_seconds}
 
     def observe(
         self, sample_time: datetime, raw_spread_bps: float
@@ -150,39 +244,45 @@ class BboRollingHistory:
     ) -> tuple[dict[str, BboWindowStats], BboHistoryMutation]:
         timestamp = _as_utc(sample_time, "sample_time")
         value = _finite(raw_spread_bps, "raw_spread_bps")
-        if (
-            self._last_sample_time is not None
-            and timestamp < self._last_sample_time
-        ):
+        if self._last_sample_time is not None and timestamp < self._last_sample_time:
             raise ValueError("sample_time must not move backwards")
 
+        self._compact_consumed_prefix()
         previous_last_sample_time = self._last_sample_time
-        removed_current: dict[str, tuple[datetime, float] | None] = {}
-        pruned_points: dict[str, tuple[tuple[datetime, float], ...]] = {}
+        previous_length = len(self._timestamps)
+        previous_heads = self._heads.copy()
+        previous_sums = self._sums.copy()
+        removed_current: tuple[datetime, float] | None = None
+        timestamp_value = _timestamp_to_microseconds(timestamp)
+        if self._timestamps and self._timestamps[-1] == timestamp_value:
+            removed_current = (
+                _microseconds_to_timestamp(self._timestamps.pop()),
+                self._values.pop(),
+            )
         results: dict[str, BboWindowStats] = {}
         for name, window_seconds in self.windows_seconds.items():
-            points = self._points[name]
-            if points and points[-1][0] == timestamp:
-                removed_current[name] = points.pop()
-            else:
-                removed_current[name] = None
             cutoff = timestamp - timedelta(seconds=window_seconds)
-            pruned_points[name] = tuple(self._prune(name, cutoff))
-            count = len(points)
+            cutoff_value = _timestamp_to_microseconds(cutoff)
+            head = self._heads[name]
+            while (
+                head < len(self._timestamps) and self._timestamps[head] < cutoff_value
+            ):
+                self._sums[name] -= self._values[head]
+                head += 1
+            self._heads[name] = head
+            count = len(self._timestamps) - head
             expected_slots = window_seconds / self.expected_interval_seconds
             coverage = min(1.0, count / expected_slots) if expected_slots else 0.0
             mean = self._sums[name] / count if count else None
-            oldest = points[0][0] if points else None
+            oldest = (
+                _microseconds_to_timestamp(self._timestamps[head]) if count else None
+            )
             required_count = math.ceil(expected_slots * self.minimum_coverage)
             covers_window_start = (
-                self.minimum_coverage == 0
-                or oldest is not None
-                and oldest <= cutoff
+                self.minimum_coverage == 0 or oldest is not None and oldest <= cutoff
             )
             available = (
-                mean is not None
-                and count >= required_count
-                and covers_window_start
+                mean is not None and count >= required_count and covers_window_start
             )
             results[name] = BboWindowStats(
                 sample_count=count,
@@ -191,55 +291,92 @@ class BboRollingHistory:
                 available=available,
             )
 
-        self._append(timestamp, value)
+        self._timestamps.append(timestamp_value)
+        self._values.append(value)
+        for name in self.windows_seconds:
+            self._sums[name] += value
+        self._last_sample_time = timestamp
         return results, BboHistoryMutation(
             history=self,
             previous_last_sample_time=previous_last_sample_time,
             appended_timestamp=timestamp,
             appended_value=value,
+            previous_length=previous_length,
             removed_current=removed_current,
-            pruned_points=pruned_points,
+            previous_heads=previous_heads,
+            previous_sums=previous_sums,
         )
 
-    def hydrate(self, points: list[tuple[datetime, float]]) -> None:
+    def hydrate(
+        self, points: BboHistoryArrays | Collection[tuple[datetime, float]]
+    ) -> None:
         """Replace the bounded history with sorted, de-duplicated points."""
-        for name in self.windows_seconds:
-            self._points[name].clear()
-            self._sums[name] = 0.0
+        self._timestamps = array("q")
+        self._values = array("d")
+        self._heads = {name: 0 for name in self.windows_seconds}
+        self._sums = {name: 0.0 for name in self.windows_seconds}
         self._last_sample_time = None
-        values: dict[datetime, float] = {}
-        for timestamp, value in points:
-            values[_as_utc(timestamp, "sample_time")] = _finite(
-                value, "raw_spread_bps"
-            )
-        ordered = sorted(values.items())
-        if not ordered:
+
+        if isinstance(points, BboHistoryArrays):
+            self._hydrate_arrays(points)
+        else:
+            values: dict[int, float] = {}
+            for timestamp, value in points:
+                normalized_timestamp = _as_utc(timestamp, "sample_time")
+                values[_timestamp_to_microseconds(normalized_timestamp)] = _finite(
+                    value, "raw_spread_bps"
+                )
+            if values:
+                self._timestamps = array("q", sorted(values))
+                self._values = array(
+                    "d", (values[timestamp] for timestamp in self._timestamps)
+                )
+        if not self._timestamps:
             return
-        latest_timestamp = ordered[-1][0]
+
+        latest_timestamp = self._timestamps[-1]
+        latest_datetime = _microseconds_to_timestamp(latest_timestamp)
         for name, window_seconds in self.windows_seconds.items():
-            cutoff = latest_timestamp - timedelta(seconds=window_seconds)
-            points_for_window = self._points[name]
-            for timestamp, value in ordered:
-                if timestamp < cutoff:
-                    continue
-                points_for_window.append((timestamp, value))
-                self._sums[name] += value
-        self._last_sample_time = latest_timestamp
+            cutoff_value = _timestamp_to_microseconds(
+                latest_datetime - timedelta(seconds=window_seconds)
+            )
+            head = bisect_right(self._timestamps, cutoff_value - 1)
+            self._heads[name] = head
+            self._sums[name] = sum(self._values[head:])
+        self._last_sample_time = latest_datetime
 
     def _append(self, timestamp: datetime, value: float) -> None:
+        timestamp = _as_utc(timestamp, "sample_time")
+        value = _finite(value, "raw_spread_bps")
+        timestamp_value = _timestamp_to_microseconds(timestamp)
+        if self._timestamps and self._timestamps[-1] >= timestamp_value:
+            raise ValueError("_append requires strictly increasing timestamps")
+        self._timestamps.append(timestamp_value)
+        self._values.append(value)
         for name in self.windows_seconds:
-            self._points[name].append((timestamp, value))
             self._sums[name] += value
         self._last_sample_time = timestamp
 
-    def _prune(self, name: str, cutoff: datetime) -> list[tuple[datetime, float]]:
-        points = self._points[name]
-        removed: list[tuple[datetime, float]] = []
-        while points and points[0][0] < cutoff:
-            removed.append(points.popleft())
-            _timestamp, value = removed[-1]
-            self._sums[name] -= value
-        return removed
+    def _hydrate_arrays(self, points: BboHistoryArrays) -> None:
+        previous_timestamp: int | None = None
+        for timestamp, value in zip(points.timestamps, points.values):
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ValueError("BBO history arrays must be strictly increasing")
+            if not math.isfinite(value):
+                raise ValueError("raw_spread_bps must be finite")
+            previous_timestamp = timestamp
+        self._timestamps = points.timestamps
+        self._values = points.values
+
+    def _compact_consumed_prefix(self) -> None:
+        if not self._timestamps:
+            return
+        consumed = min(self._heads.values())
+        if consumed < 1_024 or consumed * 2 < len(self._timestamps):
+            return
+        self._timestamps = array("q", self._timestamps[consumed:])
+        self._values = array("d", self._values[consumed:])
+        self._heads = {name: head - consumed for name, head in self._heads.items()}
 
 
 @dataclass(frozen=True)
@@ -447,9 +584,17 @@ def replay_manual_opportunity(
                         ),
                         None,
                     )
-                    if abs(spread) > 1_000 and temporal_reason is None and active_episode is not None:
+                    if (
+                        abs(spread) > 1_000
+                        and temporal_reason is None
+                        and active_episode is not None
+                    ):
                         oversized_candidate_episode_ids.add(active_episode.episode_id)
-                    if was_active and reason is not None and not lifecycle.is_active(key):
+                    if (
+                        was_active
+                        and reason is not None
+                        and not lifecycle.is_active(key)
+                    ):
                         counters["persistence_broken"] += 1
                     for alert in alerts:
                         alert_payloads.append(dict(alert.payload))
@@ -457,7 +602,9 @@ def replay_manual_opportunity(
                             abs(spread) > 1_000
                             and alert.payload.get("event_kind") == "manual_initial"
                         ):
-                            oversized_confirmed_episode_ids.add(alert.event_id.split(":initial")[0])
+                            oversized_confirmed_episode_ids.add(
+                                alert.event_id.split(":initial")[0]
+                            )
                     if (
                         canonical_symbol == "QQQ"
                         and long_venue.lower() == "arcus"
@@ -540,7 +687,8 @@ def replay_manual_opportunity(
         "rejection_counts": {
             key: value
             for key, value in counters.items()
-            if key in {
+            if key
+            in {
                 "insufficient_baseline_history",
                 "unstable_baseline",
                 "expected_net_below_min",
@@ -685,9 +833,7 @@ class ManualOpportunityHistory:
             points.append(
                 ManualOpportunityHistoryPoint(
                     sample_time=long_row.sample_time,
-                    raw_spread_bps=(
-                        short_row.best_bid / long_row.best_ask - 1.0
-                    )
+                    raw_spread_bps=(short_row.best_bid / long_row.best_ask - 1.0)
                     * 10_000.0,
                 )
             )
@@ -728,7 +874,7 @@ def load_recent_bbo_history(
     allowed_feeds: Collection[tuple[str, str, str]],
     as_of: datetime,
     window_seconds: int = 3 * 24 * 60 * 60,
-) -> dict[SpreadPairKey, tuple[tuple[datetime, float], ...]]:
+) -> dict[SpreadPairKey, BboHistoryArrays]:
     """Load strictly-prior directional BBO history for enabled exact feeds.
 
     The Parquet scan selects only the fields needed to build a directional BBO
@@ -776,7 +922,7 @@ def load_recent_bbo_history(
         ORDER BY sample_time, canonical_symbol, venue, venue_symbol
     """
 
-    points: dict[SpreadPairKey, list[tuple[datetime, float]]] = {}
+    points: dict[SpreadPairKey, BboHistoryArrays] = {}
 
     def process_slot(rows: list[_ReplayMarketRow]) -> None:
         if not rows:
@@ -807,14 +953,21 @@ def load_recent_bbo_history(
                     spread_bps = (
                         short_row.best_bid / long_row.best_ask - 1.0
                     ) * 10_000.0
-                    points.setdefault(key, []).append((sample_time, spread_bps))
+                    route_points = points.get(key)
+                    if route_points is None:
+                        route_points = BboHistoryArrays(array("q"), array("d"))
+                        points[key] = route_points
+                    route_points.timestamps.append(
+                        _timestamp_to_microseconds(sample_time)
+                    )
+                    route_points.values.append(spread_bps)
 
     current_sample: datetime | None = None
     slot_rows: list[_ReplayMarketRow] = []
     with duckdb.connect() as connection:
-        reader = connection.execute(query, [start, as_of_utc, as_of_utc]).to_arrow_reader(
-            batch_size=50_000
-        )
+        reader = connection.execute(
+            query, [start, as_of_utc, as_of_utc]
+        ).to_arrow_reader(batch_size=50_000)
         for batch in reader:
             for raw_row in batch.to_pylist():
                 parsed = _parse_market_row(raw_row)
@@ -829,7 +982,7 @@ def load_recent_bbo_history(
                 slot_rows.append(parsed)
     process_slot(slot_rows)
 
-    return {key: tuple(route_points) for key, route_points in points.items()}
+    return points
 
 
 def _stream_market_rows(
@@ -899,7 +1052,9 @@ def _stream_market_rows(
                                 if parsed.sample_time != slot_time:
                                     completed_slot = slot_time
                                     process_slot(slot_rows)
-                                    missing_slot = completed_slot + timedelta(seconds=10)
+                                    missing_slot = completed_slot + timedelta(
+                                        seconds=10
+                                    )
                                     while missing_slot < parsed.sample_time:
                                         process_slot([], missing_slot)
                                         missing_slot += timedelta(seconds=10)
@@ -927,13 +1082,9 @@ def _parse_market_row(row: Mapping[str, object]) -> _ReplayMarketRow | None:
         canonical_symbol = str(row["canonical_symbol"])
         raw_best_bid = row["best_bid"]
         raw_best_ask = row["best_ask"]
-        if not isinstance(raw_best_bid, (int, float)) or isinstance(
-            raw_best_bid, bool
-        ):
+        if not isinstance(raw_best_bid, (int, float)) or isinstance(raw_best_bid, bool):
             return None
-        if not isinstance(raw_best_ask, (int, float)) or isinstance(
-            raw_best_ask, bool
-        ):
+        if not isinstance(raw_best_ask, (int, float)) or isinstance(raw_best_ask, bool):
             return None
         best_bid = _finite(raw_best_bid, "best_bid")
         best_ask = _finite(raw_best_ask, "best_ask")
@@ -1058,7 +1209,8 @@ def _count_funnel(
         counters["baseline_history_available"] += 1
         if (
             observation.baseline_range_bps is not None
-            and observation.baseline_range_bps <= config.manual_opportunity.baseline_range_max_bps
+            and observation.baseline_range_bps
+            <= config.manual_opportunity.baseline_range_max_bps
         ):
             counters["stable_baseline"] += 1
             expected = observation.expected_net_at_a_bps
