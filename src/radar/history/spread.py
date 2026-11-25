@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -80,6 +81,31 @@ def _stale_limit(
     if price_source == "rfq" and rfq_stale_after_seconds is not None:
         return rfq_stale_after_seconds
     return stale_after_seconds
+
+
+def _market_source_for_window(
+    data_root: Path, start: datetime, end: datetime
+) -> str | None:
+    """Return only date partitions that can contain the requested window."""
+    all_paths = tuple(data_root.glob("market/date=*/part-*.parquet"))
+    paths = []
+    has_parseable_partition = False
+    for path in all_paths:
+        try:
+            partition_date = datetime.strptime(
+                path.parent.name.removeprefix("date="), "%Y-%m-%d"
+            ).date()
+        except ValueError:
+            continue
+        has_parseable_partition = True
+        if start.date() <= partition_date <= end.date():
+            paths.append(path)
+    if not paths and not has_parseable_partition:
+        paths = list(all_paths)
+    if not paths:
+        return None
+    quoted = ", ".join(f"'{str(path).replace(chr(39), chr(39) * 2)}'" for path in paths)
+    return f"[{quoted}]"
 
 
 def _stats_for_window(
@@ -268,6 +294,7 @@ class SpreadHistory:
         window: timedelta = timedelta(days=1),
         stale_after_seconds: int | None = None,
         rfq_stale_after_seconds: int | None = None,
+        allowed_feeds: Collection[tuple[str, str, str]] | None = None,
     ) -> dict[SpreadPairKey, tuple[tuple[datetime, float], ...]]:
         """Load one bounded prior window for stable-basis monitor hydration."""
         try:
@@ -276,19 +303,15 @@ class SpreadHistory:
             raise ValueError("primary_size_usd must be 1000, 5000, or 10000") from exc
         if stale_after_seconds is not None and stale_after_seconds <= 0:
             raise ValueError("stale_after_seconds must be positive")
-
-        as_of_utc = _as_utc(as_of, "as_of")
-        market_files = tuple(
-            path
-            for path in self.data_root.glob("market/date=*/part-*.parquet")
-            if path.is_file()
-        )
-        if not market_files:
+        if allowed_feeds is not None and not allowed_feeds:
             return {}
 
-        market_glob = str(
-            self.data_root / "market" / "date=*" / "part-*.parquet"
-        ).replace("'", "''")
+        as_of_utc = _as_utc(as_of, "as_of")
+        market_source = _market_source_for_window(
+            self.data_root, as_of_utc - window, as_of_utc
+        )
+        if market_source is None:
+            return {}
         query = f"""
             SELECT
                 sample_time,
@@ -299,14 +322,23 @@ class SpreadHistory:
                 {buy_column} AS buy_vwap,
                 {sell_column} AS sell_vwap,
                 price_source
-            FROM {duckdb_read_parquet(f"'{market_glob}'")}
+            FROM {duckdb_read_parquet(market_source)}
             WHERE sample_time >= ?
               AND sample_time < ?
         """
+        parameters: list[object] = [as_of_utc - window, as_of_utc]
+        if allowed_feeds is not None:
+            feed_clauses = []
+            for venue, venue_symbol, canonical_symbol in sorted(allowed_feeds):
+                feed_clauses.append(
+                    "(venue = ? AND venue_symbol = ? AND canonical_symbol = ?)"
+                )
+                parameters.extend((venue, venue_symbol, canonical_symbol))
+            query += " AND (" + " OR ".join(feed_clauses) + ")"
         with duckdb.connect() as connection:
             rows = connection.execute(
                 query,
-                [as_of_utc - window, as_of_utc],
+                parameters,
             ).fetchall()
 
         latest: dict[tuple[str, str, str, datetime], tuple[datetime, object, object]] = {}
@@ -342,6 +374,7 @@ class SpreadHistory:
             previous = latest.get(feed_key)
             if previous is None or observed_at_utc > previous[0]:
                 latest[feed_key] = (observed_at_utc, buy_vwap, sell_vwap)
+        del rows
 
         by_sample: dict[tuple[str, datetime], dict[tuple[str, str], tuple[object, object]]] = {}
         for (venue, venue_symbol, canonical_symbol, sample_time), (
@@ -352,6 +385,7 @@ class SpreadHistory:
             by_sample.setdefault((canonical_symbol, sample_time), {})[
                 (venue, venue_symbol)
             ] = (buy_vwap, sell_vwap)
+        del latest
 
         hydrated: dict[SpreadPairKey, list[tuple[datetime, float]]] = {}
         for (canonical_symbol, sample_time), feeds in by_sample.items():
@@ -375,10 +409,13 @@ class SpreadHistory:
                     )
                     hydrated.setdefault(pair_key, []).append((sample_time, raw_spread_bps))
 
-        return {
+        result = {
             key: tuple(sorted(points, key=lambda point: point[0]))
             for key, points in hydrated.items()
         }
+        del by_sample
+        del hydrated
+        return result
 
     def query_anomaly_context(
         self,

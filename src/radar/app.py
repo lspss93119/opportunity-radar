@@ -892,19 +892,21 @@ def build_application(
     )
     history = SpreadHistory(Path(data_root))
     monitors = build_enabled_monitors(config, runtime_store=runtime_store)
+    spread_history_kwargs = {
+        "primary_size_usd": config.monitors.spread.primary_size_usd,
+        "as_of": clock(),
+        "window": timedelta(seconds=config.monitors.spread.basis.window_seconds),
+        "allowed_feeds": config.spread_monitor_market_identities(),
+    }
     if config.monitors.spread.anomaly_v2.enabled:
         history_points = history.load_recent_pair_points(
-            primary_size_usd=config.monitors.spread.primary_size_usd,
-            as_of=clock(),
-            window=timedelta(seconds=config.monitors.spread.basis.window_seconds),
+            **spread_history_kwargs,
             stale_after_seconds=config.monitors.spread.stale_after_seconds,
             rfq_stale_after_seconds=config.monitors.spread.rfq_stale_after_seconds,
         )
     else:
         history_points = history.load_recent_pair_points(
-            primary_size_usd=config.monitors.spread.primary_size_usd,
-            as_of=clock(),
-            window=timedelta(seconds=config.monitors.spread.basis.window_seconds),
+            **spread_history_kwargs,
         )
     for monitor in monitors:
         if monitor.name != "spread":
@@ -912,6 +914,7 @@ def build_application(
         hydrate_history = getattr(monitor, "hydrate_history", None)
         if callable(hydrate_history):
             hydrate_history(history_points)
+    del history_points
     for monitor in monitors:
         if isinstance(monitor, FundingMonitor):
             # Slow startup read; evaluation itself never touches Parquet.

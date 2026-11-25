@@ -57,6 +57,33 @@ async def test_worker_processes_one_item_and_accounts_for_queue_task():
 
 
 @pytest.mark.asyncio
+async def test_worker_logs_successful_alert_without_transport_details(caplog):
+    import logging
+
+    from radar.alerts.worker import AlertWorker
+
+    caplog.set_level(logging.INFO, logger="radar.alerts.worker")
+    queue: asyncio.Queue[AlertRequest] = asyncio.Queue()
+    alert = AlertRequest(
+        monitor="spread",
+        event_id="event-123",
+        created_at=NOW,
+        payload={
+            "kind": "spread_initial",
+            "canonical_symbol": "BTC",
+            "url": "https://api.telegram.org/bot123456:secret/sendMessage",
+        },
+    )
+    queue.put_nowait(alert)
+
+    await AlertWorker(queue, FakeProcessor()).run_once()  # type: ignore[arg-type]
+
+    assert "alert sent monitor=spread kind=spread_initial symbol=BTC event_id=event-123" in caplog.text
+    assert "api.telegram.org" not in caplog.text
+    assert "123456:secret" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_worker_reports_failure_continues_and_accounts_for_all_items():
     from radar.alerts.worker import AlertWorker
 

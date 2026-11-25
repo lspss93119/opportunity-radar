@@ -5,6 +5,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 from typing import Any, Callable
 
 import websockets
@@ -25,6 +26,7 @@ from radar.models import FundingSnapshot, HourlyContext, MarketSnapshot
 from radar.vwap import BookLevel, buy_vwap, sell_vwap
 
 UTC = timezone.utc
+LOGGER = logging.getLogger(__name__)
 # Funding settles every hour (docs.lighter.xyz/trading/funding). The bulk
 # /api/v1/funding-rates endpoint returns every market's current (accruing)
 # rate normalized to 8 hours, positive = longs pay: its Hyperliquid rows are
@@ -388,6 +390,10 @@ class LighterOrderBookFeed:
             return
         if message_type == "ping":
             await websocket.send(json.dumps({"type": "pong"}))
+            return
+        if message_type == "shutdown":
+            LOGGER.info("%s websocket received normal shutdown", self._venue)
+            await websocket.close()
             return
         if message_type not in {"subscribed/order_book", "update/order_book"}:
             raise ValueError(f"unexpected websocket message type: {message_type}")

@@ -128,6 +128,25 @@ def test_hydrate_observe_with_rollback_matches_legacy_observe():
     assert optimized.sample_count == 5
 
 
+def test_hydrated_basis_matches_observe_and_trims_old_points():
+    points = [
+        (START + timedelta(seconds=offset), float(offset + 1))
+        for offset in range(0, 100, 10)
+    ]
+    observed = RollingBasis(window_seconds=30, min_observations=1)
+    for sample_time, value in points:
+        observed.observe(sample_time, value)
+    hydrated = RollingBasis(window_seconds=30, min_observations=1)
+    hydrated.hydrate(points)
+
+    assert hydrated.stats_before(START + timedelta(seconds=100)) == observed.stats_before(
+        START + timedelta(seconds=100)
+    )
+    assert tuple(hydrated._times) == tuple(
+        START + timedelta(seconds=offset) for offset in (70, 80, 90)
+    )
+
+
 def test_rollback_rejects_intervening_mutation():
     basis = _hydrated_basis()
     _stats, mutation = basis.observe_with_rollback(START + timedelta(seconds=50), 99.0)

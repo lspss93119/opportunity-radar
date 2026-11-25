@@ -93,3 +93,16 @@ def test_hydrate_rebuilds_the_window():
 
     assert basis.stats_before(at(40)).mean_bps == 2.0
     assert basis._sorted == [1.0, 2.0, 3.0]
+
+
+def test_hydrated_median_matches_observe_and_trims_old_points():
+    points = [(at(seconds), float(seconds)) for seconds in range(0, 100, 10)]
+    observed = median_basis(window=30, min_obs=1)
+    for sample_time, value in points:
+        observed.observe(sample_time, value)
+    hydrated = median_basis(window=30, min_obs=1)
+    hydrated.hydrate(points)
+
+    assert hydrated.stats_before(at(100)) == observed.stats_before(at(100))
+    assert tuple(hydrated._times) == tuple(at(seconds) for seconds in (70, 80, 90))
+    assert hydrated._sorted == [70.0, 80.0, 90.0]

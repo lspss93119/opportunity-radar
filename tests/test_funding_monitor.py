@@ -123,6 +123,40 @@ def test_feed_window_is_time_weighted_and_counts_gaps():
     assert window.mean_apr == pytest.approx((0.10 + 0.30 * 2) / 3)
 
 
+def test_feed_history_prune_keeps_boundary_value_and_discards_older_points():
+    history = FeedHistory()
+    for hours, apr in enumerate((0.1, 0.2, 0.3, 0.4)):
+        history.record(NOW - timedelta(hours=4 - hours), apr)
+
+    history.prune(NOW - timedelta(hours=2, minutes=30))
+
+    assert history.times == [
+        NOW - timedelta(hours=3),
+        NOW - timedelta(hours=2),
+        NOW - timedelta(hours=1),
+    ]
+    assert history.aprs == [0.2, 0.3, 0.4]
+
+
+def test_hydrated_funding_window_matches_online_history():
+    key = ("hyperliquid", "ACE", "ACE")
+    points = tuple(
+        (NOW - timedelta(hours=4 - index), 0.1 + index * 0.1)
+        for index in range(4)
+    )
+    online = FeedHistory()
+    for observed_at, apr in points:
+        online.record(observed_at, apr)
+
+    funding_monitor = monitor()
+    funding_monitor.hydrate_history({key: points})
+    hydrated = funding_monitor._histories[key]
+
+    assert hydrated.window(
+        NOW - timedelta(hours=4), NOW, timedelta(hours=2)
+    ) == online.window(NOW - timedelta(hours=4), NOW, timedelta(hours=2))
+
+
 def settling(hour: int, minute: int = 45) -> datetime:
     """A moment ``hour`` hours after NOW, inside the pre-settlement window by default."""
     return NOW + timedelta(hours=hour, minutes=minute)

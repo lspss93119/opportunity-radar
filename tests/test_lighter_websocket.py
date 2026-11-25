@@ -613,6 +613,59 @@ async def test_lighter_order_book_feed_handles_application_ping():
     await feed.stop()
 
 
+@pytest.mark.parametrize("venue", ["lighter", "lighter_robinhood"])
+@pytest.mark.asyncio
+async def test_lighter_shutdown_is_normal_disconnect_and_reconnects(caplog, venue):
+    import logging
+
+    first = FakeWebSocket([{"type": "connected"}, {"type": "shutdown"}])
+    second = FakeWebSocket([{"type": "connected"}])
+    connections = [first, second]
+    failures: list[Exception] = []
+
+    def connect(_url: str):
+        return connections.pop(0)
+
+    feed = LighterOrderBookFeed(
+        "wss://example.test/stream",
+        (1,),
+        connect=connect,
+        venue=venue,
+        error_handler=lambda _venue, error: failures.append(error),
+        reconnect_delay_seconds=0,
+    )
+    caplog.set_level(logging.INFO, logger="radar.collectors.lighter")
+
+    await feed.start()
+    try:
+        await wait_until(lambda: feed.reconnect_count >= 1)
+        assert failures == []
+        assert venue in caplog.text
+    finally:
+        await feed.stop()
+
+
+@pytest.mark.asyncio
+async def test_lighter_unknown_message_type_still_reports_error():
+    websocket = FakeWebSocket([{"type": "mystery"}])
+    failures: list[Exception] = []
+    feed = LighterOrderBookFeed(
+        "wss://example.test/stream",
+        (1,),
+        connect=lambda _url: websocket,
+        error_handler=lambda _venue, error: failures.append(error),
+        reconnect_delay_seconds=60,
+    )
+
+    await feed.start()
+    try:
+        await wait_until(lambda: bool(failures))
+        assert isinstance(failures[0], ValueError)
+        assert "unexpected websocket message type" in str(failures[0])
+    finally:
+        await feed.stop()
+
+
 @pytest.mark.asyncio
 async def test_lighter_collector_reads_ws_book_without_rest_order_book_requests():
     calls: list[str] = []

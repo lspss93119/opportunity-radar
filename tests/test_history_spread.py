@@ -396,6 +396,32 @@ def test_load_recent_pair_points_hydrates_all_directional_pairs_and_excludes_aso
     assert all(point[0] < AS_OF for values in points.values() for point in values)
 
 
+def test_load_recent_pair_points_can_limit_to_spread_monitor_feeds(tmp_path):
+    sample_time = AS_OF - timedelta(seconds=10)
+    long_snapshot, short_snapshot = make_pair(sample_time)
+    extra = make_market("backpack", sample_time)
+    write_markets(tmp_path, [long_snapshot, short_snapshot, extra])
+    history = SpreadHistory(tmp_path / "data")
+
+    all_points = history.load_recent_pair_points(
+        primary_size_usd=10_000,
+        as_of=AS_OF,
+    )
+    scoped_points = history.load_recent_pair_points(
+        primary_size_usd=10_000,
+        as_of=AS_OF,
+        allowed_feeds={
+            ("lighter", "BTC", "BTC"),
+            ("hyperliquid", "BTC", "BTC"),
+        },
+    )
+
+    expected = SpreadPairKey("BTC", "lighter", "BTC", "hyperliquid", "BTC")
+    assert set(scoped_points) == {expected, SpreadPairKey("BTC", "hyperliquid", "BTC", "lighter", "BTC")}
+    assert scoped_points[expected] == all_points[expected]
+    assert all("backpack" not in {key.long_venue, key.short_venue} for key in scoped_points)
+
+
 def test_v2_hydration_applies_optional_observation_skew_validation(tmp_path):
     sample_time = AS_OF - timedelta(seconds=10)
     long_snapshot, short_snapshot = make_pair(

@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable
 from typing import Protocol
 
 from radar.monitors.base import AlertRequest
 
 LOGGER = logging.getLogger(__name__)
+_URL_OR_BOT_TOKEN = re.compile(
+    r"https?://\S+|\b\d{8,}:[A-Za-z0-9_-]{20,}\b",
+    re.IGNORECASE,
+)
+
+
+def _safe_log_value(value: object) -> str:
+    return _URL_OR_BOT_TOKEN.sub("[redacted]", str(value))
 
 
 class AlertProcessor(Protocol):
@@ -55,6 +64,16 @@ class AlertWorker:
         alert = await self._queue.get()
         try:
             await self._processor.process(alert)
+            payload = alert.payload
+            kind = payload.get("kind", payload.get("event_type", "unknown"))
+            symbol = payload.get("canonical_symbol", "unknown")
+            LOGGER.info(
+                "alert sent monitor=%s kind=%s symbol=%s event_id=%s",
+                _safe_log_value(alert.monitor),
+                _safe_log_value(kind),
+                _safe_log_value(symbol),
+                _safe_log_value(alert.event_id),
+            )
         except Exception as error:  # noqa: BLE001
             if self._error_handler is None:
                 LOGGER.error("alert processing failed for event_id=%s", alert.event_id)
