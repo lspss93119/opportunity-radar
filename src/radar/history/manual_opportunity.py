@@ -3,9 +3,13 @@ from __future__ import annotations
 from array import array
 from bisect import bisect_right
 from collections.abc import Collection, Mapping
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import logging
 import math
+import multiprocessing
 from pathlib import Path
 from typing import Any, Iterator, overload
 
@@ -20,6 +24,9 @@ from radar.monitors.manual_opportunity import (
 )
 from radar.monitors.spread.models import SpreadPairKey
 from radar.storage.parquet import duckdb_read_parquet
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -983,6 +990,96 @@ def load_recent_bbo_history(
     process_slot(slot_rows)
 
     return points
+
+
+def _load_recent_bbo_history_worker(
+    data_root: Path,
+    allowed_feeds: tuple[tuple[str, str, str], ...],
+    as_of: datetime,
+    window_seconds: int,
+) -> dict[SpreadPairKey, BboHistoryArrays]:
+    return load_recent_bbo_history(
+        data_root,
+        allowed_feeds=allowed_feeds,
+        as_of=as_of,
+        window_seconds=window_seconds,
+    )
+
+
+def _shutdown_history_executor(executor: ProcessPoolExecutor) -> None:
+    try:
+        executor.shutdown(wait=True)
+    except Exception as error:
+        LOGGER.warning("isolated BBO history worker shutdown failed", exc_info=error)
+
+
+def load_recent_bbo_history_isolated(
+    data_root: Path,
+    *,
+    allowed_feeds: Collection[tuple[str, str, str]],
+    as_of: datetime,
+    window_seconds: int = 3 * 24 * 60 * 60,
+) -> dict[SpreadPairKey, BboHistoryArrays]:
+    """Load recent BBO history in a short-lived spawned process.
+
+    The child owns DuckDB and the query temporaries.  If the worker cannot be
+    started or exits before returning a result, retry in-process so startup
+    keeps the historical behavior.  Exceptions raised by the loader itself
+    are deliberately not caught here.
+    """
+    feeds = tuple(allowed_feeds)
+    try:
+        executor = ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+    except OSError as error:
+        LOGGER.warning(
+            "isolated BBO history worker could not start; falling back to in-process load",
+            exc_info=error,
+        )
+        return load_recent_bbo_history(
+            data_root,
+            allowed_feeds=feeds,
+            as_of=as_of,
+            window_seconds=window_seconds,
+        )
+
+    result: dict[SpreadPairKey, BboHistoryArrays] | None = None
+    worker_error: BrokenProcessPool | OSError | None = None
+    try:
+        try:
+            future = executor.submit(
+                _load_recent_bbo_history_worker,
+                Path(data_root),
+                feeds,
+                as_of,
+                window_seconds,
+            )
+        except (BrokenProcessPool, OSError) as error:
+            worker_error = error
+        else:
+            try:
+                result = future.result()
+            except BrokenProcessPool as error:
+                worker_error = error
+    finally:
+        _shutdown_history_executor(executor)
+
+    if worker_error is not None:
+        LOGGER.warning(
+            "isolated BBO history worker failed; falling back to in-process load",
+            exc_info=worker_error,
+        )
+        return load_recent_bbo_history(
+            data_root,
+            allowed_feeds=feeds,
+            as_of=as_of,
+            window_seconds=window_seconds,
+        )
+
+    assert result is not None
+    return result
 
 
 def _stream_market_rows(

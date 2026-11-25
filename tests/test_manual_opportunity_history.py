@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from array import array
 from collections import deque
 from datetime import UTC, datetime, timedelta
 import hashlib
 import math
+import pickle
 from pathlib import Path
 
 import pyarrow as pa
@@ -15,6 +17,7 @@ from radar.history.manual_opportunity import (
     BboRollingHistory,
     ManualOpportunityHistory,
     load_recent_bbo_history,
+    load_recent_bbo_history_isolated,
 )
 from radar.monitors.spread.models import SpreadPairKey
 
@@ -414,6 +417,72 @@ def test_load_recent_bbo_history_is_streaming_prior_only_and_route_isolated(tmp_
         timestamp < as_of for points in result.values() for timestamp, _ in points
     )
     assert hashlib.sha256(path.read_bytes()).digest() == before
+
+    isolated_result = load_recent_bbo_history_isolated(
+        tmp_path / "data",
+        allowed_feeds={
+            ("arcus", "QQQ-USD", "QQQ"),
+            ("lighter_robinhood", "QQQ", "QQQ"),
+        },
+        as_of=as_of,
+    )
+
+    assert list(isolated_result) == list(result)
+    for key in result:
+        assert list(isolated_result[key].timestamps) == list(result[key].timestamps)
+        assert list(isolated_result[key].values) == list(result[key].values)
+
+
+def test_load_recent_bbo_history_isolated_falls_back_when_executor_cannot_start(
+    monkeypatch, caplog, tmp_path
+):
+    import radar.history.manual_opportunity as history_module
+
+    expected = {"sentinel": object()}
+
+    def fake_load(*args, **kwargs):
+        del args, kwargs
+        return expected
+
+    def fail_executor(*args, **kwargs):
+        del args, kwargs
+        raise OSError("spawn unavailable")
+
+    monkeypatch.setattr(history_module, "load_recent_bbo_history", fake_load)
+    monkeypatch.setattr(history_module, "ProcessPoolExecutor", fail_executor)
+    caplog.set_level("WARNING", logger="radar.history.manual_opportunity")
+
+    result = load_recent_bbo_history_isolated(
+        tmp_path / "data",
+        allowed_feeds=(),
+        as_of=START,
+    )
+
+    assert result is expected
+    assert "falling back to in-process load" in caplog.text
+
+
+def test_load_recent_bbo_history_isolated_propagates_loader_exception(tmp_path):
+    with pytest.raises(FileNotFoundError, match="market Parquet dataset is missing"):
+        load_recent_bbo_history_isolated(
+            tmp_path / "data",
+            allowed_feeds={("arcus", "QQQ-USD", "QQQ")},
+            as_of=START,
+        )
+
+
+def test_bbo_history_arrays_pickle_round_trip_uses_compact_buffers():
+    point_count = 10_000
+    history = BboHistoryArrays(
+        timestamps=array("q", range(point_count)),
+        values=array("d", (float(value) for value in range(point_count))),
+    )
+
+    payload = pickle.dumps(history, protocol=pickle.HIGHEST_PROTOCOL)
+    restored = pickle.loads(payload)
+
+    assert restored == history
+    assert len(payload) / point_count == pytest.approx(16.0, abs=0.1)
 
 
 def test_manual_opportunity_history_queries_exact_route_without_lookahead(tmp_path):

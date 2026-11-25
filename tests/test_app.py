@@ -997,7 +997,7 @@ def test_build_application_hydrates_manual_history_before_pipeline_start(
             events.append("spread_history")
             return {}
 
-    def fake_load_recent_bbo_history(*args, **kwargs):
+    def fake_load_recent_bbo_history_isolated(*args, **kwargs):
         del args, kwargs
         events.append("manual_history")
         return {key: ((NOW - timedelta(seconds=10), 0.0),)}
@@ -1010,8 +1010,8 @@ def test_build_application_hydrates_manual_history_before_pipeline_start(
     monkeypatch.setattr(app_module, "SpreadHistory", FakeSpreadHistory)
     monkeypatch.setattr(
         app_module,
-        "load_recent_bbo_history",
-        fake_load_recent_bbo_history,
+        "load_recent_bbo_history_isolated",
+        fake_load_recent_bbo_history_isolated,
         raising=False,
     )
     config = RadarConfig(
@@ -1093,7 +1093,7 @@ def test_build_application_releases_manual_history_before_runner_construction(
             del kwargs
             return {}
 
-    def fake_load_recent_bbo_history(*args, **kwargs):
+    def fake_load_recent_bbo_history_isolated(*args, **kwargs):
         del args, kwargs
         nonlocal history_ref
         history = TrackingHistory({key: ((now - timedelta(seconds=10), 0.0),)})
@@ -1109,8 +1109,8 @@ def test_build_application_releases_manual_history_before_runner_construction(
     monkeypatch.setattr(app_module, "MonitorRunner", FakeRunner)
     monkeypatch.setattr(
         app_module,
-        "load_recent_bbo_history",
-        fake_load_recent_bbo_history,
+        "load_recent_bbo_history_isolated",
+        fake_load_recent_bbo_history_isolated,
         raising=False,
     )
     config = RadarConfig(

@@ -34,7 +34,7 @@ from radar.history.funding import load_recent_funding_points
 from radar.history.spread import SpreadHistory
 from radar.history.manual_opportunity import (
     ManualOpportunityHistory,
-    load_recent_bbo_history,
+    load_recent_bbo_history_isolated,
 )
 from radar.models import FundingSnapshot, MarketSnapshot
 from radar.monitors.base import AlertRequest, JSONValue
@@ -935,7 +935,7 @@ def build_application(
         hydration_started = time.perf_counter()
         peak_rss_before = _max_rss_bytes()
         allowed_feeds = config.monitor_market_identities()
-        manual_history = load_recent_bbo_history(
+        manual_history = load_recent_bbo_history_isolated(
             Path(data_root),
             allowed_feeds=allowed_feeds,
             as_of=_as_utc(clock(), "clock"),
