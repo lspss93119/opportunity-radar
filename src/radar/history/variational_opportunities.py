@@ -13,7 +13,10 @@ import duckdb  # type: ignore[import-untyped]
 
 from radar.config import MarketConfig, RadarConfig
 from radar.monitors.spread.models import calculate_raw_spread_bps
-from radar.storage.parquet import duckdb_read_parquet
+from radar.storage.parquet import (
+    duckdb_read_parquet,
+    duckdb_read_parquet_with_defaults,
+)
 
 MAX_MARKET_AGE_SECONDS = 20.0
 PERSISTENCE_THRESHOLDS_BPS = (10.0, 20.0, 50.0)
@@ -389,13 +392,23 @@ def _read_funding_rows(data_root: Path) -> tuple[_FundingRow, ...]:
         return ()
     funding_glob = _parquet_glob(data_root, "funding")
     # Partitions written before interval_seconds existed lack that column.
-    query = f"""
+    query_template = """
         SELECT *
-        FROM read_parquet('{funding_glob}', union_by_name=true)
+        FROM {funding_relation}
         ORDER BY observed_at, venue, venue_symbol
     """
     with duckdb.connect() as connection:
-        cursor = connection.execute(query)
+        funding_relation = duckdb_read_parquet_with_defaults(
+            connection,
+            f"'{funding_glob}'",
+            defaults={
+                "interval_seconds": "CAST(NULL AS BIGINT)",
+                "rate_kind": "CAST(NULL AS VARCHAR)",
+            },
+        )
+        cursor = connection.execute(
+            query_template.format(funding_relation=funding_relation)
+        )
         names = [column[0] for column in cursor.description]
         raw_records = [dict(zip(names, row)) for row in cursor.fetchall()]
     raw_rows = [

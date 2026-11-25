@@ -9,6 +9,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from radar.history.spread import HistoricalSpreadContext, SpreadHistory
+from radar.config import MarketConfig, RadarConfig
 from radar.models import MarketSnapshot
 from radar.monitors.spread.models import SpreadPairKey
 from radar.storage.parquet import ParquetStorage
@@ -102,6 +103,83 @@ def query_context(tmp_path, *, as_of: datetime = AS_OF, size: int = 10_000):
     )
 
 
+def legacy_hydrate(
+    snapshots: list[MarketSnapshot],
+    *,
+    as_of: datetime,
+    window: timedelta,
+    stale_after_seconds: int | None,
+    rfq_stale_after_seconds: int | None,
+) -> dict[SpreadPairKey, tuple[tuple[datetime, float], ...]]:
+    """Reference implementation kept as an oracle for SQL hydration."""
+    latest: dict[tuple[str, str, str, datetime], tuple[datetime, object, object]] = {}
+    start = as_of - window
+    for snapshot in snapshots:
+        if not start <= snapshot.sample_time < as_of:
+            continue
+        if stale_after_seconds is not None:
+            stale_limit = (
+                rfq_stale_after_seconds
+                if snapshot.price_source == "rfq"
+                and rfq_stale_after_seconds is not None
+                else stale_after_seconds
+            )
+            if (
+                abs((snapshot.sample_time - snapshot.observed_at).total_seconds())
+                > stale_limit
+            ):
+                continue
+        key = (
+            snapshot.venue,
+            snapshot.venue_symbol,
+            snapshot.canonical_symbol,
+            snapshot.sample_time,
+        )
+        previous = latest.get(key)
+        if previous is None or snapshot.observed_at > previous[0]:
+            latest[key] = (
+                snapshot.observed_at,
+                snapshot.buy_10k_vwap,
+                snapshot.sell_10k_vwap,
+            )
+
+    by_sample: dict[
+        tuple[str, datetime], dict[tuple[str, str], tuple[object, object]]
+    ] = {}
+    for (venue, venue_symbol, symbol, sample_time), (
+        _observed_at,
+        buy_vwap,
+        sell_vwap,
+    ) in latest.items():
+        by_sample.setdefault((symbol, sample_time), {})[(venue, venue_symbol)] = (
+            buy_vwap,
+            sell_vwap,
+        )
+
+    result: dict[SpreadPairKey, list[tuple[datetime, float]]] = {}
+    for (symbol, sample_time), feeds in by_sample.items():
+        for (long_venue, long_symbol), (long_buy, _long_sell) in feeds.items():
+            if not isinstance(long_buy, (int, float)) or not math.isfinite(long_buy) or long_buy <= 0:
+                continue
+            for (short_venue, short_symbol), (_short_buy, short_sell) in feeds.items():
+                if long_venue.lower() == short_venue.lower():
+                    continue
+                if not isinstance(short_sell, (int, float)) or not math.isfinite(short_sell) or short_sell <= 0:
+                    continue
+                spread = (short_sell / long_buy - 1.0) * 10_000.0
+                if not math.isfinite(spread):
+                    continue
+                key = SpreadPairKey(
+                    canonical_symbol=symbol,
+                    long_venue=long_venue,
+                    long_venue_symbol=long_symbol,
+                    short_venue=short_venue,
+                    short_venue_symbol=short_symbol,
+                )
+                result.setdefault(key, []).append((sample_time, spread))
+    return {key: tuple(sorted(points)) for key, points in result.items()}
+
+
 def test_exact_sample_time_join_uses_short_sell_over_long_buy(tmp_path):
     long_snapshot, short_snapshot = make_pair(AS_OF, long_buy=100.0, short_sell=101.0)
     write_markets(tmp_path, [long_snapshot, short_snapshot])
@@ -123,6 +201,172 @@ def test_query_handles_old_and_new_market_schema_partitions(tmp_path):
     context = query_context(tmp_path)
 
     assert [point.sample_time for point in context.points_7d] == [old_time, AS_OF]
+
+
+@pytest.mark.parametrize("schema", ["old", "new", "mixed"])
+def test_load_recent_pair_points_handles_all_schema_layouts(tmp_path, schema):
+    old_time = AS_OF - timedelta(days=1)
+    new_time = AS_OF - timedelta(seconds=10)
+    old_pair = make_pair(old_time, long_buy=100.0, short_sell=101.0)
+    new_pair = make_pair(new_time, long_buy=100.0, short_sell=102.0)
+    data_root = tmp_path / schema
+
+    if schema == "old":
+        write_legacy_markets(data_root, [*old_pair, *new_pair])
+    elif schema == "new":
+        storage = ParquetStorage(data_root)
+        for snapshot in (*old_pair, *new_pair):
+            storage.append(snapshot)
+        storage.flush(now=AS_OF)
+    else:
+        write_legacy_markets(data_root, list(old_pair))
+        partition = data_root / "market" / f"date={new_time.date()}"
+        partition.mkdir(parents=True, exist_ok=True)
+        new_rows = [snapshot.model_dump(mode="python") for snapshot in new_pair]
+        pq.write_table(pa.Table.from_pylist(new_rows), partition / "part-new.parquet")
+
+    points = SpreadHistory(data_root).load_recent_pair_points(
+        primary_size_usd=10_000,
+        as_of=AS_OF,
+    )
+    key = SpreadPairKey("BTC", "lighter", "BTC", "hyperliquid", "BTC")
+    reverse = SpreadPairKey("BTC", "hyperliquid", "BTC", "lighter", "BTC")
+    assert [sample for sample, _ in points[key]] == [old_time, new_time]
+    assert [sample for sample, _ in points[reverse]] == [old_time, new_time]
+    assert points[key][0][1] == pytest.approx(100.0)
+    assert points[key][1][1] == pytest.approx(200.0)
+
+
+def test_load_recent_pair_points_matches_legacy_reference_for_fixture(tmp_path):
+    start = AS_OF - timedelta(minutes=5)
+    samples = [
+        MarketSnapshot(
+            **make_market(
+                "lighter", start, buy_10k_vwap=100.0
+            ).model_dump(mode="python")
+        ),
+    ]
+    long_old, short_old = make_pair(
+        AS_OF - timedelta(seconds=40), long_buy=100.0, short_sell=101.0
+    )
+    long_newer = long_old.model_copy(
+        update={
+            "observed_at": long_old.sample_time + timedelta(seconds=2),
+            "buy_10k_vwap": 99.0,
+        }
+    )
+    rfq_long = long_old.model_copy(
+        update={
+            "venue": "variational",
+            "venue_symbol": "BTC-USD",
+            "price_source": "rfq",
+            "sample_time": AS_OF - timedelta(seconds=30),
+            "observed_at": AS_OF - timedelta(seconds=120),
+            "buy_10k_vwap": 98.0,
+        }
+    )
+    rfq_short = short_old.model_copy(
+        update={
+            "venue": "arcus",
+            "venue_symbol": "BTC-USD",
+            "price_source": "rfq",
+            "sample_time": rfq_long.sample_time,
+            "observed_at": rfq_long.observed_at,
+            "sell_10k_vwap": 103.0,
+        }
+    )
+    stale_rfq = rfq_short.model_copy(
+        update={
+            "sample_time": AS_OF - timedelta(seconds=20),
+            "observed_at": AS_OF - timedelta(seconds=141),
+        }
+    )
+    same_venue = short_old.model_copy(
+        update={
+            "venue": "LIGHTER",
+            "sample_time": AS_OF - timedelta(seconds=20),
+            "sell_10k_vwap": 110.0,
+        }
+    )
+    at_as_of = short_old.model_copy(update={"sample_time": AS_OF})
+    samples.extend(
+        [
+            long_old,
+            short_old,
+            long_newer,
+            rfq_long,
+            rfq_short,
+            stale_rfq,
+            same_venue,
+            at_as_of,
+        ]
+    )
+    write_markets(tmp_path, samples)
+
+    expected = legacy_hydrate(
+        samples,
+        as_of=AS_OF,
+        window=timedelta(minutes=5),
+        stale_after_seconds=30,
+        rfq_stale_after_seconds=120,
+    )
+    actual = SpreadHistory(tmp_path / "data").load_recent_pair_points(
+        primary_size_usd=10_000,
+        as_of=AS_OF,
+        window=timedelta(minutes=5),
+        stale_after_seconds=30,
+        rfq_stale_after_seconds=120,
+    )
+
+    assert set(actual) == set(expected)
+    for key in expected:
+        assert [sample for sample, _ in actual[key]] == [sample for sample, _ in expected[key]]
+        assert [value for _, value in actual[key]] == pytest.approx(
+            [value for _, value in expected[key]], abs=1e-9
+        )
+
+
+def test_build_application_hydration_old_schema_matches_new_schema(tmp_path):
+    from radar.app import build_application
+
+    old_root = tmp_path / "old-data"
+    new_root = tmp_path / "new-data"
+    runtime_root = tmp_path / "runtime"
+    sample_time = AS_OF - timedelta(seconds=10)
+    snapshots = list(make_pair(sample_time, long_buy=100.0, short_sell=101.0))
+    write_legacy_markets(old_root, snapshots)
+    new_storage = ParquetStorage(new_root)
+    for snapshot in snapshots:
+        new_storage.append(snapshot)
+    new_storage.flush(now=AS_OF)
+    config = RadarConfig(
+        markets=[
+            MarketConfig(venue="lighter", venue_symbol="BTC", canonical_symbol="BTC"),
+            MarketConfig(
+                venue="hyperliquid", venue_symbol="BTC", canonical_symbol="BTC"
+            ),
+        ],
+        monitors={"spread": {"primary_size_usd": 10_000}},
+    )
+
+    def hydrated(root: Path, runtime_db: Path):
+        app = build_application(
+            config,
+            data_root=root,
+            runtime_db=runtime_db,
+            telegram_credentials=("token-not-logged", "chat-id"),
+            clock=lambda: AS_OF,
+        )
+        try:
+            monitor = next(item for item in app.monitor_runner.monitors if item.name == "spread")
+            key = SpreadPairKey("BTC", "lighter", "BTC", "hyperliquid", "BTC")
+            return dict(monitor._basis_by_key[key]._values)
+        finally:
+            app.runtime_store.close()
+
+    assert hydrated(old_root, runtime_root / "old.sqlite3") == hydrated(
+        new_root, runtime_root / "new.sqlite3"
+    )
 
 
 def test_offset_sample_times_do_not_form_asof_point(tmp_path):

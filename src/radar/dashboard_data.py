@@ -24,7 +24,10 @@ from radar.monitors.spread.basis import (
     RollingBasisStats,
 )
 from radar.monitors.spread.models import SpreadPairKey, calculate_raw_spread_bps
-from radar.storage.parquet import duckdb_read_parquet
+from radar.storage.parquet import (
+    duckdb_read_parquet,
+    duckdb_read_parquet_with_defaults,
+)
 
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_DB = Path("runtime/radar.sqlite3")
@@ -1132,6 +1135,8 @@ class DashboardQueryService:
         self,
         files: tuple[Path, ...],
         expected: tuple[tuple[str, str, str], ...],
+        *,
+        market_relation: str | None = None,
     ) -> tuple[str, list[object]]:
         predicates = " OR ".join(
             "(venue = ? AND venue_symbol = ? AND canonical_symbol = ?)"
@@ -1140,6 +1145,8 @@ class DashboardQueryService:
         path_list = ", ".join(
             "'" + str(path).replace("'", "''") + "'" for path in files
         )
+        if market_relation is None:
+            market_relation = duckdb_read_parquet(f"[{path_list}]")
         query = f"""
             WITH ranked AS (
                 SELECT
@@ -1158,7 +1165,7 @@ class DashboardQueryService:
                         PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
                         ORDER BY observed_at DESC
                     ) AS row_number
-                FROM {duckdb_read_parquet(f"[{path_list}]")}
+                FROM {market_relation}
                 WHERE sample_time >= ? AND sample_time <= ?
                   AND ({predicates})
             )
@@ -1228,11 +1235,20 @@ class DashboardQueryService:
         if not files:
             return [], None
         expected = tuple(self._expected_feeds() if identities is None else identities)
-        query, identity_params = self._market_query(files, expected)
         errors: list[str] = []
         data_as_of: datetime | None = None
         try:
             with duckdb.connect() as connection:
+                market_relation = duckdb_read_parquet_with_defaults(
+                    connection,
+                    f"[{', '.join(repr(str(path).replace(chr(39), chr(39) * 2)) for path in files)}]",
+                    defaults={
+                        "price_source": "CAST('order_book' AS VARCHAR)",
+                    },
+                )
+                query, identity_params = self._market_query(
+                    files, expected, market_relation=market_relation
+                )
                 result = connection.execute(query, [start, end, *identity_params])
                 while batch := result.fetchmany(SCANNER_BATCH_ROWS):
                     for values in batch:
@@ -1265,11 +1281,20 @@ class DashboardQueryService:
         path_list = ", ".join(
             "'" + str(path).replace("'", "''") + "'" for path in files
         )
-        query, identity_params = self._market_query(files, expected)
         try:
             with duckdb.connect() as connection:
+                market_relation = duckdb_read_parquet_with_defaults(
+                    connection,
+                    f"[{path_list}]",
+                    defaults={
+                        "price_source": "CAST('order_book' AS VARCHAR)",
+                    },
+                )
+                query, identity_params = self._market_query(
+                    files, expected, market_relation=market_relation
+                )
                 data_as_of_row = connection.execute(
-                    f"SELECT max(sample_time) FROM {duckdb_read_parquet(f'[{path_list}]')} "
+                    f"SELECT max(sample_time) FROM {market_relation} "
                     "WHERE sample_time >= ? AND sample_time <= ?",
                     [start, end],
                 ).fetchone()

@@ -6,7 +6,7 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -134,6 +134,50 @@ DATASET_SCHEMAS = {
 def duckdb_read_parquet(source: str) -> str:
     """Build a DuckDB read over Parquet partitions with schema unioning."""
     return f"read_parquet({source}, union_by_name=true)"
+
+
+def duckdb_read_parquet_with_defaults(
+    connection: object,
+    source: str,
+    *,
+    defaults: Mapping[str, str],
+) -> str:
+    """Read Parquet partitions and make appended columns safe to project.
+
+    ``union_by_name`` fills a column from a mixed set of files with NULL, but
+    it cannot bind a column that is absent from every file.  This helper also
+    adds missing columns and applies the supplied expression to NULL values.
+    Defaults are SQL expressions owned by the caller, not user input.
+    """
+    relation = duckdb_read_parquet(source)
+    cursor = connection.execute(f"DESCRIBE SELECT * FROM {relation}", [])
+    describe = []
+    while row := cursor.fetchone():
+        describe.append(row)
+    available = {row[0] for row in describe}
+    replacement_columns = [
+        column
+        for column, expression in defaults.items()
+        if column in available
+    ]
+    replacements = [
+        f"coalesce({column}, {expression}) AS {column}"
+        for column, expression in defaults.items()
+        if column in available
+    ]
+    missing = [
+        f"{expression} AS {column}"
+        for column, expression in defaults.items()
+        if column not in available
+    ]
+    if not replacements and not missing:
+        return relation
+    select_items = (
+        [f"* EXCLUDE ({', '.join(replacement_columns)})"]
+        if replacement_columns
+        else ["*"]
+    ) + replacements + missing
+    return f"(SELECT {', '.join(select_items)} FROM {relation})"
 
 
 def _as_utc(value: datetime, field_name: str) -> datetime:

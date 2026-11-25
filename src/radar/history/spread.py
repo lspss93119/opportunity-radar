@@ -10,7 +10,7 @@ from statistics import median
 import duckdb  # type: ignore[import-untyped]
 
 from radar.monitors.spread.models import SpreadPairKey
-from radar.storage.parquet import duckdb_read_parquet
+from radar.storage.parquet import duckdb_read_parquet_with_defaults
 
 VWAP_COLUMNS = {
     1_000: ("buy_1k_vwap", "sell_1k_vwap"),
@@ -158,7 +158,7 @@ class SpreadHistory:
         market_glob = str(
             self.data_root / "market" / "date=*" / "part-*.parquet"
         ).replace("'", "''")
-        query = f"""
+        query_template = f"""
             WITH filtered AS (
                 SELECT
                     sample_time,
@@ -168,7 +168,7 @@ class SpreadHistory:
                     canonical_symbol,
                     {buy_column} AS buy_vwap,
                     {sell_column} AS sell_vwap
-                FROM {duckdb_read_parquet(f"'{market_glob}'")}
+                FROM {{market_relation}}
                 WHERE sample_time >= ?
                   AND sample_time <= ?
                   AND canonical_symbol = ?
@@ -230,6 +230,14 @@ class SpreadHistory:
             canonical_symbol,
         ]
         with duckdb.connect() as connection:
+            market_relation = duckdb_read_parquet_with_defaults(
+                connection,
+                f"'{market_glob}'",
+                defaults={
+                    "price_source": "CAST('order_book' AS VARCHAR)",
+                },
+            )
+            query = query_template.format(market_relation=market_relation)
             rows = connection.execute(query, parameters).fetchall()
 
         points: list[HistoricalSpreadPoint] = []
@@ -312,21 +320,8 @@ class SpreadHistory:
         )
         if market_source is None:
             return {}
-        query = f"""
-            SELECT
-                sample_time,
-                observed_at,
-                venue,
-                venue_symbol,
-                canonical_symbol,
-                {buy_column} AS buy_vwap,
-                {sell_column} AS sell_vwap,
-                price_source
-            FROM {duckdb_read_parquet(market_source)}
-            WHERE sample_time >= ?
-              AND sample_time < ?
-        """
         parameters: list[object] = [as_of_utc - window, as_of_utc]
+        where_clauses = ["sample_time >= ?", "sample_time < ?"]
         if allowed_feeds is not None:
             feed_clauses = []
             for venue, venue_symbol, canonical_symbol in sorted(allowed_feeds):
@@ -334,88 +329,128 @@ class SpreadHistory:
                     "(venue = ? AND venue_symbol = ? AND canonical_symbol = ?)"
                 )
                 parameters.extend((venue, venue_symbol, canonical_symbol))
-            query += " AND (" + " OR ".join(feed_clauses) + ")"
-        with duckdb.connect() as connection:
-            rows = connection.execute(
-                query,
-                parameters,
-            ).fetchall()
-
-        latest: dict[tuple[str, str, str, datetime], tuple[datetime, object, object]] = {}
-        for (
-            sample_time,
-            observed_at,
-            venue,
-            venue_symbol,
-            canonical_symbol,
-            buy_vwap,
-            sell_vwap,
-            price_source,
-        ) in rows:
-            if not all(
-                isinstance(value, str) and value.strip()
-                for value in (venue, venue_symbol, canonical_symbol)
-            ):
-                continue
-            try:
-                sample_time_utc = _as_utc(sample_time, "sample_time")
-                observed_at_utc = _as_utc(observed_at, "observed_at")
-            except (AttributeError, TypeError, ValueError):
-                continue
-            if (
-                stale_after_seconds is not None
-                and abs((sample_time_utc - observed_at_utc).total_seconds())
-                > _stale_limit(
-                    price_source, stale_after_seconds, rfq_stale_after_seconds
-                )
-            ):
-                continue
-            feed_key = (venue, venue_symbol, canonical_symbol, sample_time_utc)
-            previous = latest.get(feed_key)
-            if previous is None or observed_at_utc > previous[0]:
-                latest[feed_key] = (observed_at_utc, buy_vwap, sell_vwap)
-        del rows
-
-        by_sample: dict[tuple[str, datetime], dict[tuple[str, str], tuple[object, object]]] = {}
-        for (venue, venue_symbol, canonical_symbol, sample_time), (
-            _observed_at,
-            buy_vwap,
-            sell_vwap,
-        ) in latest.items():
-            by_sample.setdefault((canonical_symbol, sample_time), {})[
-                (venue, venue_symbol)
-            ] = (buy_vwap, sell_vwap)
-        del latest
-
+            where_clauses.append("(" + " OR ".join(feed_clauses) + ")")
+        if stale_after_seconds is not None:
+            rfq_limit = (
+                stale_after_seconds
+                if rfq_stale_after_seconds is None
+                else rfq_stale_after_seconds
+            )
+            where_clauses.append(
+                "abs(epoch(sample_time - observed_at)) <= "
+                f"CASE WHEN price_source = 'rfq' THEN {rfq_limit} "
+                f"ELSE {stale_after_seconds} END"
+            )
+        query_template = f"""
+            WITH filtered AS (
+                SELECT
+                    sample_time,
+                    observed_at,
+                    venue,
+                    venue_symbol,
+                    canonical_symbol,
+                    {buy_column} AS buy_vwap,
+                    {sell_column} AS sell_vwap,
+                    price_source
+                FROM {{market_relation}}
+                WHERE {" AND ".join(where_clauses)}
+            ),
+            ranked AS (
+                SELECT *, row_number() OVER (
+                    PARTITION BY venue, venue_symbol, canonical_symbol, sample_time
+                    ORDER BY observed_at DESC
+                ) AS row_number
+                FROM filtered
+            ),
+            latest AS (
+                SELECT sample_time, venue, venue_symbol, canonical_symbol,
+                       buy_vwap, sell_vwap
+                FROM ranked
+                WHERE row_number = 1
+            ),
+            paired AS (
+                SELECT
+                    long_side.canonical_symbol,
+                    long_side.sample_time,
+                    long_side.venue AS long_venue,
+                    long_side.venue_symbol AS long_venue_symbol,
+                    short_side.venue AS short_venue,
+                    short_side.venue_symbol AS short_venue_symbol,
+                    (short_side.sell_vwap / long_side.buy_vwap - 1.0)
+                        * 10_000.0 AS raw_spread_bps
+                FROM latest AS long_side
+                INNER JOIN latest AS short_side
+                    ON short_side.canonical_symbol = long_side.canonical_symbol
+                   AND short_side.sample_time = long_side.sample_time
+                WHERE lower(long_side.venue) <> lower(short_side.venue)
+                  AND long_side.buy_vwap IS NOT NULL
+                  AND isfinite(long_side.buy_vwap)
+                  AND long_side.buy_vwap > 0
+                  AND short_side.sell_vwap IS NOT NULL
+                  AND isfinite(short_side.sell_vwap)
+                  AND short_side.sell_vwap > 0
+            )
+            SELECT canonical_symbol, sample_time,
+                   long_venue, long_venue_symbol,
+                   short_venue, short_venue_symbol, raw_spread_bps
+            FROM paired
+            WHERE isfinite(raw_spread_bps)
+            ORDER BY canonical_symbol, sample_time,
+                     long_venue, long_venue_symbol,
+                     short_venue, short_venue_symbol
+        """
         hydrated: dict[SpreadPairKey, list[tuple[datetime, float]]] = {}
-        for (canonical_symbol, sample_time), feeds in by_sample.items():
-            for (long_venue, long_symbol), (long_buy, _long_sell) in feeds.items():
-                if not isinstance(long_buy, (int, float)) or not math.isfinite(float(long_buy)) or float(long_buy) <= 0:
-                    continue
-                for (short_venue, short_symbol), (_short_buy, short_sell) in feeds.items():
-                    if long_venue.lower() == short_venue.lower():
+        with duckdb.connect() as connection:
+            market_relation = duckdb_read_parquet_with_defaults(
+                connection,
+                market_source,
+                defaults={
+                    "price_source": "CAST('order_book' AS VARCHAR)",
+                },
+            )
+            result = connection.execute(
+                query_template.format(market_relation=market_relation),
+                parameters,
+            )
+            while batch := result.fetchmany(8192):
+                for (
+                    canonical_symbol,
+                    sample_time,
+                    long_venue,
+                    long_venue_symbol,
+                    short_venue,
+                    short_venue_symbol,
+                    raw_spread_bps,
+                ) in batch:
+                    if not all(
+                        isinstance(value, str) and value.strip()
+                        for value in (
+                            canonical_symbol,
+                            long_venue,
+                            long_venue_symbol,
+                            short_venue,
+                            short_venue_symbol,
+                        )
+                    ):
                         continue
-                    if not isinstance(short_sell, (int, float)) or not math.isfinite(float(short_sell)) or float(short_sell) <= 0:
+                    try:
+                        sample_time_utc = _as_utc(sample_time, "sample_time")
+                        raw_value = float(raw_spread_bps)
+                    except (AttributeError, TypeError, ValueError):
                         continue
-                    raw_spread_bps = (float(short_sell) / float(long_buy) - 1.0) * 10_000.0
-                    if not math.isfinite(raw_spread_bps):
+                    if not math.isfinite(raw_value):
                         continue
                     pair_key = SpreadPairKey(
                         canonical_symbol=canonical_symbol,
                         long_venue=long_venue,
-                        long_venue_symbol=long_symbol,
+                        long_venue_symbol=long_venue_symbol,
                         short_venue=short_venue,
-                        short_venue_symbol=short_symbol,
+                        short_venue_symbol=short_venue_symbol,
                     )
-                    hydrated.setdefault(pair_key, []).append((sample_time, raw_spread_bps))
-
-        result = {
-            key: tuple(sorted(points, key=lambda point: point[0]))
-            for key, points in hydrated.items()
-        }
-        del by_sample
-        del hydrated
-        return result
+                    hydrated.setdefault(pair_key, []).append(
+                        (sample_time_utc, raw_value)
+                    )
+        return {key: tuple(points) for key, points in hydrated.items()}
 
     def query_anomaly_context(
         self,
@@ -450,7 +485,7 @@ class SpreadHistory:
         market_glob = str(
             self.data_root / "market" / "date=*" / "part-*.parquet"
         ).replace("'", "''")
-        query = f"""
+        query_template = f"""
             WITH filtered AS (
                 SELECT
                     sample_time,
@@ -461,7 +496,7 @@ class SpreadHistory:
                     {buy_column} AS buy_vwap,
                     {sell_column} AS sell_vwap,
                     price_source
-                FROM {duckdb_read_parquet(f"'{market_glob}'")}
+                FROM {{market_relation}}
                 WHERE sample_time >= ?
                   AND sample_time < ?
                   AND canonical_symbol = ?
@@ -493,7 +528,16 @@ class SpreadHistory:
             short_venue_symbol,
         ]
         with duckdb.connect() as connection:
-            rows = connection.execute(query, parameters).fetchall()
+            market_relation = duckdb_read_parquet_with_defaults(
+                connection,
+                f"'{market_glob}'",
+                defaults={
+                    "price_source": "CAST('order_book' AS VARCHAR)",
+                },
+            )
+            rows = connection.execute(
+                query_template.format(market_relation=market_relation), parameters
+            ).fetchall()
 
         feeds: dict[tuple[str, str, datetime], tuple[datetime, object, object]] = {}
         for (
